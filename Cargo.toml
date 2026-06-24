@@ -1,0 +1,10 @@
+[package]
+name = "trifle"
+version = "0.0.1"
+edition = "2024"
+description = "A small, embedded, typo-tolerant fuzzy search engine backed by SQLite."
+license = "MIT"
+repository = "https://github.com/lathrys-at/trifle"
+readme = "README.md"
+
+[dependencies]

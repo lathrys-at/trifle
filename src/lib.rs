@@ -157,11 +157,15 @@ impl Config {
 /// [`insert_batch`](Index::insert_batch) and [`rebuild`](Index::rebuild).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
-    /// The caller's document id.
+    /// The caller's document id — the unit of retrieval: a search returns at most one
+    /// match per `doc_id`.
     pub doc_id: i64,
-    /// Provenance category (e.g. `"field"`, `"ocr"`).
+    /// A category within the document, and the unit of write:
+    /// [`insert`](Index::insert) and [`remove_source`](Index::remove_source) operate on a
+    /// whole `(doc_id, source)`.
     pub source: String,
-    /// Provenance sub-location (e.g. a field name, a filename).
+    /// A per-segment label returned on a match (e.g. a field name, a chunk position).
+    /// Metadata, not a key: there is no replace or delete by `ref`.
     pub ref_: String,
     /// The segment text (stored raw; the tokenizer normalizes internally).
     pub text: String,

@@ -23,24 +23,6 @@ SQLite, so the comparison isolates matching strategy from store.
 The `latency` harness uses phrase-MATCH FTS5, `relevance` compares against word-level BM25
 and the trigram cousin, and `fuzzy` compares against FTS5 trigram-MATCH plus the LIKE floor.
 
-### Capability matrix
-
-Latency is one axis. The matrix records the others, including where trifle is not the best
-choice:
-
-| | durable? | embedded / no server? | incremental update vs rebuild? | corpus-scale (100k+ small docs)? | provenance? | matching semantics | footprint |
-|---|---|---|---|---|---|---|---|
-| **trifle** | ✅ disk (SQLite) | ✅ | ✅ incremental (base+delta) | ✅ | ✅ (source/ref) | trigram overlap | disk |
-| FTS5-trigram | ✅ | ✅ | ✅ incremental | ✅ | rowid only | trigram + BM25 | disk |
-| pg_trgm | ✅ | ❌ server | ✅ | ✅ | table cols | trigram similarity | disk |
-| Tantivy + Levenshtein | ✅ | ✅ | ✅ (segments) | ✅ | fields | Levenshtein automaton | disk |
-| fzf / nucleo / fuzzy-matcher | ❌ | ✅ | rebuild-on-startup | ⚠️ RAM-bound | — | subsequence | RAM |
-| fst / SymSpell / strsim | ⚠️ immutable | ✅ | rebuild-to-update | ✅ | key-oriented | delete-neighborhood / edit-distance | RAM/disk |
-
-The in-memory subsequence filters are faster than trifle when RAM-resident and rebuilt on
-startup. The out-of-process engines (pg_trgm, Tantivy, fzf, fst, …) are not wired into this
-harness; run them in their own drivers on the same corpus and queries.
-
 ## Corpora
 
 | Corpus / Command | Description |

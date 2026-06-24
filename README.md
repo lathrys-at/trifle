@@ -45,16 +45,29 @@ fn main() -> trifle::Result<()> {
 
 ## Data model
 
-A segment is `(doc_id, source, ref, text)`:
+A segment is `(doc_id, source, ref, text)`. The fields are caller-assigned and play
+distinct operational roles:
 
-- `doc_id` — your document identifier.
-- `source`, `ref` — opaque provenance labels returned on a match (e.g. `source` a
-  category like `"ocr"` / `"caption"`, `ref` a field name or filename). trifle indexes
-  `(doc_id, source)`, so per-category replace and delete are cheap.
-- `text` — stored raw; the tokenizer normalizes for matching.
+- `doc_id` — the unit of retrieval. A search returns at most one match per `doc_id`, its
+  best-matching segment, and `limit` counts `doc_id`s. Make `doc_id` whatever you want back
+  as a single result.
+- `source` — the unit of write. `insert(doc_id, source, …)` replaces every segment under a
+  `(doc_id, source)` pair; `remove_source(doc_id, source)` deletes that pair; `remove(doc_id)`
+  deletes every source of a doc.
+- `ref` — a free-form label on one segment, returned on a match so you know which segment
+  matched. It is metadata, not a key: there is no replace or delete by `ref`.
+- `text` — stored raw; the tokenizer normalizes it for matching.
 
-A document may have many segments. `insert` replaces all segments under a `(doc_id,
-source)` pair; `remove_source` deletes that pair; `remove` deletes a whole `doc_id`.
+These roles cover two distinct patterns:
+
+- **Provenance** — one logical document per `doc_id`, with a segment per place its text comes
+  from: `source` the category (`"ocr"`, `"caption"`, `"field"`), `ref` the sub-location (a
+  filename or field name). A search returns the document and its best-matching segment.
+- **Chunking a large document** — if one best passage per document is enough, keep `doc_id`
+  the document, put the chunks under a single `source`, and use `ref` for each chunk's
+  position; a match returns the best chunk, with its text and (when locatable) a byte span.
+  To retrieve several passages from the same document at once, give each chunk its own
+  `doc_id` (results are deduplicated per `doc_id`) and record the parent in `source` or `ref`.
 
 ## Features
 
@@ -67,13 +80,78 @@ source)` pair; `remove_source` deletes that pair; `remove` deletes a whole `doc_
   normalization, literal verification). Tune via `SearchOpts::rerank(Effort)` (`None`
   through `Max`), or supply a custom `Ranker`.
 - **Scoped search** — a provenance predicate evaluated over candidates only.
-- **Concurrency** — one internal writer plus a pool of read-only connections under WAL,
-  or configurable connection handling in shared-mode. Fully Synchronous API, with no
-  runtime imposed.
-- **Maintenance** — `compact()` folds deltas into bases; `rebuild()` reindexes via an
-  atomic shadow swap; `stats()` reports `delta_backlog` to decide when to compact.
-- **Rebuildable cache** — a tokenizer change or a bumped `data_version` drops the cache;
-  repopulate with `rebuild`.
+
+## Usage
+
+Trifle assumes a read-often, write-infrequent workload over small documents, a single
+writer, and that it is a derived cache over a source of truth you own. It never writes to
+your data and does not know when your source changes — deciding when a segment is stale and
+repopulating it is your responsibility. The API is synchronous and `&self`-thread-safe:
+writes serialize through one connection, reads run concurrently under WAL, and an async
+caller dispatches to a blocking pool.
+
+### Sidecar mode (default)
+
+Trifle owns its own SQLite file — WAL, `mmap`, one write connection and a pool of read
+connections — and manages the pragmas and write serialization itself. You open it and use
+it; nothing else is required:
+
+```rust
+let index = Index::open_at(Path::new("search.db"), Config::default())?;
+```
+
+### Shared mode
+
+Trifle's tables live namespaced inside a database you own and supply connections to. Use it
+only for a hard co-location requirement. You give it the write connection and a factory for
+read-only connections, and you take on three guarantees Trifle cannot enforce across a file
+it does not own:
+
+- single-writer serialization across the **whole** database, not just Trifle's tables;
+- a WAL and pragma setup compatible with concurrent reads;
+- never holding an open transaction across a `rebuild()` — its shadow-table swap must commit.
+
+```rust
+let backend = Shared::new(
+    Namespace::prefixed("trifle_")?,   // tables become trifle_seg, trifle_post, …
+    write_conn,                        // the one connection writes serialize through
+    || open_readonly_connection(),     // read-only factory: || -> rusqlite::Result<Connection>
+)?;
+let index = Index::open(backend, TrigramTokenizer::new(), Config::default())?;
+```
+
+### Maintenance
+
+Writes are cheap because they append to a delta; bounding that growth is an explicit step,
+not automatic:
+
+- **Compact.** `compact()` folds deltas into bases. Call it when `stats().delta_backlog`
+  grows — that is the signal. It bounds delta growth but does not shrink the file.
+- **Rebuild.** `rebuild(corpus)` reindexes from scratch via an atomic shadow swap. It is
+  required after a tokenizer change or a bumped `Config::data_version`, both of which empty
+  the cache on open.
+- **Drift.** On open, a schema, tokenizer-fingerprint, or `data_version` mismatch (or
+  detected corruption) drops the cache to empty rather than migrating it. Treat an empty
+  index after such a change as expected and repopulate with `rebuild` from your source of
+  truth.
+
+## Comparison
+
+How Trifle compares to other embedded fuzzy- and substring-search tools, across the axes
+that matter when choosing one:
+
+| | durable? | embedded / no server? | incremental update vs rebuild? | corpus-scale (100k+ small docs)? | provenance? | matching semantics | footprint |
+|---|---|---|---|---|---|---|---|
+| **trifle** | ✅ disk (SQLite) | ✅ | ✅ incremental (base+delta) | ✅ | ✅ (source/ref) | trigram overlap | disk |
+| FTS5-trigram | ✅ | ✅ | ✅ incremental | ✅ | rowid only | trigram + BM25 | disk |
+| pg_trgm | ✅ | ❌ server | ✅ | ✅ | table cols | trigram similarity | disk |
+| Tantivy + Levenshtein | ✅ | ✅ | ✅ (segments) | ✅ | fields | Levenshtein automaton | disk |
+| fzf / nucleo / fuzzy-matcher | ❌ | ✅ | rebuild-on-startup | ⚠️ RAM-bound | — | subsequence | RAM |
+| fst / SymSpell / strsim | ⚠️ immutable | ✅ | rebuild-to-update | ✅ | key-oriented | delete-neighborhood / edit-distance | RAM/disk |
+
+The in-memory subsequence filters (fzf, nucleo) are faster when everything is RAM-resident
+and rebuilt on startup. A search server like Tantivy or a database extension like pg_trgm is
+the better fit when you already run one.
 
 ## Non-goals
 

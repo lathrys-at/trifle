@@ -400,7 +400,7 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
     }
     println!(
         "# (latency is one axis; durability, footprint, update cost, and semantics differ \
-         per engine — see benchmarks/README.md)"
+         per engine — see the comparison table in the project README)"
     );
     Ok(())
 }

@@ -63,6 +63,7 @@ fn main() -> ExitCode {
         "fuzzy" => cmd_fuzzy(rest),
         "profile" => cmd_profile(rest),
         "ranksweep" => cmd_ranksweep(rest),
+        "tmaxsweep" => cmd_tmaxsweep(rest),
         "fetch" => cmd_fetch(rest),
         "help" | "--help" | "-h" => {
             print!("{}", USAGE);
@@ -91,6 +92,7 @@ COMMANDS:
     fuzzy      Entity name+edit recall vs FTS5 trigram-MATCH / LIKE, per edit-count
     profile    Σ(kept-posting cardinality) distribution — the work-done curve
     ranksweep  recall@k vs rerank-pool depth CSV (backend for tools/calibrate_pool.py)
+    tmaxsweep  recall/latency vs selection cap t_max CSV (backend for tools/tmax_knee.py)
     fetch      Download + verify the pinned corpus assets into the cache (no bench)
     help       Show this message
 
@@ -928,6 +930,55 @@ fn pool_grid(max: usize) -> Vec<usize> {
 /// `synthetic`/`geonames` carry a single relevant id (snippet/name + typos), `msmarco`
 /// the qrel relevant-set. See `tools/README.md` for the model and how the constants fall
 /// out of this matrix.
+/// A corpus paired with its labeled queries: each query's text and its relevant doc-id
+/// set (one id for single-label corpora, the qrel set for msmarco).
+type LabeledCorpus = (Corpus, Vec<(String, Vec<i64>)>);
+
+/// Build a corpus at size `n` and its labeled queries, for the sweep commands. Each
+/// corpus is a different query/label regime: `synthetic` (snippet+typo, single label),
+/// `msmarco` (real dev queries + qrels, relevant-set label), and `geonames-*` (entity
+/// name + typos, single label).
+fn labeled_corpus(
+    which: &str,
+    n: usize,
+    q: usize,
+    edits: usize,
+    seed: u64,
+) -> Result<LabeledCorpus, String> {
+    Ok(match which {
+        "synthetic" => {
+            let c = corpus::synthetic(n, seed);
+            let qs = query::labeled_snippets(&c, q, edits, seed)
+                .into_iter()
+                .map(|(t, id)| (t, vec![id]))
+                .collect();
+            (c, qs)
+        }
+        "msmarco" => {
+            let rel = corpus::msmarco_relevance(n, q, seed).map_err(|e| format!("msmarco: {e}"))?;
+            let qs = rel
+                .queries
+                .into_iter()
+                .map(|r| (r.text, r.relevant))
+                .collect();
+            (rel.corpus, qs)
+        }
+        corpus::CORPUS_GEONAMES_CITIES | corpus::CORPUS_GEONAMES_ALL => {
+            let ent = corpus::geonames(which, n, q, seed).map_err(|e| format!("geonames: {e}"))?;
+            let qs = query::fuzzy_queries(&ent.targets, edits.max(1), seed)
+                .into_iter()
+                .map(|fq| (fq.text, vec![fq.target]))
+                .collect();
+            (ent.corpus, qs)
+        }
+        other => {
+            return Err(format!(
+                "unknown --corpus {other} (synthetic|msmarco|geonames-cities|geonames-all)"
+            ));
+        }
+    })
+}
+
 fn cmd_ranksweep(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args, &[])?;
     flags.reject_unknown(&[
@@ -957,43 +1008,7 @@ fn cmd_ranksweep(args: &[String]) -> Result<(), String> {
     let pools = pool_grid(max_pool);
     const KS: &[usize] = &[1, 5, 10, 20, 50, 100];
 
-    // (corpus, labeled queries). Each corpus yields a different query/label regime, so
-    // the calibration can check the p(k,N) law isn't an artifact of any one of them:
-    //  - `synthetic`         — snippet+typo queries (single label); scales freely.
-    //  - `msmarco`           — real dev queries + qrels (relevant-set label); real prose.
-    //  - `geonames-cities/-all` — entity name + typos (single label); short structured text.
-    let (corpus, queries): (Corpus, Vec<(String, Vec<i64>)>) = match which.as_str() {
-        "synthetic" => {
-            let c = corpus::synthetic(n, seed);
-            let qs = query::labeled_snippets(&c, q, edits, seed)
-                .into_iter()
-                .map(|(t, id)| (t, vec![id]))
-                .collect();
-            (c, qs)
-        }
-        "msmarco" => {
-            let rel = corpus::msmarco_relevance(n, q, seed).map_err(|e| format!("msmarco: {e}"))?;
-            let qs = rel
-                .queries
-                .into_iter()
-                .map(|r| (r.text, r.relevant))
-                .collect();
-            (rel.corpus, qs)
-        }
-        corpus::CORPUS_GEONAMES_CITIES | corpus::CORPUS_GEONAMES_ALL => {
-            let ent = corpus::geonames(&which, n, q, seed).map_err(|e| format!("geonames: {e}"))?;
-            let qs = query::fuzzy_queries(&ent.targets, edits.max(1), seed)
-                .into_iter()
-                .map(|fq| (fq.text, vec![fq.target]))
-                .collect();
-            (ent.corpus, qs)
-        }
-        other => {
-            return Err(format!(
-                "unknown --corpus {other} (synthetic|msmarco|geonames-cities|geonames-all)"
-            ));
-        }
-    };
+    let (corpus, queries) = labeled_corpus(&which, n, q, edits, seed)?;
     let ndocs = corpus.docs.len();
     if queries.is_empty() {
         return Err("no queries generated".into());
@@ -1022,6 +1037,83 @@ fn cmd_ranksweep(args: &[String]) -> Result<(), String> {
                     hits[ki] as f64 / qn as f64
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+// ----- tmaxsweep (selection-cap knee sweep) -----------------------------------
+
+/// Selection-cap grid for the t_max sweep: dense near the typo floor, sparser past it,
+/// capped at `max`. Values below the floor clamp to it at run time.
+fn tmax_grid(max: usize) -> Vec<usize> {
+    const G: &[usize] = &[
+        4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 40, 48, 56, 64,
+    ];
+    let mut v: Vec<usize> = G.iter().copied().filter(|&t| t <= max).collect();
+    if v.last() != Some(&max) {
+        v.push(max);
+    }
+    v
+}
+
+/// Distinct trigram count of a query under trifle's default tokenizer — the query-length
+/// facet for the t_max knee analysis.
+fn query_trigram_count(query: &str) -> usize {
+    use std::collections::HashSet;
+    use trifle::tokenize::{Tokenizer, TrigramTokenizer};
+    TrigramTokenizer::new()
+        .tokenize(query)
+        .map(|g| g.as_str().to_string())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn cmd_tmaxsweep(args: &[String]) -> Result<(), String> {
+    let flags = Flags::parse(args, &[])?;
+    flags.reject_unknown(&[
+        "corpus", "docs", "queries", "edits", "seed", "pool", "max-tmax",
+    ])?;
+    let n = flags.usize("docs", 100_000)?;
+    if n == 0 {
+        return Err("--docs must be >= 1".into());
+    }
+    let q = flags.usize("queries", 500)?;
+    let edits = flags.usize("edits", 2)?;
+    let seed = flags.u64("seed", DEFAULT_SEED)?;
+    let which = flags.str("corpus", "msmarco");
+    let max_tmax = flags.usize("max-tmax", 64)?.max(1);
+    let pool_req = flags.usize("pool", 1000)?.max(1);
+
+    let (corpus, queries) = labeled_corpus(&which, n, q, edits, seed)?;
+    let ndocs = corpus.docs.len();
+    if queries.is_empty() {
+        return Err("no queries generated".into());
+    }
+    let qn = queries.len();
+    // A generous, fixed rerank pool so selection (t_max) is the only recall bottleneck.
+    let pool = pool_req.min(ndocs);
+    let tmaxes = tmax_grid(max_tmax);
+    let trifle = Trifle::build(&corpus, Tuning::default());
+    eprintln!(
+        "tmaxsweep[{which}]: N={ndocs} queries={qn} pool={pool} t_max={tmaxes:?} — sweeping t_max…"
+    );
+    // Per (query, t_max): the query length (distinct trigram count), the rank of the first
+    // relevant doc in the generous-pool result (0 = not recovered), and the search latency.
+    // recall@k for any k is `0 < rank <= k`.
+    println!("N,t_max,q_trigrams,rank,latency_us");
+    for (text, relevant) in &queries {
+        let qt = query_trigram_count(text);
+        for &t in &tmaxes {
+            let start = std::time::Instant::now();
+            let ids = trifle.search_pool_tmax(text, pool, t);
+            let us = start.elapsed().as_micros();
+            let rank = ids
+                .iter()
+                .position(|id| relevant.contains(id))
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            println!("{ndocs},{t},{qt},{rank},{us}");
         }
     }
     Ok(())

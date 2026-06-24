@@ -107,6 +107,28 @@ impl Trifle {
             .map(|m| m.doc_id)
             .collect()
     }
+
+    /// Like [`search_pool`](Self::search_pool) but with an explicit selection cap `t_max`
+    /// and an unbounded breadth budget, so the rarest `t_max` query trigrams are kept —
+    /// selection is the swept variable while the pool is held generous. Backs the t_max
+    /// knee sweep (`tools/tmax_knee.py`).
+    pub fn search_pool_tmax(&self, query: &str, pool: usize, t_max: usize) -> Vec<i64> {
+        let ranker = trifle::rank::Bm25Ranker;
+        let mut o = SearchOpts::new(pool)
+            .ranker(&ranker)
+            .rerank(Effort::None)
+            .breadth(u64::MAX)
+            .t_max(t_max);
+        if let Some(m) = self.tuning.min_shared {
+            o = o.min_shared(m);
+        }
+        self.index
+            .search(query, o)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.doc_id)
+            .collect()
+    }
 }
 
 impl Engine for Trifle {

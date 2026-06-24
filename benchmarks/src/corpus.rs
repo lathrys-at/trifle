@@ -49,18 +49,32 @@ pub struct Manifest {
 const WORDS_MANIFEST: &str = include_str!("../sources/words_alpha.json");
 const MSMARCO_MANIFEST: &str = include_str!("../sources/msmarco.json");
 
+/// Per-corpus cache namespaces — also the `--corpus` values. Each corpus's assets
+/// live under their own subdirectory so identically named files (a `collection.tar.gz`
+/// archive, an extracted `collection.tsv`) from different corpora never stomp on each
+/// other in the cache.
+const CORPUS_SYNTHETIC: &str = "synthetic";
+const CORPUS_MSMARCO: &str = "msmarco";
+
 fn manifest(json: &str) -> Manifest {
     serde_json::from_str(json).expect("pinned-source manifest is valid JSON")
 }
 
-/// The gitignored download cache (repo-root `.cache/bench`).
-fn cache_dir() -> PathBuf {
+/// The gitignored download-cache root (repo-root `.cache/bench`).
+fn cache_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is `<repo>/benchmarks`; the cache is repo-root `.cache`.
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("benchmarks/ has a parent")
         .join(".cache")
         .join("bench")
+}
+
+/// One corpus's cache subdirectory under the root. Namespacing per corpus isolates a
+/// corpus's downloaded archive and any extracted artifacts, so two corpora that ship
+/// identically named files cannot overwrite each other.
+fn cache_dir(corpus: &str) -> PathBuf {
+    cache_root().join(corpus)
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
@@ -78,17 +92,38 @@ fn sha256_file(path: &Path) -> io::Result<String> {
         .to_string())
 }
 
-/// Ensure the pinned file is present + verified in the cache, downloading once if
-/// absent. Returns the cached path. The proxy/CA are configured in the environment,
-/// so a plain `curl` honors them.
-fn ensure(m: &Manifest) -> io::Result<PathBuf> {
-    let dir = cache_dir();
+/// Ensure the pinned file is present + verified in `corpus`'s cache, downloading
+/// once if absent. Returns the cached path. The proxy/CA are configured in the
+/// environment, so a plain `curl` honors them.
+///
+/// Verification is strict: when the manifest pins a `sha256`, a cached *or* freshly
+/// downloaded file whose hash differs is a hard error (see [`sha256_mismatch`]) — the
+/// run stops rather than silently serving or re-downloading the wrong bytes. An empty
+/// manifest `sha256` is "unpinned": the file is used as-is with a loud warning
+/// carrying the computed hash to pin back into the manifest.
+fn ensure(m: &Manifest, corpus: &str) -> io::Result<PathBuf> {
+    let dir = cache_dir(corpus);
     std::fs::create_dir_all(&dir)?;
     let file_name = m.url.rsplit('/').next().unwrap_or("asset");
     let dest = dir.join(file_name);
 
-    if dest.is_file() && !m.sha256.is_empty() && sha256_file(&dest)? == m.sha256 {
-        return Ok(dest);
+    // A cached copy: verify it against the pin before reusing. A mismatch is fatal —
+    // we do not silently re-download over it. An unpinned manifest cannot verify, so
+    // reuse with a warning rather than re-fetch a multi-GiB archive every run.
+    if dest.is_file() {
+        if m.sha256.is_empty() {
+            eprintln!(
+                "WARNING: {} is unpinned; reusing cached {} without verification.\n  Pin its sha256 in the manifest for a verified, reproducible cache.",
+                m.name,
+                dest.display()
+            );
+            return Ok(dest);
+        }
+        let got = sha256_file(&dest)?;
+        if got == m.sha256 {
+            return Ok(dest);
+        }
+        return Err(io::Error::other(sha256_mismatch(m, &dest, &got)));
     }
 
     eprintln!("fetching {} -> {}", m.url, dest.display());
@@ -111,13 +146,24 @@ fn ensure(m: &Manifest) -> io::Result<PathBuf> {
         );
     } else if got != m.sha256 {
         let _ = std::fs::remove_file(&tmp);
-        return Err(io::Error::other(format!(
-            "sha256 mismatch for {}: got {got}, expected {}",
-            m.name, m.sha256
-        )));
+        return Err(io::Error::other(sha256_mismatch(m, &dest, &got)));
     }
     std::fs::rename(&tmp, &dest)?; // atomic: a half-written download never looks complete
     Ok(dest)
+}
+
+/// A clear, actionable sha256-mismatch error. Either the upstream source legitimately
+/// changed — update the manifest's `sha256` to the printed value — or the cached file
+/// is corrupt, in which case deleting it and re-running re-downloads a clean copy.
+fn sha256_mismatch(m: &Manifest, dest: &Path, got: &str) -> String {
+    format!(
+        "sha256 mismatch for {name}\n  expected: {expected}\n  got:      {got}\n  file:     {file}\n  \
+         If the upstream source legitimately changed, update its \"sha256\" in benchmarks/sources/ to \
+         the value above; otherwise the cached file is corrupt — delete it and re-run to re-download.",
+        name = m.name,
+        expected = m.sha256,
+        file = dest.display(),
+    )
 }
 
 /// Pre-download and hash-verify the assets a corpus needs, without building it —
@@ -125,15 +171,15 @@ fn ensure(m: &Manifest) -> io::Result<PathBuf> {
 /// offline run. `synthetic` needs the wordlist; `msmarco` needs the passage archive.
 pub fn prefetch(corpus: &str) -> io::Result<()> {
     let (m, after) = match corpus {
-        "synthetic" => (manifest(WORDS_MANIFEST), ""),
-        "msmarco" => (
+        CORPUS_SYNTHETIC => (manifest(WORDS_MANIFEST), ""),
+        CORPUS_MSMARCO => (
             manifest(MSMARCO_MANIFEST),
             " (run the `msmarco` corpus once to extract collection.tsv)",
         ),
         other => return Err(io::Error::other(format!("unknown corpus: {other}"))),
     };
     eprintln!("{} — {}", m.name, m.license);
-    let p = ensure(&m)?;
+    let p = ensure(&m, corpus)?;
     eprintln!("ready: {}{after}", p.display());
     Ok(())
 }
@@ -200,12 +246,13 @@ const FALLBACK_VOCAB: &[&str] = &[
 /// trigram floor, dropping pathological ultra-long words).
 fn load_vocabulary() -> Vec<String> {
     let m = manifest(WORDS_MANIFEST);
-    let cached = cache_dir().join(m.url.rsplit('/').next().unwrap_or("words_alpha.txt"));
+    let cached =
+        cache_dir(CORPUS_SYNTHETIC).join(m.url.rsplit('/').next().unwrap_or("words_alpha.txt"));
     let raw = if cached.is_file() {
         std::fs::read_to_string(&cached).ok()
     } else {
         // Try to fetch; on failure (offline), fall back.
-        match ensure(&m).and_then(std::fs::read_to_string) {
+        match ensure(&m, CORPUS_SYNTHETIC).and_then(std::fs::read_to_string) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!(
@@ -258,7 +305,7 @@ pub fn synthetic(n: usize, seed: u64) -> Corpus {
 /// ~1 GiB of disk for the archive.
 pub fn msmarco(n: usize, seed: u64) -> io::Result<Corpus> {
     let m = manifest(MSMARCO_MANIFEST);
-    let archive = ensure(&m)?;
+    let archive = ensure(&m, CORPUS_MSMARCO)?;
     // Extract collection.tsv next to the archive (idempotent).
     let dir = archive.parent().expect("cached archive has a parent");
     let tsv = dir.join("collection.tsv");

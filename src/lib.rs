@@ -442,8 +442,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     ///
     /// On open, the store is created if absent and checked against three version
     /// stamps (schema, tokenizer fingerprint, caller `data_version`); any mismatch —
-    /// or a detected `seg`↔posting desync — drops the cache to empty (no migrations).
-    /// After such a reset, [`rebuild`](Self::rebuild) repopulates it.
+    /// or a broken id-allocation invariant (a segment id at or past the allocator's
+    /// high-water mark) — drops the cache to empty (no migrations). After such a reset,
+    /// [`rebuild`](Self::rebuild) repopulates it.
     ///
     /// # Errors
     ///

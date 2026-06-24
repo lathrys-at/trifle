@@ -140,8 +140,8 @@ pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
 }
 
 /// Reset the store to empty: drop persistent tables and any shadows, then recreate
-/// the persistent tables. Used when a version stamp mismatches or a `seg`↔posting
-/// desync is detected at open.
+/// the persistent tables. Used when a version stamp mismatches or the id-allocation
+/// invariant is found broken at open.
 pub(crate) fn reset(conn: &Connection, ns: &Namespace) -> Result<()> {
     drop_shadows(conn, ns)?;
     drop_persistent(conn, ns)?;

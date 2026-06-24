@@ -113,8 +113,8 @@ A search flows through four stages, each its own module — this is the spine of
   transaction as the segment.
 - **Schema** (`src/schema.rs`) — all table names come from a validated `Namespace` (no SQL
   injection surface in the interpolated DDL). Three version stamps — schema version, tokenizer
-  fingerprint, caller `data_version` — gate drift; a mismatch (or a detected `seg`↔posting
-  desync) **resets the cache, never migrates**. Monotonic id allocation + the atomic
+  fingerprint, caller `data_version` — gate drift; a mismatch (or a broken id-allocation
+  invariant) **resets the cache, never migrates**. Monotonic id allocation + the atomic
   shadow-table swap that `rebuild()` uses live here.
 - **Backends** (`src/store/`, behind the `Backend` trait):
   - `Sidecar` (default) — trifle owns its own SQLite file: WAL, `mmap`, one mutexed write

@@ -54,8 +54,9 @@ pub(crate) fn select<Tk: Clone + Ord>(tokens: &[(Tk, i64)], params: SelectParams
     present.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
     // The typo floor, clamped to the match floor and to what's present; the ceiling
-    // can never undercut the floor.
-    let f = (params.min_shared + params.typo_damage) as usize;
+    // can never undercut the floor. Summed in usize so a caller-supplied `min_shared`
+    // near `u32::MAX` cannot overflow the add.
+    let f = params.min_shared as usize + params.typo_damage as usize;
     let floor = f.max(params.min_shared as usize).min(present.len());
     let ceiling = params.k_max.max(floor);
 
@@ -119,6 +120,15 @@ mod tests {
         ]);
         let kept = select(&t, params(2, 0));
         assert_eq!(kept, ["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn extreme_min_shared_does_not_overflow() {
+        // A pathological `min_shared` near u32::MAX must not panic on the floor add
+        // (debug overflow check); the floor just clamps to what is present.
+        let t = toks(&[("a", 1), ("b", 2), ("c", 3)]);
+        let kept = select(&t, params(u32::MAX, 0));
+        assert_eq!(kept, ["a", "b", "c"]); // clamped to present.len()
     }
 
     #[test]

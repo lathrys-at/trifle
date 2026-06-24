@@ -96,16 +96,16 @@ COMMANDS:
 
 COMMON OPTIONS:
     --docs <N>                    Index size. For `relevance`, the distractor target
-                                  (answers are always indexed)   [default: 50000, fuzzy 200000]
+                                  (answers are always indexed) [default: 50000, fuzzy 200000]
     --queries <N>                 Queries (relevance: sampled real queries; fuzzy: target
-                                  entities)                      [default: latency 2000, relevance 1000, fuzzy 2000]
-    --k <N>                       Top-k cutoff                                    [default: 10]
+                                  entities) [default: latency 2000, relevance 1000, fuzzy 2000]
+    --k <N>                       Top-k cutoff [default: 10]
     --seed <N>                    Master seed (decimal or 0x-hex); fixes corpus + query
-                                  sampling for a byte-reproducible run        [default: 0x5EED..]
+                                  sampling for a byte-reproducible run [default: 0x5EED..]
 
 SEARCH-TUNING (trifle only):
-    --min-shared <M>              Match floor m (shared rare tokens)           [default: engine]
-    --breadth <B>                 Breadth budget B (recall/latency)            [default: engine]
+    --min-shared <M>              Match floor m (shared rare tokens) [default: engine]
+    --breadth <B>                 Breadth budget B (recall/latency) [default: engine]
     --effort <none|low|medium|high|max>  Rerank effort (pool depth c·√(kN) + the BM25
                                   precision tier). Omit to use trifle's default (Medium)
 
@@ -115,18 +115,18 @@ ENGINE SELECTION (latency, relevance, fuzzy):
                                   e.g. --filter like-scan (slow on huge corpora)
 
 LATENCY:
-    --corpus <synthetic|msmarco>  Corpus source                              [default: synthetic]
-    --warmup <N>                  Untimed warmup queries                            [default: 200]
-    --repeat <N>                  Measured passes (samples accumulate)                [default: 1]
+    --corpus <synthetic|msmarco>  Corpus source [default: synthetic]
+    --warmup <N>                  Untimed warmup queries [default: 200]
+    --repeat <N>                  Measured passes (samples accumulate) [default: 1]
     --batched                     One search_batch call (shares posting/frequency reads)
-    --concurrent <T>              Run trifle across T reader threads (read-pool axis)  [default: 0]
+    --concurrent <T>              Run trifle across T reader threads (read-pool axis) [default: 0]
 
 FUZZY:
-    --corpus <geonames-cities|geonames-all>   Entity corpus           [default: geonames-cities]
+    --corpus <geonames-cities|geonames-all>   Entity corpus [default: geonames-cities]
     --edits <N>                   Typos per query. Omit to run {1, 2} separately.
 
 PROFILE:
-    --corpus <synthetic|msmarco>  Corpus source                              [default: synthetic]
+    --corpus <synthetic|msmarco>  Corpus source [default: synthetic]
 
 EXAMPLES:
     trifle-bench fetch --corpus geonames-cities

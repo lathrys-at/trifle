@@ -19,12 +19,12 @@ python3 benchmarks/tools/calibrate_pool.py --corpus msmarco --queries 500 --seed
 
 ---
 
-## Why pool depth is a *power law* in N (from Zipf's law)
+## Pool-depth law
 
 trifle generates candidates by **overlap** — for each segment, the number of *selected*
 query trigrams it contains, counted bit-sliced (independent of posting size) — and
 orders them coarsely by that count. A precision tier then reorders the top-`pool`. The
-question is how deep `pool` must be. The answer falls out of the corpus's statistics.
+question is how deep `pool` must be.
 
 ### 1. Zipf's law on trigrams
 
@@ -44,8 +44,7 @@ trigrams have small `φ`.
 ### 3. A random distractor's overlap
 
 For a non-relevant segment `d`, model its trigram membership as independent across trigrams
-(a mean-field assumption — the "good statistical properties" the Zipf structure provides at
-scale). It contains selected trigram `tᵢ` with probability `φᵢ = df(tᵢ)/N`, so its overlap
+(a mean-field assumption valid at scale). It contains selected trigram `tᵢ` with probability `φᵢ = df(tᵢ)/N`, so its overlap
 
 ```
 O_d = Σᵢ 1[tᵢ ∈ d]   ~  PoissonBinomial(φ₁ … φ_ksel),   mean μ = Σᵢ φᵢ.
@@ -57,7 +56,7 @@ The relevant segment `r` shares the query's content, but a *paraphrased* query (
 or a *typo'd* one drops some trigrams, so `r` carries only a fraction: `O_r = ρ·k_sel`,
 `ρ ∈ (0,1]`. `O_r` is a fixed, query-dependent number; distractor overlaps are random.
 
-### 5. The relevant segment's overlap-RANK is ∝ N
+### 5. The relevant segment's overlap-rank is ∝ N
 
 Its rank by overlap is one plus the number of distractors that beat it:
 
@@ -66,15 +65,13 @@ rank(r) = 1 + #{ d : O_d > O_r }   ⇒   E[rank(r)] = 1 + (N−1)·q  ≈  1 + N
 ```
 
 where `q = P(O_d > O_r)` is the per-distractor tail probability. **`q` is fixed by the
-query; the expected overlap-rank of the answer grows linearly with `N`.** This is the whole
-engine: a bigger index has proportionally more *accidental* high-overlap distractors burying
-the true answer.
+query; the expected overlap-rank of the answer grows linearly with `N`.** A bigger index has
+proportionally more accidental high-overlap distractors burying the answer.
 
 ### 6. The pool must reach that rank → naively `pool ∝ N`
 
 The reranker can only reorder what is *in* the pool, so recovering `r` needs
-`pool ≥ rank(r) ∝ N`. Taken literally that is ruinous (pool scaling with the corpus). It
-isn't — two effects knock the exponent below 1, but **never to a logarithm**:
+`pool ≥ rank(r) ∝ N`. Two effects knock the exponent below 1, but never to a logarithm:
 
 - **(a) The reranker is correlated with relevance.** idf-weighting + literal verification
   rank `r` above most of the `q·N` accidental distractors (they share only *common* trigrams,
@@ -84,7 +81,7 @@ isn't — two effects knock the exponent below 1, but **never to a logarithm**:
   recall over that distribution, the pool for a fixed recall *fraction* scales as `N^b`,
   `b < 1`.
 
-### 7. The law
+### 7. Result
 
 ```
               ┌ k                      (small N: the answer is already in the top-k)
@@ -100,15 +97,14 @@ p*(k, N) ≈ max(k, c · √(k · N)).
 
 The k-dependence is *weak* (`a ≈ 0.2–0.55` across corpora) — pool depth is driven far more
 by `N` than by `k`, because the dominant cost is *inclusion* (`rank ∝ N`) and `k` only sets
-the final cutoff. `√(kN)` (a = b = ½) is a clean, serviceable middle; the exact exponents
-are corpus-dependent (synthetic tilts N-heavy, `a≈0.2 b≈0.77`) — **same magnitude, but
-calibrate per corpus, and never expect a log.**
+the final cutoff. `√(kN)` (a = b = ½) is the working approximation; the exact exponents
+are corpus-dependent (synthetic tilts N-heavy, `a≈0.2 b≈0.77`). Calibrate per corpus.
 
 ### 8. The constant `c`, and the separate recall ceiling
 
 `c` is not arbitrary — it is exactly `c(θ) = p*_θ / √(k·N)` for a chosen recall target `θ`
 (a fraction of the deep-pool recall **ceiling**). The tool measures it as the median of
-`p*/√(kN)` across the `(k,N)` grid; a *tight* spread means `√(kN)` genuinely holds there.
+`p*/√(kN)` across the `(k,N)` grid; a tight spread means `√(kN)` holds there.
 
 The ceiling *itself* also falls with `N` — as accidental high-overlap distractors become
 genuinely indistinguishable from `r` by the trigram signal, the reranker can't separate
@@ -129,7 +125,7 @@ The shipped constants pin `c` to recall targets (validated by this tool, see bel
 
 ---
 
-## What the tool does
+## What it does
 
 **Sweep.** For each `N` in `--docs`, `calibrate_pool.py` invokes
 
@@ -155,8 +151,7 @@ the whole `k` column. Labels: `synthetic`/`geonames-*` carry a single relevant i
 | `summary.json` | exponents, `R²`, and `c` (with spread) at every target |
 
 It prints a table of `c` per target and maps the shipped `Effort` constants onto the
-nearest calibrated target — so if a future corpus or code change moves the constants, the
-drift is visible immediately.
+nearest calibrated target — so constant drift from a corpus or code change is visible.
 
 ## Usage
 

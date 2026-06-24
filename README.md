@@ -72,9 +72,12 @@ A document may have many segments. `insert` replaces all segments under a
   (`min_shared`) and an orthogonal recall dial (`breadth`).
 - **Configurable normalization** — NFC (default), NFD, accent-insensitive
   (`NfdStripMarks`), or none; Unicode casefolding on by default.
-- **Pluggable ranking** — the default orders by overlap; a custom `Ranker` can add a
-  precision tier (literal verification, proximity, idf-weighting) over the text each
-  candidate carries.
+- **Reranking by default** — bit-sliced overlap generates candidates; the default
+  `Effort::Medium` then reranks a pool of `≈ c·√(k·N)` of them with a BM25-shaped precision
+  tier (idf-weighting + length normalization + literal verification). Trade recall for
+  latency with `SearchOpts::rerank(Effort)` — `None` (overlap-only, lowest latency) through
+  `Max` — or supply a custom `Ranker`. The pool law and the `Effort` constants are
+  calibrated in `benchmarks/tools/` (`p(k,N)`, from Zipf's law).
 - **Scoped search** — a membership predicate over provenance, evaluated only over
   candidates (never the corpus).
 - **Concurrency** — a single internal writer plus a pooled set of read-only

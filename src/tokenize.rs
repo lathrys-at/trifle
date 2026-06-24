@@ -232,7 +232,7 @@ pub enum Normalization {
     /// search when accent tolerance matters.
     NfdStripMarks,
     /// No normalization. Choose only when the caller guarantees a canonical form on
-    /// both writes and queries (see [`assume_normalized`](TrigramTokenizerBuilder::assume_normalized)).
+    /// both writes and queries (see [`assume_normalized`](NgramTokenizerBuilder::assume_normalized)).
     None,
 }
 

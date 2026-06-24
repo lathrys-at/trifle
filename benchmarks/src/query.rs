@@ -129,6 +129,29 @@ pub fn perf_queries(corpus: &Corpus, n: usize, seed: u64) -> Vec<Query> {
         .collect()
 }
 
+/// Labeled snippet queries for the `ranksweep` pool-depth study: each is a 3–6 word
+/// snippet of a random corpus doc with `edits` typos, labeled by that doc's id (the
+/// known relevant answer). The typos give the true doc only *partial* trigram overlap,
+/// so it ranks at depth among distractors — the regime the rerank pool must reach.
+pub fn labeled_snippets(corpus: &Corpus, n: usize, edits: usize, seed: u64) -> Vec<(String, i64)> {
+    let mut rng = Rng::new(seed ^ 0x5A5A_1234 ^ ((edits as u64) << 40));
+    (0..n)
+        .filter_map(|_| {
+            let doc = &corpus.docs[rng.below(corpus.docs.len())];
+            let len = rng.range(3, 6);
+            let snip = snippet(&doc.text, len, &mut rng);
+            if snip.chars().count() < 4 {
+                return None;
+            }
+            let text = corrupt(snip, edits, &mut rng);
+            if text.chars().count() < 3 {
+                return None;
+            }
+            Some((text, doc.id))
+        })
+        .collect()
+}
+
 /// Generate one fuzzy query per target entity: the entity name with exactly `edits`
 /// single-character typos (§10.5), labeled by the entity id. Deterministic per
 /// `(seed, edits)`, so 1-edit and 2-edit runs use distinct corruptions. Names too short

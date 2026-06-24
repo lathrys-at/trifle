@@ -18,7 +18,7 @@ use std::path::Path;
 use rusqlite::Connection;
 use trifle::store::Sidecar;
 use trifle::tokenize::TrigramTokenizer;
-use trifle::{Config, Index, SearchOpts};
+use trifle::{Config, Effort, Index, SearchOpts};
 
 use crate::corpus::Corpus;
 
@@ -38,12 +38,14 @@ pub trait Engine {
     }
 }
 
-/// Search-strictness knobs for trifle (`m`, `B`; §10.3). `None` leaves the engine
-/// default. Baselines have no analogue and ignore these.
+/// Search-strictness knobs for trifle (`m`, `B`; §10.3) plus the rerank [`Effort`].
+/// `None` leaves the engine default (Effort defaults to Medium). Baselines have no
+/// analogue and ignore these.
 #[derive(Clone, Copy, Default)]
 pub struct Tuning {
     pub min_shared: Option<u32>,
     pub breadth: Option<u64>,
+    pub effort: Option<Effort>,
 }
 
 /// trifle itself.
@@ -62,8 +64,9 @@ impl Trifle {
             .docs
             .iter()
             .map(|d| trifle::Segment::new(d.id, "field", "body", d.text.clone()));
-        index.insert_batch(segs).unwrap();
-        index.compact().unwrap(); // steady-state read shape (folded bases)
+        // Bulk-load via rebuild (roaring accumulation, folded bases): the steady-state
+        // read shape, and far more memory-efficient than insert_batch at million-doc N.
+        index.rebuild(segs).unwrap();
         Trifle {
             index,
             tuning,
@@ -79,7 +82,31 @@ impl Trifle {
         if let Some(b) = self.tuning.breadth {
             o = o.breadth(b);
         }
+        if let Some(e) = self.tuning.effort {
+            o = o.rerank(e);
+        }
         o
+    }
+
+    /// Search the top-`pool` overlap candidates, reranked by the BM25 precision tier,
+    /// returning doc ids best-first. Exact pool control for the `ranksweep` calibration:
+    /// `Effort::None` disables the √(kN) auto-pool (so pool == `limit`), while the
+    /// explicit ranker still reranks. recall@k for any `k <= pool` is `id in result[..k]`.
+    pub fn search_pool(&self, query: &str, pool: usize) -> Vec<i64> {
+        let ranker = trifle::rank::Bm25Ranker;
+        let mut o = SearchOpts::new(pool).ranker(&ranker).rerank(Effort::None);
+        if let Some(m) = self.tuning.min_shared {
+            o = o.min_shared(m);
+        }
+        if let Some(b) = self.tuning.breadth {
+            o = o.breadth(b);
+        }
+        self.index
+            .search(query, o)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.doc_id)
+            .collect()
     }
 }
 

@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 use baselines::{Engine, Fts5, Fts5Word, Like, MatchMode, Trifle, Tuning};
 use corpus::{Corpus, Entity};
 use metrics::{Dist, Latency, fmt_dur, scored_queries, set_recall_at_k, throughput};
+use trifle::Effort;
 use trifle::tokenize::{Tokenizer, TrigramTokenizer};
 
 /// The default master seed (`0x5EED…`). Override with `--seed`.
@@ -60,6 +61,7 @@ fn main() -> ExitCode {
         "relevance" => cmd_relevance(rest),
         "fuzzy" => cmd_fuzzy(rest),
         "profile" => cmd_profile(rest),
+        "ranksweep" => cmd_ranksweep(rest),
         "fetch" => cmd_fetch(rest),
         "help" | "--help" | "-h" => {
             print!("{}", USAGE);
@@ -87,6 +89,7 @@ COMMANDS:
     relevance  MS MARCO real dev queries+qrels: set-recall@k vs word BM25 (+trigram) (§10.4)
     fuzzy      Entity name+edit recall vs FTS5 trigram-MATCH / LIKE, per edit-count (§10.5)
     profile    Σ(kept-posting cardinality) distribution — the §10.2 work-done curve
+    ranksweep  recall@k vs rerank-pool depth CSV (backend for tools/calibrate_pool.py)
     fetch      Download + verify the pinned corpus assets into the cache (no bench)
     help       Show this message
 
@@ -102,6 +105,8 @@ COMMON OPTIONS:
 SEARCH-TUNING (trifle only, §10.3):
     --min-shared <M>              Match floor m (shared rare tokens)           [default: engine]
     --breadth <B>                 Breadth budget B (recall/latency)            [default: engine]
+    --effort <none|low|medium|high|max>  Rerank effort (pool depth c·√(kN) + the BM25
+                                  precision tier). Omit to use trifle's default (Medium)
 
 ENGINE SELECTION (latency, relevance, fuzzy):
     --filter <engine>             Skip an engine; repeatable. Engines: trifle,
@@ -261,10 +266,26 @@ fn tuning(flags: &Flags) -> Result<Tuning, String> {
     Ok(Tuning {
         min_shared: flags.opt_u32("min-shared")?,
         breadth: flags.opt_u64("breadth")?,
+        effort: parse_effort(flags)?,
     })
 }
 
-const CORPUS_OPTS: &[&str] = &["corpus", "docs", "seed", "min-shared", "breadth"];
+/// Parse `--effort <none|low|medium|high|max>`; `None` (unset) leaves trifle's default.
+fn parse_effort(flags: &Flags) -> Result<Option<Effort>, String> {
+    if !flags.has("effort") {
+        return Ok(None);
+    }
+    Ok(Some(match flags.str("effort", "").as_str() {
+        "none" => Effort::None,
+        "low" => Effort::Low,
+        "medium" => Effort::Medium,
+        "high" => Effort::High,
+        "max" => Effort::Max,
+        other => return Err(format!("--effort {other} (none|low|medium|high|max)")),
+    }))
+}
+
+const CORPUS_OPTS: &[&str] = &["corpus", "docs", "seed", "min-shared", "breadth", "effort"];
 
 /// The engine identifiers accepted by `--filter`. These must match the strings each
 /// engine returns from `baselines::Engine::name()`. Not every command runs every
@@ -610,6 +631,7 @@ fn cmd_relevance(args: &[String]) -> Result<(), String> {
         "min-shared",
         "breadth",
         "filter",
+        "effort",
     ])?;
     let skip = skipped_engines(&flags)?;
 
@@ -695,6 +717,7 @@ fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
         "min-shared",
         "breadth",
         "filter",
+        "effort",
     ])?;
     let skip = skipped_engines(&flags)?;
     if skip.contains(ENGINE_TRIFLE) {
@@ -877,6 +900,129 @@ fn cmd_profile(args: &[String]) -> Result<(), String> {
     );
     println!("# Correlate with the p99 of `latency`: if the tail tracks this curve, the");
     println!("# residual is big-bitset AND/XOR cost (expected). If not, look at hydration.");
+    Ok(())
+}
+
+// ----- ranksweep (rerank-pool calibration backend) ----------------------------
+
+/// A log-spaced pool-depth grid `1 … max` (≈×1.5 steps, dense at the low end where the
+/// recall curve bends), for the calibration sweep.
+fn pool_grid(max: usize) -> Vec<usize> {
+    let mut v = vec![1usize];
+    while *v.last().unwrap() < max {
+        let last = *v.last().unwrap();
+        let next = ((last as f64 * 1.5).round() as usize).max(last + 1);
+        v.push(next.min(max));
+    }
+    v
+}
+
+/// The measurement backend for the rerank-pool calibration (`tools/calibrate_pool.py`).
+///
+/// Emits the recall@k vs rerank-pool-depth matrix for one `(corpus, --docs N, --queries,
+/// --seed)` as CSV to stdout (`N,edits,pool,k,queries,recall`). Builds the index once,
+/// then for each pool depth reranks exactly the top-`pool` overlap candidates (via
+/// [`Trifle::search_pool`], which pins the pool with `Effort::None` and the explicit
+/// BM25 reranker) — so recall@k for every `k <= pool` falls out of one pass. The labels:
+/// `synthetic`/`geonames` carry a single relevant id (snippet/name + typos), `msmarco`
+/// the qrel relevant-set. See `tools/README.md` for the model and how the constants fall
+/// out of this matrix.
+fn cmd_ranksweep(args: &[String]) -> Result<(), String> {
+    let flags = Flags::parse(args, &[])?;
+    flags.reject_unknown(&[
+        "corpus",
+        "docs",
+        "queries",
+        "edits",
+        "seed",
+        "min-shared",
+        "breadth",
+        "max-pool",
+    ])?;
+    let n = flags.usize("docs", 100_000)?;
+    if n == 0 {
+        return Err("--docs must be >= 1".into());
+    }
+    let q = flags.usize("queries", 500)?;
+    let edits = flags.usize("edits", 2)?;
+    let seed = flags.u64("seed", DEFAULT_SEED)?;
+    let tuning = tuning(&flags)?;
+    let which = flags.str("corpus", "synthetic");
+
+    // Log-spaced pool depths up to `--max-pool` (resolution dense at the low end), capped
+    // to the corpus size at run time. Raise it past the default 2048 to push the recall
+    // ceiling at very large N (where 2048 hasn't saturated — see tools/README.md caveats).
+    let max_pool = flags.usize("max-pool", 2048)?.max(1);
+    let pools = pool_grid(max_pool);
+    const KS: &[usize] = &[1, 5, 10, 20, 50, 100];
+
+    // (corpus, labeled queries). Each corpus yields a different query/label regime, so
+    // the calibration can check the p(k,N) law isn't an artifact of any one of them:
+    //  - `synthetic`         — snippet+typo queries (single label); scales freely.
+    //  - `msmarco`           — real dev queries + qrels (relevant-set label); real prose.
+    //  - `geonames-cities/-all` — entity name + typos (single label); short structured text.
+    let (corpus, queries): (Corpus, Vec<(String, Vec<i64>)>) = match which.as_str() {
+        "synthetic" => {
+            let c = corpus::synthetic(n, seed);
+            let qs = query::labeled_snippets(&c, q, edits, seed)
+                .into_iter()
+                .map(|(t, id)| (t, vec![id]))
+                .collect();
+            (c, qs)
+        }
+        "msmarco" => {
+            let rel = corpus::msmarco_relevance(n, q, seed).map_err(|e| format!("msmarco: {e}"))?;
+            let qs = rel
+                .queries
+                .into_iter()
+                .map(|r| (r.text, r.relevant))
+                .collect();
+            (rel.corpus, qs)
+        }
+        corpus::CORPUS_GEONAMES_CITIES | corpus::CORPUS_GEONAMES_ALL => {
+            let ent = corpus::geonames(&which, n, q, seed).map_err(|e| format!("geonames: {e}"))?;
+            let qs = query::fuzzy_queries(&ent.targets, edits.max(1), seed)
+                .into_iter()
+                .map(|fq| (fq.text, vec![fq.target]))
+                .collect();
+            (ent.corpus, qs)
+        }
+        other => {
+            return Err(format!(
+                "unknown --corpus {other} (synthetic|msmarco|geonames-cities|geonames-all)"
+            ));
+        }
+    };
+    let ndocs = corpus.docs.len();
+    if queries.is_empty() {
+        return Err("no queries generated".into());
+    }
+    let qn = queries.len();
+    let trifle = Trifle::build(&corpus, tuning);
+    eprintln!("ranksweep[{which}]: N={ndocs} queries={qn} edits={edits} — sweeping pools…");
+
+    for &pool in &pools {
+        if pool > ndocs {
+            continue;
+        }
+        let mut hits = vec![0usize; KS.len()];
+        for (text, relevant) in &queries {
+            let ids = trifle.search_pool(text, pool); // top-`pool` overlap, BM25-reranked
+            for (ki, &k) in KS.iter().enumerate() {
+                if k <= pool && ids.iter().take(k).any(|id| relevant.contains(id)) {
+                    hits[ki] += 1;
+                }
+            }
+        }
+        for (ki, &k) in KS.iter().enumerate() {
+            if k <= pool {
+                println!(
+                    "{ndocs},{edits},{pool},{k},{qn},{:.4}",
+                    hits[ki] as f64 / qn as f64
+                );
+            }
+        }
+    }
     Ok(())
 }
 

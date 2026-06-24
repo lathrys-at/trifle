@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use memchr::memmem;
 use roaring::RoaringBitmap;
 use rusqlite::Connection;
 use rusqlite::types::Value;
@@ -202,9 +203,9 @@ pub trait Ranker: Send + Sync {
     fn rank(&self, candidates: &Candidates<'_>, query: &QueryContext<'_>) -> Vec<Ranked>;
 }
 
-/// The default ranker: order by overlap count. Reads only the counts the bit-sliced
-/// pass already produced, so it is effectively free — the candidates arrive in
-/// overlap-descending order, and this preserves it.
+/// The default ranker when [`Effort`](crate::Effort) reranking is **off**: order by
+/// overlap count. Reads only the counts the bit-sliced pass already produced, so it is
+/// effectively free — the candidates arrive overlap-descending and this preserves it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OverlapRanker;
 
@@ -212,6 +213,125 @@ impl Ranker for OverlapRanker {
     fn rank(&self, candidates: &Candidates<'_>, _query: &QueryContext<'_>) -> Vec<Ranked> {
         (0..candidates.len())
             .map(|candidate| Ranked { candidate })
+            .collect()
+    }
+}
+
+/// BM25 idf for a token present in `df` of `n` segments.
+fn idf(df: u64, n: u64) -> f64 {
+    let (df, n) = (df as f64, n as f64);
+    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+}
+
+/// The precision-tier reranker run over an over-fetched pool when
+/// [`Effort`](crate::Effort) reranking is on (the default). It rescores each candidate
+/// with a BM25-shaped signal:
+///
+/// - **idf-weighted matched mass** — a candidate's score sums `idf(df)` over the selected
+///   query trigrams it shares, so *rare* shared trigrams (the discriminating ones) count
+///   far more than common ones that any long document carries.
+/// - **length normalization** — divide by `len^0.35`, so a long document doesn't win on
+///   incidental overlap (the missing piece §10.1 calls out).
+/// - **literal word-coverage** — multiply by a small boost per query *word* found
+///   verbatim in the text (a `memmem` substring verify, the [`Finder`](memmem::Finder)
+///   built once per query). It is **trigram-gated**: trigram-containment is necessary for
+///   substring-containment, so a word whose selected trigrams the candidate is missing is
+///   provably absent and skips the (per-candidate) lowercase + search.
+///
+/// Reads only the candidate text and posting cardinalities already in hand — no extra
+/// store reads. This is the engine behind the recall lift; see `benchmarks/` for the
+/// recall/latency curves and the `Effort` pool-depth calibration.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Bm25Ranker;
+
+impl Ranker for Bm25Ranker {
+    fn rank(&self, candidates: &Candidates<'_>, query: &QueryContext<'_>) -> Vec<Ranked> {
+        // Length-normalization exponent and per-literal-hit boost.
+        const ALPHA: f64 = 0.35;
+        const LIT_BOOST: f64 = 0.5;
+        let n = query.n_segments.max(1);
+
+        // The literal tier: per distinct query word (>= 3 chars), a memmem Finder paired
+        // with the bitmask of the *selected query trigrams that word covers*. Built ONCE
+        // here. `mask == 0` is a common word (its trigrams were all pruned): kept but
+        // ungateable — it contributes only when the candidate is already being lowercased
+        // for some discriminating word, so the gate stays recall-neutral. (Gating needs
+        // the present set to fit a u64; with > 64 selected trigrams the tier runs ungated.)
+        let gated = candidates.present.len() <= 64;
+        let lits: Vec<(u64, memmem::Finder<'static>)> = {
+            let lowered = query.query.to_lowercase();
+            let mut words: Vec<&str> = lowered
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.chars().count() >= 3)
+                .collect();
+            words.sort_unstable();
+            words.dedup();
+            words
+                .into_iter()
+                .map(|w| {
+                    let mut mask = 0u64;
+                    if gated {
+                        for (j, (t, _)) in candidates.present.iter().enumerate() {
+                            if w.contains(*t) {
+                                mask |= 1u64 << j;
+                            }
+                        }
+                    }
+                    (mask, memmem::Finder::new(w.as_bytes()).into_owned())
+                })
+                .collect()
+        };
+
+        let mut scored: Vec<(usize, f64, u32)> = (0..candidates.len())
+            .map(|i| {
+                let s = &candidates.survivors[i];
+                // idf mass + the matched selected-trigram bitmask (for the literal gate),
+                // in one pass over the few present postings.
+                let mut idf_sum = 0.0;
+                let mut matched_mask = 0u64;
+                for (j, (_, bm)) in candidates.present.iter().enumerate() {
+                    if bm.contains(s.seg_id) {
+                        idf_sum += idf(bm.len(), n);
+                        if gated {
+                            matched_mask |= 1u64 << j;
+                        }
+                    }
+                }
+                let len = s.text.as_deref().map_or(1, |t| t.chars().count()).max(1);
+                let mut score = idf_sum / (len as f64).powf(ALPHA);
+                // Literal tier, trigram-gated: lowercase + memmem only the words that can
+                // be present; a discriminating word triggers the work, common words ride
+                // the lowercase we already paid for (so the gate never drops a real hit).
+                if !lits.is_empty() {
+                    let hits = s.text.as_deref().map_or(0, |text| {
+                        let gate = |mask: u64| !gated || (mask & matched_mask) == mask;
+                        let triggers =
+                            |mask: u64| if gated { mask != 0 && gate(mask) } else { true };
+                        if !lits.iter().any(|(mask, _)| triggers(*mask)) {
+                            return 0;
+                        }
+                        let lower = text.to_lowercase();
+                        lits.iter()
+                            .filter(|(mask, _)| gate(*mask))
+                            .filter(|(_, f)| f.find(lower.as_bytes()).is_some())
+                            .count()
+                    });
+                    score *= 1.0 + LIT_BOOST * hits as f64;
+                }
+                (i, score, s.overlap)
+            })
+            .collect();
+
+        // Best score first; tie-break by raw overlap, then original (overlap) order.
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.2.cmp(&a.2))
+                .then(a.0.cmp(&b.0))
+        });
+        scored
+            .into_iter()
+            .map(|(candidate, _, _)| Ranked { candidate })
             .collect()
     }
 }
@@ -224,6 +344,8 @@ pub struct QueryContext<'a> {
     pub selected: &'a [String],
     /// The match floor `m` in effect for this query.
     pub min_shared: u32,
+    /// Total live segments `N`, for idf weighting (`idf(t) ∝ ln(N/df(t))`).
+    pub n_segments: u64,
 }
 
 /// The overlap-counted survivors handed to a [`Ranker`], with their text already

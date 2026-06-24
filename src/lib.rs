@@ -42,7 +42,7 @@
 //! # What trifle leaves to the caller
 //!
 //! Embeddings/semantic search, fusion (RRF) with other signals, an exact precision
-//! tier beyond a custom [`Ranker`](rank::Ranker), sub-trigram (`<3`-char) query
+//! tier beyond a custom [`Ranker`], sub-trigram (`<3`-char) query
 //! handling, and deciding *when* the cache is stale relative to the source of truth.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -73,7 +73,7 @@ use rusqlite::types::Value;
 pub use rusqlite;
 
 pub use error::{Error, Result};
-use rank::{Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
+use rank::{Bm25Ranker, Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
 use schema::SCHEMA_VERSION;
 use select::{SelectParams, select};
 use store::{Backend, Namespace, Sidecar, TextResolver};
@@ -127,7 +127,7 @@ pub struct Config {
     pub advanced: Advanced,
     /// A [`TextResolver`] to run **contentless** (store no text snapshot, fetch text
     /// from the caller's source). `None` (default) stores a self-contained snapshot.
-    /// See the [crate](crate) docs and [`TextResolver`] for the contract.
+    /// See the [crate] docs and [`TextResolver`] for the contract.
     pub external_content: Option<Box<dyn TextResolver>>,
 }
 
@@ -209,6 +209,83 @@ pub struct Match {
 /// stack); a `dyn Fn` alias without it would force `'static` and reject such closures.
 pub type ScopeFn<'a> = dyn Fn(i64, &str, &str) -> bool + 'a;
 
+/// How hard the ranker tries: how deep a candidate pool to over-fetch and rerank.
+///
+/// Candidate generation by bit-sliced overlap is cheap but orders only coarsely (by
+/// shared-token count); the precision tier — idf weighting, length normalization, and
+/// literal verification (the [`Bm25Ranker`]) — reorders a *pool* of
+/// the top candidates. The pool must be deeper than `limit` to recover a relevant
+/// document that overlap alone ranked past `limit`, and empirically the depth needed for
+/// a given recall scales as **`c·√(limit · N)`** (N = indexed segments) — a power law in
+/// corpus size, not a constant. Each level fixes `c` to hit a fraction of the
+/// deep-pool recall **ceiling** (calibrated on MS MARCO; see `benchmarks/`):
+///
+/// | level | `c` | ≈ recall vs ceiling | cost |
+/// |-------|-----|---------------------|------|
+/// | [`None`](Effort::None)     | 0    | overlap order only | cheapest (pool = `limit`) |
+/// | [`Low`](Effort::Low)       | 0.03 | ~50% | |
+/// | [`Medium`](Effort::Medium) | 0.05 | ~90% | **the default** |
+/// | [`High`](Effort::High)     | 0.10 | ~95% | |
+/// | [`Max`](Effort::Max)       | 0.30 | ~99% (saturation tail) | deepest |
+///
+/// Deeper pool → more hydration + scoring, so latency grows ~linearly with the pool
+/// while recall grows logarithmically. The pool is always at least `limit`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Effort {
+    /// No reranking: return the bit-sliced overlap order (pool = `limit`). Cheapest;
+    /// the pre-`0.1` behavior.
+    None,
+    /// ~50% of the recall ceiling (`c = 0.03`).
+    Low,
+    /// ~90% of the recall ceiling (`c = 0.05`). The default.
+    Medium,
+    /// ~95% of the recall ceiling (`c = 0.10`).
+    High,
+    /// ~99% of the recall ceiling (`c = 0.30`) — the flat saturation tail; large pool
+    /// for the last few points.
+    Max,
+    /// An explicit coefficient `c` in `pool = max(limit, round(c·√(limit·N)))`. `0`
+    /// disables reranking, as [`None`](Effort::None).
+    Custom(f64),
+}
+
+impl Default for Effort {
+    /// [`Medium`](Effort::Medium) — reranking on, ~90% of the recall ceiling.
+    fn default() -> Self {
+        Effort::Medium
+    }
+}
+
+impl Effort {
+    /// The pool coefficient `c`.
+    fn coeff(self) -> f64 {
+        match self {
+            Effort::None => 0.0,
+            Effort::Low => 0.03,
+            Effort::Medium => 0.05,
+            Effort::High => 0.10,
+            Effort::Max => 0.30,
+            Effort::Custom(c) => c.max(0.0),
+        }
+    }
+
+    /// Whether reranking is active (a precision tier runs over an over-fetched pool).
+    fn reranks(self) -> bool {
+        self.coeff() > 0.0
+    }
+
+    /// The rerank pool depth for a result `limit` over `n_segments` indexed segments:
+    /// `max(limit, round(c·√(limit·n_segments)))`.
+    fn pool(self, limit: usize, n_segments: u64) -> usize {
+        let c = self.coeff();
+        if c == 0.0 || limit == 0 {
+            return limit;
+        }
+        let p = (c * ((limit as f64) * (n_segments as f64)).sqrt()).round();
+        limit.max(p as usize)
+    }
+}
+
 /// Per-search options.
 ///
 /// Construct with [`SearchOpts::new`] and the builder setters, or the public fields.
@@ -222,18 +299,24 @@ pub struct SearchOpts<'a> {
     pub min_shared: Option<u32>,
     /// `B` — the breadth budget in selection cost units. `None` → `0`.
     pub breadth: Option<u64>,
-    /// A per-query [`Ranker`](rank::Ranker). `None` → the built-in
-    /// [`OverlapRanker`](rank::OverlapRanker).
+    /// A per-query [`Ranker`]. `None` → the built-in [`OverlapRanker`] (when reranking is
+    /// off) or [`Bm25Ranker`] (the [`Effort`] precision tier).
     pub ranker: Option<&'a dyn Ranker>,
     /// A membership predicate `(doc_id, source, ref) -> keep` evaluated over
     /// candidates in overlap order — never over the corpus. The walk continues until
     /// `limit` predicate-passing results lock, so scoping needs no over-fetch. The
     /// predicate must not call back into this index's writer.
     pub scope: Option<&'a ScopeFn<'a>>,
+    /// How hard to rerank — the over-fetch [`Effort`]. Defaults to
+    /// [`Medium`](Effort::Medium). [`None`](Effort::None) restores the pre-`0.1`
+    /// overlap-only behavior (cheapest). When `ranker` is also set, `effort` still
+    /// chooses the pool depth but that custom ranker scores it.
+    pub effort: Effort,
 }
 
 impl<'a> SearchOpts<'a> {
-    /// Options for the given result limit, everything else default.
+    /// Options for the given result limit, everything else default (reranking at
+    /// [`Effort::Medium`]).
     pub fn new(limit: usize) -> Self {
         SearchOpts {
             limit,
@@ -241,6 +324,7 @@ impl<'a> SearchOpts<'a> {
             breadth: None,
             ranker: None,
             scope: None,
+            effort: Effort::default(),
         }
     }
 
@@ -259,6 +343,12 @@ impl<'a> SearchOpts<'a> {
     /// Set a per-query ranker.
     pub fn ranker(mut self, ranker: &'a dyn Ranker) -> Self {
         self.ranker = Some(ranker);
+        self
+    }
+
+    /// Set the rerank [`Effort`] (pool depth + whether the precision tier runs).
+    pub fn rerank(mut self, effort: Effort) -> Self {
+        self.effort = effort;
         self
     }
 
@@ -319,8 +409,8 @@ enum Content {
 
 /// An embedded fuzzy-search index over text segments.
 ///
-/// Generic over the [`Tokenizer`](tokenize::Tokenizer) (monomorphized — it is on the
-/// hot path) and the storage [`Backend`](store::Backend). Both default, so the common
+/// Generic over the [`Tokenizer`] (monomorphized — it is on the
+/// hot path) and the storage [`Backend`]. Both default, so the common
 /// case is just `Index`. Open with [`open_at`](Index::open_at) (an owned sidecar
 /// file) or [`open`](Index::open) (any backend).
 ///
@@ -337,7 +427,7 @@ pub struct Index<T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
 
 impl Index<TrigramTokenizer, Sidecar> {
     /// Open (creating if absent) an index at `path` with the default trigram
-    /// tokenizer and an owned [`Sidecar`](store::Sidecar) file. The common case.
+    /// tokenizer and an owned [`Sidecar`] file. The common case.
     ///
     /// # Errors
     ///
@@ -779,8 +869,16 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             alpha: self.advanced.alpha,
             beta: self.advanced.beta,
         };
-        let default_ranker = OverlapRanker;
-        let ranker: &dyn Ranker = opts.ranker.unwrap_or(&default_ranker);
+        // The reranker: an explicit `opts.ranker` wins; otherwise the precision tier
+        // ([`Bm25Ranker`]) when reranking is active, else plain overlap order.
+        let overlap = OverlapRanker;
+        let bm25 = Bm25Ranker;
+        let default_ranker: &dyn Ranker = if opts.effort.reranks() {
+            &bm25
+        } else {
+            &overlap
+        };
+        let ranker: &dyn Ranker = opts.ranker.unwrap_or(default_ranker);
 
         // Distinct tokens per query (deduplicated), computed once outside the read.
         let query_tokens: Vec<Vec<String>> =
@@ -814,6 +912,18 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             let sel_vec: Vec<&str> = sel_all.into_iter().collect();
             let postings_map = postings::effective_postings(conn, ns, &sel_vec)?;
 
+            // Total live segments — the `N` a length/idf reranker normalizes by. One
+            // count for the whole batch (cheap; the default overlap ranker ignores it).
+            let n_segments: u64 =
+                conn.query_row(&format!("SELECT count(*) FROM {}", ns.seg()), [], |r| {
+                    r.get::<_, i64>(0)
+                })? as u64;
+            // A reranking ranker needs more than `limit` candidates to reorder (the
+            // target of a "ranking gap" miss sits past `limit` by raw overlap); fetch a
+            // pool, rank it, then truncate to `limit`. Default pool == limit (no
+            // over-fetch), so the overlap ranker pays nothing.
+            let pool = opts.effort.pool(opts.limit, n_segments);
+
             let mut out = Vec::with_capacity(queries.len());
             for (qi, query) in queries.iter().enumerate() {
                 let selected = &selected_per[qi];
@@ -823,11 +933,12 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                     .collect();
 
                 let mut survivors =
-                    overlap_search(conn, ns, &present, opts.limit, min_shared, opts.scope)?;
+                    overlap_search(conn, ns, &present, pool, min_shared, opts.scope)?;
                 self.hydrate_text(conn, ns, &mut survivors)?;
 
                 out.push(self.rank_to_matches(
                     &survivors, &present, selected, query, min_shared, ranker, opts.limit,
+                    n_segments,
                 ));
             }
             Ok(out)
@@ -845,12 +956,14 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         min_shared: u32,
         ranker: &dyn Ranker,
         limit: usize,
+        n_segments: u64,
     ) -> Vec<Match> {
         let candidates = Candidates::new(survivors, present);
         let qctx = QueryContext {
             query,
             selected,
             min_shared,
+            n_segments,
         };
         let ranked = ranker.rank(&candidates, &qctx);
         let sel_refs: Vec<&str> = selected.iter().map(String::as_str).collect();
@@ -1063,4 +1176,28 @@ fn decode_tokens(blob: &[u8]) -> Result<Vec<String>> {
         pos = end;
     }
     Ok(tokens)
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::Effort;
+
+    #[test]
+    fn pool_floor_none_and_growth() {
+        // No over-fetch for None / Custom(0): pool == limit.
+        assert_eq!(Effort::None.pool(10, 1_000_000), 10);
+        assert_eq!(Effort::Custom(0.0).pool(10, 1_000_000), 10);
+        // limit == 0 stays 0.
+        assert_eq!(Effort::Max.pool(0, 1_000_000), 0);
+        // Small N stays at the floor: 0.05·√(10·100) = 1.58 < limit 10.
+        assert_eq!(Effort::Medium.pool(10, 100), 10);
+        // Large N follows c·√(k·N): k=10, N=1e6, √(kN)=3162.28.
+        assert_eq!(Effort::Medium.pool(10, 1_000_000), 158); // 0.05·3162 = 158.1
+        assert_eq!(Effort::High.pool(10, 1_000_000), 316); // 0.10·3162 = 316.2
+        assert_eq!(Effort::Max.pool(10, 1_000_000), 949); // 0.30·3162 = 948.7
+        // reranks() reflects whether c > 0.
+        assert!(!Effort::None.reranks());
+        assert!(Effort::Medium.reranks());
+        assert!(!Effort::Custom(0.0).reranks());
+    }
 }

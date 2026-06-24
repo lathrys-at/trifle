@@ -113,6 +113,9 @@ fn concurrent_reads_run_alongside_writes() {
                 while !stop.load(Ordering::Relaxed) {
                     let hits = idx.search("quick brown fox", SearchOpts::new(10)).unwrap();
                     assert!(!hits.is_empty());
+                    // No phantom: every returned doc is one actually inserted (1..=120),
+                    // so concurrent writes never corrupt a read into a bogus doc id.
+                    assert!(hits.iter().all(|m| (1..=120).contains(&m.doc_id)));
                 }
             })
         })
@@ -153,7 +156,11 @@ fn reads_continue_across_a_rebuild_swap() {
             thread::spawn(move || {
                 let mut seen = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    // Must never error (the schema-change retry absorbs the swap).
+                    // A read must never error across the swap: the rename keeps the same
+                    // table names/shape so rusqlite re-prepares transparently, and
+                    // read_retry absorbs any transient SQLITE_SCHEMA/BUSY. And because
+                    // the token is in BOTH corpora, every consistent read finds it —
+                    // the swap is complete-old or complete-new, never partial.
                     let hits = idx.search("persistent token", SearchOpts::new(10)).unwrap();
                     assert!(
                         !hits.is_empty(),
@@ -165,8 +172,8 @@ fn reads_continue_across_a_rebuild_swap() {
             })
         })
         .collect();
-    // Rebuild several times to widen the swap window the readers race.
-    for _ in 0..5 {
+    // Rebuild many times to widen the window the readers race against the swap.
+    for _ in 0..40 {
         let corpus: Vec<Segment> = (1..=10)
             .map(|doc| {
                 Segment::new(

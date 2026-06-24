@@ -201,3 +201,71 @@ fn contentless_upsert_replaces() {
         1
     ));
 }
+
+#[test]
+fn contentless_handles_an_empty_token_set() {
+    // A sub-trigram segment ("hi") yields no tokens; fwd stores a zero-token set.
+    // Insert and remove must not panic and must touch no postings.
+    let (idx, _dir) = contentless_index(TagResolver {
+        missing: Mutex::new(HashMap::new()),
+    });
+    idx.insert(1, "field", &[("r", "hi")]).unwrap();
+    assert_eq!(idx.stats().unwrap().segments, 1);
+    idx.remove(1).unwrap(); // reads the empty fwd token set
+    assert_eq!(idx.stats().unwrap().segments, 0);
+}
+
+#[test]
+fn contentless_round_trips_weird_byte_tokens() {
+    // Emoji/multibyte trigrams must encode into fwd and decode back on delete.
+    let (idx, _dir) = contentless_index(TagResolver {
+        missing: Mutex::new(HashMap::new()),
+    });
+    idx.insert(1, "field", &[("r", "🚀🎉😀 distinctive payload")])
+        .unwrap();
+    assert!(hit(
+        &idx.search("distinctive payload", SearchOpts::new(5))
+            .unwrap(),
+        1
+    ));
+    idx.remove(1).unwrap(); // decodes the emoji-trigram fwd blob — must not panic
+    assert!(
+        idx.search("distinctive payload", SearchOpts::new(5))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn contentless_corrupt_fwd_blob_surfaces_an_error_not_a_panic() {
+    let (idx, dir) = contentless_index(TagResolver {
+        missing: Mutex::new(HashMap::new()),
+    });
+    idx.insert(7, "field", &[("r", "soon to be corrupted")])
+        .unwrap();
+    // Corrupt the stored token set via a separate connection (a count prefix that
+    // promises tokens the blob does not contain).
+    let raw = Connection::open(dir.path().join("t.db")).unwrap();
+    raw.execute(
+        "UPDATE fwd SET tokens = ?1",
+        [vec![0xFFu8, 0xFF, 0xFF, 0xFF]],
+    )
+    .unwrap();
+    drop(raw);
+    // remove() must consult fwd and surface the corruption, not panic.
+    assert!(matches!(idx.remove(7), Err(trifle::Error::Corrupt(_))));
+}
+
+#[test]
+fn shared_snapshot_returns_the_stored_text() {
+    // Shared mode with no resolver stores a snapshot; Match.text comes from it.
+    let dir = tempfile::tempdir().unwrap();
+    let idx = shared(&dir.path().join("host.db"), Namespace::default());
+    idx.insert(1, "field", &[("r", "snapshot text in the host file")])
+        .unwrap();
+    let hits = idx.search("snapshot text", SearchOpts::new(5)).unwrap();
+    assert_eq!(
+        hits[0].text.as_deref(),
+        Some("snapshot text in the host file")
+    );
+}

@@ -96,7 +96,7 @@ pub(crate) fn overlap_search(
     present: &[(&str, &RoaringBitmap)],
     limit: usize,
     min_shared: u32,
-    scope: Option<&crate::ScopeFn>,
+    scope: Option<&crate::ScopeFn<'_>>,
 ) -> Result<Vec<Survivor>> {
     let bitmaps: Vec<&RoaringBitmap> = present.iter().map(|(_, b)| *b).collect();
     if bitmaps.is_empty() || limit == 0 {

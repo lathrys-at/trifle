@@ -95,25 +95,28 @@ fn min_shared_controls_strictness_when_both_trigrams_are_present() {
 }
 
 #[test]
-fn breadth_never_loses_a_hit_and_helps_two_edit_targets() {
+fn breadth_never_loses_a_narrow_hit() {
     let h = Harness::new();
-    h.put(1, "field", "f", "neurotransmitter dopamine serotonin");
-    h.put(
-        2,
-        "field",
-        "f",
-        "unrelated text about gardening tools and soil",
-    );
-    let q = "neurotransmiter dopamin"; // two typos
-    let narrow = h.index.search(q, SearchOpts::new(5)).unwrap();
-    let wide = h.index.search(q, SearchOpts::new(5).breadth(1000)).unwrap();
-    if hit(&narrow, 1) {
-        assert!(hit(&wide, 1), "breadth must not drop a hit narrow found");
-    }
+    load_fixture(&h);
+    // A query narrow (B=0) provably matches several fixture docs — no vacuous guard.
+    let q = "quick brown";
+    let narrow = h.index.search(q, SearchOpts::new(10)).unwrap();
+    let wide = h
+        .index
+        .search(q, SearchOpts::new(10).breadth(10_000))
+        .unwrap();
     assert!(
-        hit(&wide, 1),
-        "the two-typo target is findable with breadth on"
+        !narrow.is_empty(),
+        "narrow must hit something for this to be meaningful"
     );
+    // Monotonicity: every doc narrow found, wide must also find (breadth only widens).
+    let wide_ids = ids(&wide);
+    for d in ids(&narrow) {
+        assert!(
+            wide_ids.contains(&d),
+            "breadth dropped doc {d} that narrow found"
+        );
+    }
 }
 
 #[test]

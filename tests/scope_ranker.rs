@@ -2,8 +2,10 @@
 
 mod common;
 use common::*;
+use std::collections::HashSet;
 use trifle::SearchOpts;
 use trifle::rank::{Candidates, QueryContext, Ranked, Ranker};
+use trifle::tokenize::{Tokenizer, TrigramTokenizer};
 
 // ----- scope predicate --------------------------------------------------------
 
@@ -116,13 +118,34 @@ fn ranker_can_read_text_and_drop_candidates() {
 }
 
 /// Asserts the [`Candidate`] invariants from inside a ranker, then passes through.
+/// Crucially it re-derives the matched tokens from the segment's *text* (an
+/// independent source from the posting-derived overlap), so the check is not
+/// circular.
 struct InvariantChecker;
 impl Ranker for InvariantChecker {
-    fn rank(&self, candidates: &Candidates<'_>, _q: &QueryContext<'_>) -> Vec<Ranked> {
+    fn rank(&self, candidates: &Candidates<'_>, q: &QueryContext<'_>) -> Vec<Ranked> {
+        let tok = TrigramTokenizer::new();
         for c in candidates.iter() {
-            // matched_tokens is exactly the set counted by overlap.
-            assert_eq!(c.matched_tokens().len() as u32, c.overlap());
+            let matched = c.matched_tokens();
+            // The count agrees with the bit-sliced overlap.
+            assert_eq!(matched.len() as u32, c.overlap());
             assert!(c.overlap() >= 1);
+            // Each matched token is genuinely a token of THIS segment's text (recounted
+            // independently of the postings) and is one of the query's selected tokens.
+            let seg_tokens: HashSet<String> = tok
+                .tokenize(c.text().unwrap())
+                .map(|g| g.to_string())
+                .collect();
+            for mt in &matched {
+                assert!(
+                    seg_tokens.contains(*mt),
+                    "matched token {mt:?} absent from segment"
+                );
+                assert!(
+                    q.selected.iter().any(|s| s == mt),
+                    "matched token {mt:?} not selected"
+                );
+            }
         }
         (0..candidates.len())
             .map(|candidate| Ranked { candidate })
@@ -131,7 +154,7 @@ impl Ranker for InvariantChecker {
 }
 
 #[test]
-fn matched_tokens_equals_overlap_count() {
+fn matched_tokens_are_real_segment_tokens_counting_overlap() {
     let h = Harness::new();
     load_fixture(&h);
     let hits = h
@@ -153,16 +176,18 @@ fn search_batch_matches_serial_search_exactly() {
     let queries = [
         "quick brown",
         "lazy dog",
-        "wizards jump",
+        "quick brown", // same query twice — must not bleed into itself
+        "quick lazy",  // overlapping vocabulary with the others (shared reads)
         "nonexistent zzqqx",
     ];
     let batched = h.index.search_batch(&queries, SearchOpts::new(10)).unwrap();
     for (i, q) in queries.iter().enumerate() {
         let serial = h.index.search(q, SearchOpts::new(10)).unwrap();
+        // Full Match equality (provenance, span, text, order) — not just doc ids — so
+        // a batch hydration that picked a different segment would be caught.
         assert_eq!(
-            ids(&batched[i]),
-            ids(&serial),
-            "batch and serial must rank {q:?} identically"
+            batched[i], serial,
+            "batch and serial must be identical for {q:?}"
         );
     }
 }

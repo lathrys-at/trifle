@@ -204,7 +204,10 @@ pub struct Match {
 
 /// A scope/exclusion predicate over a candidate's provenance:
 /// `(doc_id, source, ref) -> keep`. Used for [`SearchOpts::scope`].
-pub type ScopeFn = dyn Fn(i64, &str, &str) -> bool;
+///
+/// The `'a` lifetime lets the predicate borrow local state (e.g. an allow-set on the
+/// stack); a `dyn Fn` alias without it would force `'static` and reject such closures.
+pub type ScopeFn<'a> = dyn Fn(i64, &str, &str) -> bool + 'a;
 
 /// Per-search options.
 ///
@@ -226,7 +229,7 @@ pub struct SearchOpts<'a> {
     /// candidates in overlap order — never over the corpus. The walk continues until
     /// `limit` predicate-passing results lock, so scoping needs no over-fetch. The
     /// predicate must not call back into this index's writer.
-    pub scope: Option<&'a ScopeFn>,
+    pub scope: Option<&'a ScopeFn<'a>>,
 }
 
 impl<'a> SearchOpts<'a> {
@@ -260,7 +263,7 @@ impl<'a> SearchOpts<'a> {
     }
 
     /// Set a scope predicate.
-    pub fn scope(mut self, scope: &'a ScopeFn) -> Self {
+    pub fn scope(mut self, scope: &'a ScopeFn<'a>) -> Self {
         self.scope = Some(scope);
         self
     }

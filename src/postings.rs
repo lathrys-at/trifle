@@ -227,7 +227,7 @@ pub(crate) struct FoldStats {
 ///
 /// Cheap for rare tokens (small bases), genuinely costly for common ones (a
 /// high-frequency token's base is a large bitset the fold rewrites) — the price of
-/// owning all tokens, paid here off the hot path rather than on every write (§7.2).
+/// owning all tokens, paid here off the hot path rather than on every write.
 pub(crate) fn fold(conn: &Connection, ns: &Namespace) -> Result<FoldStats> {
     // Only tokens with a delta row can have a pending change; that set is the dirty
     // candidate list and is emptied as we go.

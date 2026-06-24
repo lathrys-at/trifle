@@ -232,8 +232,7 @@ pub type ScopeFn<'a> = dyn Fn(i64, &str, &str) -> bool + 'a;
 /// while recall grows logarithmically. The pool is always at least `limit`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Effort {
-    /// No reranking: return the bit-sliced overlap order (pool = `limit`). Cheapest;
-    /// the pre-`0.1` behavior.
+    /// No reranking: return the bit-sliced overlap order (pool = `limit`). Cheapest.
     None,
     /// ~50% of the recall ceiling (`c = 0.03`).
     Low,
@@ -289,9 +288,8 @@ impl Effort {
 /// Per-search options.
 ///
 /// Construct with [`SearchOpts::new`] and the builder setters, or the public fields.
-/// The one knob most callers reach for is [`min_shared`](SearchOpts::min_shared)
-/// (`m`, the strictness dial); [`breadth`](SearchOpts::breadth) (`B`) is the
-/// orthogonal recall axis.
+/// Most searches only set [`min_shared`](SearchOpts::min_shared) (`m`, the strictness
+/// dial); [`breadth`](SearchOpts::breadth) (`B`) is the orthogonal recall axis.
 pub struct SearchOpts<'a> {
     /// Maximum number of matches to return (top-k).
     pub limit: usize,
@@ -308,9 +306,9 @@ pub struct SearchOpts<'a> {
     /// predicate must not call back into this index's writer.
     pub scope: Option<&'a ScopeFn<'a>>,
     /// How hard to rerank — the over-fetch [`Effort`]. Defaults to
-    /// [`Medium`](Effort::Medium). [`None`](Effort::None) restores the pre-`0.1`
-    /// overlap-only behavior (cheapest). When `ranker` is also set, `effort` still
-    /// chooses the pool depth but that custom ranker scores it.
+    /// [`Medium`](Effort::Medium). [`None`](Effort::None) disables reranking and returns
+    /// plain overlap order (cheapest). When `ranker` is also set, `effort` still chooses
+    /// the pool depth but that custom ranker scores it.
     pub effort: Effort,
 }
 
@@ -1074,7 +1072,18 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let mut attempt = 0;
         loop {
             let conn = self.backend.read()?;
-            match f(&conn, ns) {
+            // Run the whole read inside one DEFERRED transaction so every statement sees a
+            // single WAL snapshot. A search issues several SELECTs (token dfs, postings,
+            // segment count, hydration); without a shared snapshot they could straddle a
+            // concurrent id-reassigning `rebuild`/`compact` commit and splice postings from
+            // the old snapshot onto seg rows from the new one — hydrating the wrong document.
+            // The transaction is read-only and never committed; dropping it rolls back, which
+            // just releases the snapshot.
+            let outcome = match conn.unchecked_transaction() {
+                Ok(tx) => f(&tx, ns),
+                Err(e) => Err(Error::from(e)),
+            };
+            match outcome {
                 Err(Error::Sqlite(e)) if attempt < RETRY_MAX && is_retryable(&e) => {
                     drop(conn);
                     attempt += 1;

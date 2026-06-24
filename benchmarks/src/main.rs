@@ -1,32 +1,33 @@
-//! `trifle-bench` — the design §10 benchmark harness.
+//! `trifle-bench` — the benchmark harness.
 //!
-//! Two distinct benchmarks live here, because conflating them measures the wrong
-//! thing (§10):
+//! Three distinct benchmarks live here, kept separate because conflating them measures
+//! the wrong thing:
 //!
-//! - **`latency`** — the footrace (§10.1–10.2). Same corpus, same queries, trifle
+//! - **`latency`** — search latency + throughput. Same corpus, same queries, trifle
 //!   vs the in-process SQLite baselines (FTS5-trigram BM25, `LIKE` scan). Reports
 //!   p50/p90/p99/max and throughput, serial *and* concurrent (the read pool's
 //!   parallelism is a distinct axis). No labels needed.
-//! - **`relevance`** — recall@k on MS MARCO **real dev queries + qrels** (§10.4), vs a
-//!   word-level BM25 baseline (and the trigram-bm25 cousin). The paraphrase/relevance
-//!   truth: real queries share no guaranteed substring with their answer.
-//! - **`fuzzy`** — recall@k on **entity-name + injected-edit** queries over a GeoNames
-//!   corpus (§10.5), vs FTS5 trigram-MATCH and the LIKE floor (never bm25-phrase). The
-//!   faithful home for the typo eval; reports 1- vs 2-edit recall.
+//! - **`relevance`** — recall@k on MS MARCO real dev queries + qrels, vs a word-level
+//!   BM25 baseline (and the trigram-bm25 cousin). The paraphrase case: real queries
+//!   share no guaranteed substring with their answer.
+//! - **`fuzzy`** — recall@k on entity-name + injected-edit queries over a GeoNames
+//!   corpus, vs FTS5 trigram-MATCH and the LIKE floor (never bm25-phrase). The typo
+//!   case; reports 1- vs 2-edit recall separately.
 //!
-//! Both recall evals tag each miss selection / floor / ranking (§4) to say whether a
-//! fix lives in the pruner/`m` or the ranker.
+//! Both recall evals tag each miss selection / floor / ranking, to say whether a fix
+//! lives in the pruner/`m` or the ranker.
 //!
 //! Plus two utilities:
 //!
-//! - **`profile`** — the §10.2 work-done instrument: the Σ(kept-posting cardinality)
-//!   distribution, the quantity whose growth would break trifle's flatness claim.
+//! - **`profile`** — the work-done instrument: the Σ(kept-posting cardinality)
+//!   distribution, the quantity whose growth with corpus size would flatten trifle's
+//!   latency advantage.
 //! - **`fetch`** — warm the pinned-corpus cache on a network machine before an
 //!   offline run.
 //!
 //! Everything is driven by a master `--seed` so a run is byte-reproducible, and the
-//! size knobs (`--docs`, `--queries`, …) let you trace the scaling sweep (§10.2).
-//! See `benchmarks/README.md` for the matrix, the corpora, and how to run.
+//! size knobs (`--docs`, `--queries`, …) let you trace how cost scales with corpus
+//! size. See `benchmarks/README.md` for the corpora and how to run.
 
 mod baselines;
 mod corpus;
@@ -79,16 +80,16 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str = "\
-trifle-bench — design §10 benchmark harness
+trifle-bench — benchmark harness
 
 USAGE:
     trifle-bench <COMMAND> [OPTIONS]
 
 COMMANDS:
-    latency    Footrace: search latency + throughput, trifle vs in-process baselines
-    relevance  MS MARCO real dev queries+qrels: set-recall@k vs word BM25 (+trigram) (§10.4)
-    fuzzy      Entity name+edit recall vs FTS5 trigram-MATCH / LIKE, per edit-count (§10.5)
-    profile    Σ(kept-posting cardinality) distribution — the §10.2 work-done curve
+    latency    Search latency + throughput, trifle vs in-process baselines
+    relevance  MS MARCO real dev queries+qrels: set-recall@k vs word BM25 (+trigram)
+    fuzzy      Entity name+edit recall vs FTS5 trigram-MATCH / LIKE, per edit-count
+    profile    Σ(kept-posting cardinality) distribution — the work-done curve
     ranksweep  recall@k vs rerank-pool depth CSV (backend for tools/calibrate_pool.py)
     fetch      Download + verify the pinned corpus assets into the cache (no bench)
     help       Show this message
@@ -102,7 +103,7 @@ COMMON OPTIONS:
     --seed <N>                    Master seed (decimal or 0x-hex); fixes corpus + query
                                   sampling for a byte-reproducible run        [default: 0x5EED..]
 
-SEARCH-TUNING (trifle only, §10.3):
+SEARCH-TUNING (trifle only):
     --min-shared <M>              Match floor m (shared rare tokens)           [default: engine]
     --breadth <B>                 Breadth budget B (recall/latency)            [default: engine]
     --effort <none|low|medium|high|max>  Rerank effort (pool depth c·√(kN) + the BM25
@@ -122,7 +123,7 @@ LATENCY:
 
 FUZZY:
     --corpus <geonames-cities|geonames-all>   Entity corpus           [default: geonames-cities]
-    --edits <N>                   Typos per query. Omit to run {1, 2} separately (§10.3).
+    --edits <N>                   Typos per query. Omit to run {1, 2} separately.
 
 PROFILE:
     --corpus <synthetic|msmarco>  Corpus source                              [default: synthetic]
@@ -330,7 +331,7 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
     flags.reject_unknown(&allowed)?;
 
     let skip = skipped_engines(&flags)?;
-    // latency runs the three footrace engines (the word-level BM25 is relevance-only).
+    // latency runs the three speed-comparison engines (word-level BM25 is relevance-only).
     if [ENGINE_TRIFLE, ENGINE_FTS5, ENGINE_LIKE]
         .iter()
         .all(|e| skip.contains(*e))
@@ -398,7 +399,8 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
         bench_engine(&like, &qtexts, k, warmup, repeat, batched);
     }
     println!(
-        "# (hidden axes — durability, footprint kind, update cost, semantics — in README §matrix)"
+        "# (latency is one axis; durability, footprint, update cost, and semantics differ \
+         per engine — see benchmarks/README.md)"
     );
     Ok(())
 }
@@ -540,9 +542,8 @@ fn effective_m(tuning: Tuning) -> usize {
     tuning.min_shared.unwrap_or(2).max(1) as usize
 }
 
-/// Where trifle's recall misses' fixes live (handoff §4), tagged cheaply from the
-/// shared-trigram count between each missed query and its target — no internals, no
-/// re-search.
+/// Where a recall miss's fix lives, tagged cheaply from the shared-trigram count
+/// between each missed query and its target — no internals, no re-search.
 #[derive(Default)]
 struct MissTally {
     /// No shared trigrams: overlap could never surface the target. The pruner/tokenizer
@@ -827,8 +828,8 @@ fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
 }
 
 /// Fraction of targets whose *clean* name surfaces ≥1 other indexed entity in trifle —
-/// i.e. has a near-match distractor present (§10.5). A low value means the run is
-/// trivially easy (no confusables sampled) and the recall numbers are inflated.
+/// i.e. has a near-match distractor present. A low value means the run is trivially easy
+/// (no confusables sampled) and the recall numbers are inflated.
 fn near_distractor_density(trifle: &Trifle, targets: &[Entity], k: usize) -> f64 {
     if targets.is_empty() {
         return 0.0;

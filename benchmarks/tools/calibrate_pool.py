@@ -67,19 +67,10 @@ class Matrix:
         d = self.df[(self.df.N == N) & (self.df.k == k)].sort_values("pool")
         return d.pool.values * 1.0, d.recall.values * 1.0
 
-    def ceiling(self, N, k):           # recall at the deepest measured pool
+    def ceiling(self, N, k):           # best recall observed (deepest pool, but max-guarded
+                                       # so a noisy dip at the tail can't depress the target)
         _, R = self.curve(N, k)
-        return R[-1] if len(R) else float("nan")
-
-    def recall_at(self, N, k, p):      # recall interpolated (in log-pool) at depth p
-        P, R = self.curve(N, k)
-        if len(P) == 0:
-            return float("nan")
-        if p <= P[0]:
-            return R[0]
-        if p >= P[-1]:
-            return R[-1]
-        return float(np.interp(math.log(p), np.log(P), R))
+        return float(np.max(R)) if len(R) else float("nan")
 
     def pstar(self, N, k, frac):       # smallest pool reaching frac*ceiling
         P, R = self.curve(N, k)

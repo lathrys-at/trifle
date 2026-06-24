@@ -1,10 +1,9 @@
-//! Real-corpus loading, following shrike's asset pattern: a **pinned source**
-//! (`sources/*.json`: url + sha256 + attribution) is committed, the **bytes are
-//! never committed** — they download on demand into a gitignored cache and are
-//! hash-verified — and an **offline fallback** keeps the harness runnable without
-//! network (at reduced realism, loudly).
+//! Real-corpus loading. A pinned source (`sources/*.json`: url + sha256 + attribution)
+//! is committed; the bytes are not — they download on demand into a gitignored cache
+//! and are hash-verified. An offline fallback keeps the harness runnable without
+//! network, at reduced realism (and says so on stderr).
 //!
-//! Corpora, each modeling a different eval (design §10.4):
+//! Corpora, each modeling a different eval:
 //! - **synthetic-from-wordlist** (default, latency): real English words sampled with
 //!   a Zipfian frequency law, so character-trigram document frequencies look like real
 //!   text. The latency sweep's corpus; a tiny vocabulary would collapse every trigram
@@ -13,8 +12,8 @@
 //! - **msmarco relevance** ([`msmarco_relevance`]): the **real dev queries + qrels**
 //!   relevance eval. The index is built *answers + distractors* — every judged-relevant
 //!   passage for the sampled queries, plus random distractors — so the known answer is
-//!   present and recall@k measures ranking it over the distractors (§10.4).
-//! - **GeoNames entities** ([`geonames`]): the fuzzy/typo eval's home (§10.5). Entity
+//!   present and recall@k measures ranking it over the distractors.
+//! - **GeoNames entities** ([`geonames`]): the fuzzy/typo eval's home. Entity
 //!   names + injected edits, where "type a corrupted target name, find the target" is
 //!   the faithful task. `geonames-cities` (~34k) and `geonames-all` (the full gazetteer).
 
@@ -454,7 +453,7 @@ pub fn msmarco(n: usize, seed: u64) -> io::Result<Corpus> {
     })
 }
 
-/// Build the MS MARCO **relevance** eval (§10.4): real dev queries scored against their
+/// Build the MS MARCO **relevance** eval: real dev queries scored against their
 /// qrels, with an "answers + distractors" index so the known answer is always present.
 /// Streams `collection.tsv` (~8.8M lines) once — keeping the qrel-relevant passages for
 /// the sampled queries and reservoir-sampling distractors — so the ~3 GB file is never
@@ -593,11 +592,11 @@ pub fn msmarco_relevance(docs: usize, n_queries: usize, seed: u64) -> io::Result
     })
 }
 
-/// Build a GeoNames entity corpus for the fuzzy eval (§10.5). Streams the dump,
+/// Build a GeoNames entity corpus for the fuzzy eval. Streams the dump,
 /// reservoir-samples `docs` entities as the indexed corpus (col 1 = geonameid = doc id,
 /// col 2 = name), and samples `n_targets` of *those* as query targets — so every
-/// target's answer is indexed, and the other entities are the (naturally near-match)
-/// distractors §10.5 requires.
+/// target's answer is indexed, and the other entities are the naturally near-match
+/// distractors the fuzzy eval needs.
 pub fn geonames(
     corpus: &str,
     docs: usize,

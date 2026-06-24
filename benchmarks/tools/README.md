@@ -22,7 +22,7 @@ python3 benchmarks/tools/calibrate_pool.py --corpus msmarco --queries 500 --seed
 ## Why pool depth is a *power law* in N (from Zipf's law)
 
 trifle generates candidates by **overlap** — for each segment, the number of *selected*
-query trigrams it contains, counted bit-sliced (independent of posting size, §10.2) — and
+query trigrams it contains, counted bit-sliced (independent of posting size) — and
 orders them coarsely by that count. A precision tier then reorders the top-`pool`. The
 question is how deep `pool` must be. The answer falls out of the corpus's statistics.
 
@@ -37,7 +37,7 @@ words under a Zipfian law precisely to reproduce this; real prose has it nativel
 
 ### 2. Selection keeps the *rare* trigrams
 
-The pruner (§6) sorts the query's trigrams rarest-first (lowest `df`) and keeps a prefix:
+The pruner sorts the query's trigrams rarest-first (lowest `df`) and keeps a prefix:
 a rare trigram is both cheapest to scan *and* most discriminating. So the `k_sel` **selected**
 trigrams have small `φ`.
 
@@ -106,7 +106,7 @@ calibrate per corpus, and never expect a log.**
 
 ### 8. The constant `c`, and the separate recall ceiling
 
-`c` is not a fudge — it is exactly `c(θ) = p*_θ / √(k·N)` for a chosen recall target `θ`
+`c` is not arbitrary — it is exactly `c(θ) = p*_θ / √(k·N)` for a chosen recall target `θ`
 (a fraction of the deep-pool recall **ceiling**). The tool measures it as the median of
 `p*/√(kN)` across the `(k,N)` grid; a *tight* spread means `√(kN)` genuinely holds there.
 

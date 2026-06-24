@@ -3,7 +3,7 @@
 //!
 //! All names come from a validated [`Namespace`], so interpolating them into DDL
 //! has no injection surface. The store is a rebuildable cache: a version mismatch
-//! drops everything rather than migrating (§8.4).
+//! drops everything rather than migrating.
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -209,13 +209,20 @@ pub(crate) fn alloc_ids(conn: &Connection, ns: &Namespace, count: u64) -> Result
         .unwrap_or(1);
     let after = next
         .checked_add(count as i64)
+        // Ids are stored in u32 roaring postings, so the real ceiling is u32::MAX, not
+        // i64::MAX: the last id minted here is `after - 1` and must round-trip through u32.
+        .filter(|&a| a <= u32::MAX as i64 + 1)
         .ok_or_else(|| crate::Error::corrupt("segment id space exhausted"))?;
     meta_set(conn, ns, KEY_NEXT_ID, &after.to_string())?;
     Ok(next)
 }
 
-/// Reset the id high-water mark (used by rebuild, which reassigns dense ids).
+/// Reset the id high-water mark (used by rebuild, which reassigns dense ids). Rejects a
+/// mark past the u32 ceiling for the same reason as [`alloc_ids`].
 pub(crate) fn set_next_id(conn: &Connection, ns: &Namespace, next_id: i64) -> Result<()> {
+    if next_id > u32::MAX as i64 + 1 {
+        return Err(crate::Error::corrupt("segment id space exhausted"));
+    }
     meta_set(conn, ns, KEY_NEXT_ID, &next_id.to_string())
 }
 
@@ -292,14 +299,27 @@ mod tests {
         let c = conn();
         let ns = Namespace::bare();
         create_tables(&c, &ns).unwrap();
-        set_next_id(&c, &ns, i64::MAX - 1).unwrap();
-        // The last legal id, leaving next_id at MAX.
-        assert_eq!(alloc_ids(&c, &ns, 1).unwrap(), i64::MAX - 1);
-        // A further allocation overflows i64; it must error, never wrap to a reused id.
+        // Ids land in u32 roaring postings, so the ceiling is u32::MAX, not i64::MAX.
+        set_next_id(&c, &ns, u32::MAX as i64).unwrap();
+        // The last legal id, leaving next_id one past u32::MAX.
+        assert_eq!(alloc_ids(&c, &ns, 1).unwrap(), u32::MAX as i64);
+        // A further allocation would mint an id that truncates in u32; it must error,
+        // never wrap to a reused id.
         assert!(matches!(
             alloc_ids(&c, &ns, 5),
             Err(crate::Error::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn set_next_id_rejects_marks_past_u32() {
+        let c = conn();
+        let ns = Namespace::bare();
+        create_tables(&c, &ns).unwrap();
+        // One past the last legal id (the "exhausted" high-water) is allowed; beyond it
+        // means an id that does not fit u32 was already in use.
+        assert!(set_next_id(&c, &ns, u32::MAX as i64 + 1).is_ok());
+        assert!(set_next_id(&c, &ns, u32::MAX as i64 + 2).is_err());
     }
 
     #[test]

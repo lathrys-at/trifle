@@ -10,8 +10,10 @@ write-infrequent. It is a **derived, rebuildable cache** over a caller-owned sou
 truth — it never touches the caller's data store, and any version/tokenizer drift drops the
 cache rather than migrating it.
 
-It is *lexical* fuzzy search (trigram overlap), deliberately **not** BM25-grade ranking and
-**not** semantic search; it omits length normalization (sound only for small segments).
+It is *lexical* fuzzy search, deliberately **not** semantic search and not a long-document
+relevance engine. Candidates come from trigram overlap; the default reranker adds a
+BM25-shaped score (idf, length normalization, literal verification) on top, but the design
+assumes small segments throughout.
 
 ## Commands
 
@@ -43,26 +45,29 @@ Notes that bite:
 - The only Cargo feature is `tracing` (off by default); enable hot-path spans with
   `--features tracing`. With it off, the instrumentation macros expand to nothing.
 
-### Benchmarks (`benchmarks/`, design §10)
+### Benchmarks (`benchmarks/`)
 
-A separate `publish = false` crate; it adds **no dependency** to what downstream users
-compile. Always run `--release` (debug numbers are meaningless). Corpora download on demand,
+A separate `publish = false` crate; it adds no dependency to what downstream users compile.
+Always run `--release` (debug numbers are meaningless). Corpora download on demand,
 hash-verified, into the gitignored repo-root `.cache/bench/` — fetch on a networked machine
 first, then run offline.
 
 ```bash
 cargo run -p trifle-benchmarks --release -- fetch --corpus synthetic   # warm the cache first
 cargo run -p trifle-benchmarks --release -- latency --docs 100000 --seed 42
-cargo run -p trifle-benchmarks --release -- quality --corpus msmarco --docs 100000
-cargo run -p trifle-benchmarks --release -- profile --docs 1000000     # the §10.2 work-done curve
+cargo run -p trifle-benchmarks --release -- relevance --docs 100000    # MS MARCO recall@k vs BM25
+cargo run -p trifle-benchmarks --release -- fuzzy --corpus geonames-cities  # name+edit recall
+cargo run -p trifle-benchmarks --release -- profile --docs 1000000     # the work-done curve
 cargo run -p trifle-benchmarks --release -- help
 ```
 
+See `benchmarks/README.md` for the evals, corpora, and `tools/calibrate_pool.py` (the
+rerank-pool calibration).
+
 ## Architecture
 
-`docs/design.md` is the canonical rationale. The `§N.M` markers throughout the code and
-comments (e.g. `§7.6`, `§8.4`, `§10.2`) point at its numbered sections — **follow them when a
-choice looks non-obvious; the "why" lives there, not in the code.**
+The rationale for non-obvious choices lives in the module-level doc comments (`//!`) — start
+with the module named for the stage you are touching. The query pipeline below is the spine.
 
 ### The model (read `src/lib.rs` first)
 
@@ -109,7 +114,7 @@ A search flows through four stages, each its own module — this is the spine of
 - **Schema** (`src/schema.rs`) — all table names come from a validated `Namespace` (no SQL
   injection surface in the interpolated DDL). Three version stamps — schema version, tokenizer
   fingerprint, caller `data_version` — gate drift; a mismatch (or a detected `seg`↔posting
-  desync) **resets the cache, never migrates** (§8.4). Monotonic id allocation + the atomic
+  desync) **resets the cache, never migrates**. Monotonic id allocation + the atomic
   shadow-table swap that `rebuild()` uses live here.
 - **Backends** (`src/store/`, behind the `Backend` trait):
   - `Sidecar` (default) — trifle owns its own SQLite file: WAL, `mmap`, one mutexed write
@@ -118,7 +123,7 @@ A search flows through four stages, each its own module — this is the spine of
     supplies connections to; use only for a hard co-location requirement.
   - `src/store/pool.rs` holds the machinery both share (writer `Mutex` + on-demand read pool).
 - **Concurrency / threading** — the API is fully **synchronous and `&self`**-thread-safe; no
-  async runtime is imposed (§7.6). One writer is serialized; reads run on the pool under WAL.
+  async runtime is imposed. One writer is serialized; reads run on the pool under WAL.
   An async caller dispatches to a blocking pool. Transient `SQLITE_BUSY`/`LOCKED`/`SCHEMA`
   faults are retried internally (`read_retry`) before surfacing as `Error::Sqlite`.
 
@@ -138,4 +143,3 @@ or `data_version` bump, both of which empty the cache on open). `stats()` report
   `drift`, `lifecycle`, `ranking`, `scope_ranker`, `backends`, `adversarial`, `api`, `basic`),
   plus `tests/thrash.rs` — a **proptest** oracle that thrashes randomized op sequences against
   a reference model. `tests/common/mod.rs` holds shared fixtures.
-```

@@ -4,9 +4,9 @@
 //!   the snippet's vocabulary/co-occurrence are exactly the corpus's, which sidesteps
 //!   "where do realistic queries come from" for a pure latency measurement.
 //! - **Fuzzy/typo recall** ([`fuzzy_queries`]): an **entity name + injected edits**,
-//!   labeled by the entity (§10.5). On an entity corpus this construction is *faithful*
-//!   ("the user types a corrupted target name, find the target"), unlike the same trick
-//!   on prose passages, where it degenerates into a known-item smoke test.
+//!   labeled by the entity. On an entity corpus this construction is faithful — the user
+//!   types a corrupted target name and wants the target — unlike the same trick on prose
+//!   passages, where it degenerates into a known-item smoke test.
 //!
 //! (The MS MARCO **relevance** eval uses real dev queries + qrels — those aren't
 //! generated here; see [`corpus::msmarco_relevance`](crate::corpus::msmarco_relevance).)
@@ -39,7 +39,7 @@ fn snippet(text: &str, len: usize, rng: &mut Rng) -> String {
     words[start..start + len].join(" ")
 }
 
-/// The four single-character edit operations (§10.5), weighted toward realistic
+/// The four single-character edit operations, weighted toward realistic
 /// typos: transpositions and substitutions dominate, insertions/deletions are
 /// rarer. Keeps the result non-empty.
 fn inject_one_edit(s: &str, rng: &mut Rng) -> String {
@@ -153,7 +153,7 @@ pub fn labeled_snippets(corpus: &Corpus, n: usize, edits: usize, seed: u64) -> V
 }
 
 /// Generate one fuzzy query per target entity: the entity name with exactly `edits`
-/// single-character typos (§10.5), labeled by the entity id. Deterministic per
+/// single-character typos, labeled by the entity id. Deterministic per
 /// `(seed, edits)`, so 1-edit and 2-edit runs use distinct corruptions. Names too short
 /// to form a trigram query after corruption are skipped (a 1–2 char name can't).
 pub fn fuzzy_queries(targets: &[Entity], edits: usize, seed: u64) -> Vec<FuzzyQuery> {

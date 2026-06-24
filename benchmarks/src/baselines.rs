@@ -1,6 +1,6 @@
-//! The footrace field (§10.1): trifle vs in-process SQLite baselines on the *same*
-//! corpus and queries, so the comparison isolates the matching strategy from the
-//! store. trifle and both baselines link the same bundled SQLite.
+//! The baseline field: trifle vs in-process SQLite baselines on the *same* corpus and
+//! queries, so the comparison isolates the matching strategy from the store. trifle and
+//! both baselines link the same bundled SQLite.
 //!
 //! - **FTS5-trigram (BM25)** — the in-DB cousin. One trigram table with `ORDER BY rank`,
 //!   queried either as a phrase (latency) or as an OR-bag of trigrams (fuzzy/relevance);
@@ -9,9 +9,8 @@
 //!   baseline (real BM25 over words).
 //! - **`LIKE '%…%'` scan** — the naive substring floor.
 //!
-//! External engines from the §10 matrix (pg_trgm, Tantivy+Levenshtein, fzf/nucleo,
-//! fst/SymSpell) are out-of-process and live in a separate driver; this module is
-//! the embedded subset that shares trifle's store.
+//! Out-of-process engines (pg_trgm, Tantivy+Levenshtein, fzf/nucleo, fst/SymSpell) live
+//! in a separate driver; this module is the embedded subset that shares trifle's store.
 
 use std::path::Path;
 
@@ -38,7 +37,7 @@ pub trait Engine {
     }
 }
 
-/// Search-strictness knobs for trifle (`m`, `B`; §10.3) plus the rerank [`Effort`].
+/// Search-strictness knobs for trifle (`m`, `B`) plus the rerank [`Effort`].
 /// `None` leaves the engine default (Effort defaults to Medium). Baselines have no
 /// analogue and ignore these.
 #[derive(Clone, Copy, Default)]
@@ -136,13 +135,13 @@ impl Engine for Trifle {
 #[derive(Clone, Copy)]
 pub enum MatchMode {
     /// The whole query as one quoted phrase — its trigrams must appear **adjacent**.
-    /// The latency footrace's baseline. A typo splits the trigram run, so phrase mode
-    /// scores ~0 on typo'd/paraphrased queries: it is NOT a fuzzy baseline (this is the
-    /// bug the recall realignment fixes — see [`TrigramOr`](MatchMode::TrigramOr)).
+    /// The latency baseline. A typo splits the trigram run, so phrase mode scores ~0 on
+    /// typo'd/paraphrased queries: it is NOT a fuzzy baseline — the recall evals use
+    /// [`TrigramOr`](MatchMode::TrigramOr) instead.
     Phrase,
     /// An **OR-bag of the query's trigrams**, bm25-ranked. Overlapping trigrams from a
     /// typo'd or paraphrased query still match, so this is the fair fuzzy *and*
-    /// relevance baseline ("FTS5 trigram-MATCH" in the handoff). Same trigram table.
+    /// relevance baseline (reported as "FTS5 trigram-MATCH"). Same trigram table.
     TrigramOr,
 }
 
@@ -218,7 +217,7 @@ fn fts5_load(conn: &Connection, corpus: &Corpus) -> Option<()> {
     Some(())
 }
 
-/// FTS5 **trigram** index with BM25 ranking. The same table serves the latency footrace
+/// FTS5 **trigram** index with BM25 ranking. The same table serves the latency benchmark
 /// ([`Phrase`](MatchMode::Phrase)) and the fuzzy/relevance evals
 /// ([`TrigramOr`](MatchMode::TrigramOr)); the mode only changes how the query becomes a
 /// `MATCH`, so latency keeps its phrase behavior unchanged.

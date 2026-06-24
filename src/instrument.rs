@@ -1,7 +1,7 @@
 //! Hot-path instrumentation that compiles to nothing unless the `tracing` feature
 //! is enabled.
 //!
-//! The core imposes no runtime dependency (§7.6): with the feature off these
+//! The core imposes no runtime dependency: with the feature off these
 //! macros expand to an empty block, so the selection / posting-read / counting /
 //! hydration call sites read the same whether or not a host wires up `tracing`.
 

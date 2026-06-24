@@ -110,7 +110,7 @@ pub(crate) fn overlap_search(
     let floor = (min_shared as usize).min(bitmaps.len()).max(1) as u32;
     let max_count = bitmaps.len() as u32;
 
-    // The `Σ kept-posting cardinality` instrumentation (§10.2): computed only when
+    // The `Σ kept-posting cardinality` instrumentation: computed only when
     // the `tracing` feature is on (the macro does not evaluate its arguments
     // otherwise), so the hot path pays nothing for it by default.
     trace_debug!(
@@ -217,10 +217,12 @@ impl Ranker for OverlapRanker {
     }
 }
 
-/// BM25 idf for a token present in `df` of `n` segments.
+/// BM25 idf for a token present in `df` of `n` segments, clamped at zero. For `df <= n`
+/// the value is already non-negative; the clamp only guards the `df > n` case a desynced
+/// posting could produce, so a match can never score *negative*.
 fn idf(df: u64, n: u64) -> f64 {
     let (df, n) = (df as f64, n as f64);
-    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+    (1.0 + (n - df + 0.5) / (df + 0.5)).ln().max(0.0)
 }
 
 /// The precision-tier reranker run over an over-fetched pool when
@@ -231,7 +233,7 @@ fn idf(df: u64, n: u64) -> f64 {
 ///   query trigrams it shares, so *rare* shared trigrams (the discriminating ones) count
 ///   far more than common ones that any long document carries.
 /// - **length normalization** — divide by `len^0.35`, so a long document doesn't win on
-///   incidental overlap (the missing piece §10.1 calls out).
+///   incidental overlap, the failure mode plain overlap order is most prone to.
 /// - **literal word-coverage** — multiply by a small boost per query *word* found
 ///   verbatim in the text (a `memmem` substring verify, the [`Finder`](memmem::Finder)
 ///   built once per query). It is **trigram-gated**: trigram-containment is necessary for
@@ -239,8 +241,8 @@ fn idf(df: u64, n: u64) -> f64 {
 ///   provably absent and skips the (per-candidate) lowercase + search.
 ///
 /// Reads only the candidate text and posting cardinalities already in hand — no extra
-/// store reads. This is the engine behind the recall lift; see `benchmarks/` for the
-/// recall/latency curves and the `Effort` pool-depth calibration.
+/// store reads. See `benchmarks/` for the recall/latency curves and the `Effort`
+/// pool-depth calibration.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Bm25Ranker;
 

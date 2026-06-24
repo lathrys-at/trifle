@@ -297,7 +297,7 @@ fn a_rebuild_that_panics_mid_stream_leaves_the_live_index_intact() {
     load_fixture(&h);
     // An iterator that yields a couple of segments then panics, simulating a source
     // that dies mid-pull. The shadow build is inside the rebuild transaction, so the
-    // unwind must roll it back and leave the old index whole (§8.5).
+    // unwind must roll it back and leave the old index whole.
     let result = catch_unwind(AssertUnwindSafe(|| {
         let mut n = 0;
         let corpus = std::iter::from_fn(move || {

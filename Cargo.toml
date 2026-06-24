@@ -26,8 +26,8 @@ exclude = ["/benchmarks", "/.cache"]
 [features]
 default = []
 # Emit `tracing` spans/events on the hot paths (selection, posting reads, overlap
-# counting, hydration). Off by default so the core imposes no runtime dependency
-# (§7.6); a host already running `tracing` flips it on for instrumentation.
+# counting, hydration). Off by default so the core imposes no runtime dependency;
+# a host already running `tracing` flips it on for instrumentation.
 tracing = ["dep:tracing"]
 
 [dependencies]

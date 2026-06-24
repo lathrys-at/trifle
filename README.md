@@ -3,28 +3,24 @@
 [![CI](https://github.com/lathrys-at/trifle/actions/workflows/test.yaml/badge.svg)](https://github.com/lathrys-at/trifle/actions/workflows/test.yaml)
 [![crates.io](https://img.shields.io/crates/v/trifle.svg)](https://crates.io/crates/trifle)
 
-Pretty good lexical/fuzzy search for Rust. Embedded, typo- and partial-tolerant
-trigram search backed by SQLite, built to stay fast over large corpora of **small
-documents** with a read-often / write-infrequent shape.
+Embedded, typo- and partial-tolerant trigram search for Rust, backed by SQLite. It is
+built to stay fast over large corpora of **small documents** with a read-often,
+write-infrequent shape.
 
-trifle indexes short text **segments** and answers typo/partial-tolerant queries,
-returning a ranked list of matches each carrying *where* it matched. It owns a
-single SQLite store holding the segment text, provenance, and an owned **roaring
-inverted index** (a base+delta posting per token); it ranks by shared-rare-token
-overlap, counted bit-sliced. It is a **derived, rebuildable cache** over a
-caller-owned source of truth — it never touches your data store.
-
-> **Honest about the regime.** This is *lexical* fuzzy search, not BM25-grade
-> ranking and not semantic search. It omits length normalization, which is sound
-> only for small documents (≲ 1–2 KB per segment). It does not (yet) ship a speed
-> superlative — that's a claim to earn with a benchmark, not assert.
+trifle indexes short text segments and answers typo- and partial-tolerant queries,
+returning a ranked list of matches that each carry *where* they matched. It owns a
+single SQLite store holding the segment text, its provenance, and a roaring inverted
+index (a base+delta posting list per token), and ranks candidates by shared-rare-token
+overlap, counted bit-sliced. The store is a derived, rebuildable cache over a
+caller-owned source of truth: trifle never writes to your data store.
 
 ## What it's for
 
-The underserved cell trifle aims at: **durable + embedded + incrementally-updatable
-+ corpus-scale fuzzy search, with provenance, fast enough to feel instant.** If you
-want an in-memory subsequence filter (fzf/nucleo) or a full search server (Tantivy,
-Elasticsearch) or semantic retrieval, those are different tools.
+Durable, embedded, incrementally updatable fuzzy search at corpus scale, with provenance
+on every match. trifle is tuned for **small documents** — short segments of roughly
+≤ 1–2 KB — and does lexical matching, not semantic search or long-document relevance
+ranking. For semantic retrieval, an in-memory subsequence filter (fzf/nucleo), or a full
+search server (Tantivy, Elasticsearch), use those instead.
 
 ## Quick start
 
@@ -73,11 +69,11 @@ A document may have many segments. `insert` replaces all segments under a
 - **Configurable normalization** — NFC (default), NFD, accent-insensitive
   (`NfdStripMarks`), or none; Unicode casefolding on by default.
 - **Reranking by default** — bit-sliced overlap generates candidates; the default
-  `Effort::Medium` then reranks a pool of `≈ c·√(k·N)` of them with a BM25-shaped precision
-  tier (idf-weighting + length normalization + literal verification). Trade recall for
-  latency with `SearchOpts::rerank(Effort)` — `None` (overlap-only, lowest latency) through
-  `Max` — or supply a custom `Ranker`. The pool law and the `Effort` constants are
-  calibrated in `benchmarks/tools/` (`p(k,N)`, from Zipf's law).
+  `Effort::Medium` reranks a pool of about `c·√(k·N)` of them with a BM25-shaped precision
+  tier (idf weighting, length normalization, literal verification). Tune the
+  recall/latency trade-off with `SearchOpts::rerank(Effort)` — from `None` (overlap only,
+  lowest latency) through `Max` — or supply a custom `Ranker`. The pool-depth law and the
+  `Effort` constants are derived and calibrated in `benchmarks/tools/`.
 - **Scoped search** — a membership predicate over provenance, evaluated only over
   candidates (never the corpus).
 - **Concurrency** — a single internal writer plus a pooled set of read-only
@@ -95,9 +91,8 @@ deciding *when* the cache is stale relative to your source of truth.
 
 ## Status
 
-`0.1` — the API (tokenizer, ranker, and storage-backend traits especially) may still
-move before `1.0`. See [the design specification](docs/design.md) for the architecture
-and the rationale behind non-obvious choices.
+`0.1` — the API may still move before `1.0`, the tokenizer, ranker, and storage-backend
+traits especially.
 
 ## License
 

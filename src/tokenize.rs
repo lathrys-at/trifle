@@ -370,13 +370,13 @@ impl<const N: usize, const CAP: usize> Tokenizer for NgramTokenizer<N, CAP> {
         // Re-derive the normalized + case-folded token stream and map a matched window
         // back to raw bytes, **streaming** — O(N) stack state, zero heap allocation.
         //
-        // Normalization runs per *combining-sequence cluster* (a starter plus its
-        // trailing combining marks), not per char: NFC composition and NFD canonical
-        // reordering both act within a combining sequence, so a per-cluster pass
-        // produces exactly the same tokens as `prepare`'s whole-string pass — fixing
-        // the spans a per-char pass would lose on decomposed or non-canonically
-        // ordered input. Every char a cluster emits is mapped to the cluster's whole
-        // raw byte range, so the returned offsets are always raw char boundaries.
+        // Normalization runs per *cluster* — a starter plus its trailing combining marks
+        // and conjoining Hangul jamo — not per char: NFC composition and NFD canonical
+        // reordering both act within such a unit, so a per-cluster pass produces exactly
+        // the same tokens as `prepare`'s whole-string pass — fixing the spans a per-char
+        // pass would lose on decomposed, non-canonically-ordered, or jamo-composed input.
+        // Every char a cluster emits is mapped to the cluster's whole raw byte range, so
+        // the returned offsets are always raw char boundaries.
         //
         // The window holds the last N emitted chars and their raw ranges; a long
         // document never materializes an O(text) buffer (span runs for the ≤ limit
@@ -413,7 +413,10 @@ impl<const N: usize, const CAP: usize> Tokenizer for NgramTokenizer<N, CAP> {
             // cluster substring is normalized straight into the window.
             let mut it = text.char_indices().peekable();
             while let Some((cluster_start, _)) = it.next() {
-                while it.peek().is_some_and(|&(_, c)| is_combining_mark(c)) {
+                while it
+                    .peek()
+                    .is_some_and(|&(_, c)| is_combining_mark(c) || is_conjoining_jamo(c))
+                {
                     it.next();
                 }
                 let cluster_end = it.peek().map_or(text.len(), |&(off, _)| off);
@@ -424,6 +427,14 @@ impl<const N: usize, const CAP: usize> Tokenizer for NgramTokenizer<N, CAP> {
         }
         first.map(|f| (f, last))
     }
+}
+
+/// Conjoining Hangul Vowel/Trailing jamo (U+1161..=U+1175, U+11A8..=U+11C2). Like
+/// combining marks these attach to a preceding character — NFC composes a leading jamo
+/// plus these into one syllable — so [`span`](NgramTokenizer::span) keeps them in the
+/// same cluster; splitting the composition would lose the token for that region.
+fn is_conjoining_jamo(c: char) -> bool {
+    matches!(c, '\u{1161}'..='\u{1175}' | '\u{11A8}'..='\u{11C2}')
 }
 
 impl<const N: usize, const CAP: usize> NgramTokenizer<N, CAP> {
@@ -755,6 +766,28 @@ mod tests {
         // Whichever token contains 'q', span must bracket it (per-char would miss it).
         let qtok = tokens.iter().find(|t| t.starts_with('q')).unwrap();
         assert!(tok.span(stored, &[qtok.as_str()]).is_some());
+    }
+
+    #[test]
+    fn span_recovers_conjoining_hangul_jamo_under_nfc() {
+        // Stored as conjoining jamo ᄀ ᅡ ᆨ (U+1100 U+1161 U+11A8); NFC composes them into
+        // the single syllable "각". A per-cluster pass that split at each jamo (they are
+        // starters, not combining marks) would never re-derive the composed token and
+        // would return None — so this is the Hangul regression for the cluster walker.
+        let tok = TrigramTokenizer::new();
+        let stored = "\u{1100}\u{1161}\u{11A8}xy"; // composes to "각xy"
+        let tokens: Vec<String> = tok.tokenize(stored).map(|g| g.to_string()).collect();
+        assert!(
+            tokens.iter().any(|t| t.starts_with('\u{ac01}')),
+            "{tokens:?}"
+        );
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let (lo, hi) = tok
+            .span(stored, &refs)
+            .expect("a span for the composed match");
+        assert!(stored.is_char_boundary(lo) && stored.is_char_boundary(hi));
+        // The match brackets the whole jamo run through "xy".
+        assert_eq!((lo, hi), (0, stored.len()));
     }
 
     #[test]

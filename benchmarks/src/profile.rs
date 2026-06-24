@@ -1,8 +1,8 @@
-//! The §10.2 work-done instrument: Σ(kept-posting cardinality) per query.
+//! The work-done instrument: Σ(kept-posting cardinality) per query.
 //!
-//! trifle's architectural claim is *flatness* — bit-sliced overlap is
-//! posting-size-independent, so latency should stay near-flat as the corpus grows.
-//! The quantity that *would* break flatness if it grew is the total cardinality of
+//! trifle aims for flat latency as the corpus grows — bit-sliced overlap is
+//! posting-size-independent. The quantity that *would* break that if it grew is the
+//! total cardinality of
 //! the postings fed to the counter for a query. trifle already emits it on its
 //! hot-path `tracing` event (`sum_cardinality`, behind the `tracing` feature); this
 //! is a minimal in-process [`Subscriber`] that captures that field, one sample per

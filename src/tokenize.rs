@@ -647,6 +647,140 @@ mod tests {
 
         // Window size is part of behavior too.
         assert_ne!(a, BigramTokenizer::new().fingerprint());
+
+        // `assume_normalized` changes the token stream on non-normalized input, so it
+        // must change the fingerprint.
+        let assume = TrigramTokenizer::builder()
+            .assume_normalized(true)
+            .build()
+            .fingerprint();
+        assert_ne!(
+            a, assume,
+            "assume_normalized change -> different fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_cap_at_equal_window() {
+        // Same window N=3, different byte capacity: must not collide (the old `as u8`
+        // encoding made CAP=12 and CAP=268 hash equal — but CAP=268 is now a compile
+        // error, so compare two *legal* widths that differ only in CAP).
+        let trigram = NgramTokenizer::<3, 12>::new().fingerprint();
+        let wide = NgramTokenizer::<3, 16>::new().fingerprint();
+        assert_ne!(trigram, wide, "CAP is part of the fingerprint");
+    }
+
+    #[test]
+    fn assume_normalized_matches_the_normalizing_path_on_conforming_input() {
+        // On input already in NFC, the skip must produce the SAME tokens as the
+        // normalizing path — proving it is a sound shortcut, not a behavior change.
+        let normalizing = TrigramTokenizer::new();
+        let assuming = TrigramTokenizer::builder().assume_normalized(true).build();
+        let nfc_input = "caf\u{e9} r\u{e9}sum\u{e9}"; // precomposed, already NFC
+        assert_eq!(grams(&normalizing, nfc_input), grams(&assuming, nfc_input));
+    }
+
+    #[test]
+    fn length_changing_casefold_is_handled() {
+        // 'İ'.to_lowercase() == ['i', '\u{307}'] — one source char folds to two.
+        let tok = TrigramTokenizer::new();
+        let grams = grams(&tok, "İst");
+        // The fold expands, so the trigram stream starts at the folded form.
+        assert_eq!(grams, ["i\u{307}s", "\u{307}st"]);
+    }
+
+    #[test]
+    fn strip_marks_collapses_dotted_capital_i_with_plain_forms() {
+        let tok = TrigramTokenizer::builder()
+            .normalization(Normalization::NfdStripMarks)
+            .build();
+        // İ -> NFD [I, ̇ ] -> strip -> I -> fold -> i. So İ/I/i all collapse.
+        assert_eq!(grams(&tok, "İab"), grams(&tok, "Iab"));
+        assert_eq!(grams(&tok, "İab"), grams(&tok, "iab"));
+        assert_eq!(grams(&tok, "İab"), ["iab"]);
+    }
+
+    #[test]
+    fn from_chars_rejects_a_window_wider_than_cap() {
+        // Three 4-byte code points = 12 bytes: fits Ngram<12>, not Ngram<9>.
+        let wide = ['🚀', '🎉', '😀'];
+        assert!(Ngram::<12>::from_chars(&wide).is_some());
+        assert!(Ngram::<9>::from_chars(&wide).is_none());
+    }
+
+    #[test]
+    fn undersized_cap_alias_silently_drops_only_the_too_wide_window() {
+        // Ngram<9> can't hold a 3-emoji window (12 bytes); it is dropped, the rest kept.
+        let tok = NgramTokenizer::<3, 9>::new();
+        // "🚀🎉😀ab": windows [🚀🎉😀](dropped), [🎉😀a], [😀ab].
+        assert_eq!(grams(&tok, "🚀🎉😀ab"), ["🎉😀a", "😀ab"]);
+    }
+
+    #[test]
+    fn span_brackets_first_through_last_occurrence() {
+        let tok = TrigramTokenizer::new();
+        // "abc" occurs at byte 0 and byte 9; the span runs first-start..last-end.
+        assert_eq!(tok.span("abcZZZZZZabc", &["abc"]), Some((0, 12)));
+        // Single occurrence is tight around the word.
+        assert_eq!(tok.span("zz abc zz", &["abc"]), Some((3, 6)));
+        // No matching token -> no span.
+        assert_eq!(tok.span("abcdef", &["zzz"]), None);
+    }
+
+    #[test]
+    fn span_recovers_decomposed_input_under_nfc() {
+        // Stored decomposed; the index composes the token "afé". The cluster-based
+        // span must still bracket it (the old per-char span returned None here).
+        let tok = TrigramTokenizer::new();
+        let stored = "Xcafe\u{301}Y"; // X c a f e ́ Y
+        let token: String = tok.tokenize(stored).map(|g| g.to_string()).nth(2).unwrap();
+        assert_eq!(token, "af\u{e9}"); // afé (composed)
+        let span = tok
+            .span(stored, &[token.as_str()])
+            .expect("a span for the match");
+        assert!(stored.is_char_boundary(span.0) && stored.is_char_boundary(span.1));
+        assert!(span.0 < span.1);
+    }
+
+    #[test]
+    fn span_recovers_noncanonically_ordered_marks_under_nfd() {
+        let tok = TrigramTokenizer::builder()
+            .normalization(Normalization::Nfd)
+            .build();
+        // q + acute(ccc 230) + dot-below(ccc 220) — given in non-canonical order.
+        let stored = "Xq\u{0301}\u{0323}Y";
+        // The tokenizer canonically reorders to q, dot-below, acute.
+        let tokens: Vec<String> = tok.tokenize(stored).map(|g| g.to_string()).collect();
+        assert!(tokens.iter().any(|t| t.starts_with('q')));
+        // Whichever token contains 'q', span must bracket it (per-char would miss it).
+        let qtok = tokens.iter().find(|t| t.starts_with('q')).unwrap();
+        assert!(tok.span(stored, &[qtok.as_str()]).is_some());
+    }
+
+    #[test]
+    fn span_offsets_are_always_char_boundaries_across_modes() {
+        let inputs = ["İstanbul café", "straße fluß", "ab🚀cd🎉ef", "Δοκιμή test"];
+        for norm in [
+            Normalization::Nfc,
+            Normalization::Nfd,
+            Normalization::NfdStripMarks,
+            Normalization::None,
+        ] {
+            let tok = TrigramTokenizer::builder().normalization(norm).build();
+            for input in inputs {
+                let tokens: Vec<String> = tok.tokenize(input).map(|g| g.to_string()).collect();
+                let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+                if let Some((lo, hi)) = tok.span(input, &refs) {
+                    assert!(
+                        input.is_char_boundary(lo) && input.is_char_boundary(hi),
+                        "span ({lo},{hi}) not on char boundaries for {input:?} / {norm:?}"
+                    );
+                    assert!(lo < hi && hi <= input.len());
+                    // A caller WILL slice this — it must not panic.
+                    let _ = &input[lo..hi];
+                }
+            }
+        }
     }
 
     #[test]

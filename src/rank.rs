@@ -362,4 +362,68 @@ mod tests {
         assert_eq!(count_eq(&acc, 2).iter().collect::<Vec<_>>(), [2]);
         assert_eq!(count_eq(&acc, 1).iter().collect::<Vec<_>>(), [1, 3]);
     }
+
+    #[test]
+    fn count_eq_exact_across_a_plane_boundary() {
+        // Counts 8 (0b1000), 7 (0b0111), 4 (0b100) straddle the 3->4 plane growth.
+        // A high-count id must be subtracted out of every lower-count query.
+        let mut posts: Vec<RoaringBitmap> = Vec::new();
+        for k in 0..8 {
+            // id 100 in all 8; id 200 in 7; id 300 in 4.
+            let mut p = bm(&[100]);
+            if k < 7 {
+                p.insert(200);
+            }
+            if k < 4 {
+                p.insert(300);
+            }
+            posts.push(p);
+        }
+        let refs: Vec<&RoaringBitmap> = posts.iter().collect();
+        let acc = bitsliced_overlap(&refs);
+        assert_eq!(count_eq(&acc, 8).iter().collect::<Vec<_>>(), [100]);
+        assert_eq!(count_eq(&acc, 7).iter().collect::<Vec<_>>(), [200]);
+        assert_eq!(count_eq(&acc, 4).iter().collect::<Vec<_>>(), [300]);
+        // The exactness that matters: count-4 must NOT contain the count-7/8 ids.
+        for c in [1, 2, 3, 5, 6] {
+            assert!(count_eq(&acc, c).is_empty(), "no id has count {c}");
+        }
+    }
+
+    #[test]
+    fn count_eq_plane_guard_rejects_counts_beyond_the_planes() {
+        // 7 postings sharing id 1 -> count 7, three planes (0b111).
+        let posts: Vec<RoaringBitmap> = (0..7).map(|_| bm(&[1])).collect();
+        let refs: Vec<&RoaringBitmap> = posts.iter().collect();
+        let acc = bitsliced_overlap(&refs);
+        assert_eq!(acc.len(), 3);
+        assert_eq!(count_eq(&acc, 7).iter().collect::<Vec<_>>(), [1]);
+        // 8 needs a 4th plane that doesn't exist -> the guard returns empty (no panic).
+        assert!(count_eq(&acc, 8).is_empty());
+        assert!(count_eq(&acc, 15).is_empty());
+    }
+
+    #[test]
+    fn count_eq_accepts_a_power_of_two_when_the_plane_exists() {
+        // 8 postings sharing id 1 -> count 8 (0b1000), exactly four planes.
+        let posts: Vec<RoaringBitmap> = (0..8).map(|_| bm(&[1])).collect();
+        let refs: Vec<&RoaringBitmap> = posts.iter().collect();
+        let acc = bitsliced_overlap(&refs);
+        assert_eq!(acc.len(), 4);
+        assert_eq!(count_eq(&acc, 8).iter().collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn bitsliced_overlap_degenerate_inputs() {
+        // No postings -> no planes.
+        assert!(bitsliced_overlap(&[]).is_empty());
+        // A single posting -> count 1 for each of its ids, nothing at count 2.
+        let single = bm(&[5, 9]);
+        let acc = bitsliced_overlap(&[&single]);
+        assert_eq!(count_eq(&acc, 1).iter().collect::<Vec<_>>(), [5, 9]);
+        assert!(count_eq(&acc, 2).is_empty());
+        // An empty posting contributes nothing and pushes no phantom plane.
+        let empty = RoaringBitmap::new();
+        assert!(bitsliced_overlap(&[&empty]).is_empty());
+    }
 }

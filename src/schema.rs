@@ -288,6 +288,21 @@ mod tests {
     }
 
     #[test]
+    fn alloc_ids_overflow_is_a_clean_error_not_a_wrap() {
+        let c = conn();
+        let ns = Namespace::bare();
+        create_tables(&c, &ns).unwrap();
+        set_next_id(&c, &ns, i64::MAX - 1).unwrap();
+        // The last legal id, leaving next_id at MAX.
+        assert_eq!(alloc_ids(&c, &ns, 1).unwrap(), i64::MAX - 1);
+        // A further allocation overflows i64; it must error, never wrap to a reused id.
+        assert!(matches!(
+            alloc_ids(&c, &ns, 5),
+            Err(crate::Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
     fn reset_empties_data_but_keeps_meta() {
         let c = conn();
         let ns = Namespace::bare();

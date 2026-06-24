@@ -195,4 +195,89 @@ mod tests {
         let t = toks(&[("a", 1), ("b", 2), ("c", 9)]);
         assert_eq!(select(&t, params(2, 0)), select(&t, params(2, 0)));
     }
+
+    #[test]
+    fn budget_boundary_is_inclusive_at_exactly_b() {
+        // 7 present, m=2 -> F=6. After the 6 rarest (df 1..6), Σdf = 21.
+        let t = toks(&[
+            ("a", 1),
+            ("b", 2),
+            ("c", 3),
+            ("d", 4),
+            ("e", 5),
+            ("f", 6),
+            ("g", 7),
+        ]);
+        // cost(6, 21) = 21 >= B -> stop at the floor. B=21 keeps exactly 6.
+        assert_eq!(select(&t, params(2, 21)).len(), 6);
+        // B=22 admits one more (cost 21 < 22 at the floor).
+        assert_eq!(select(&t, params(2, 22)).len(), 7);
+    }
+
+    #[test]
+    fn df_ties_break_on_the_token_deterministically() {
+        // Equal DF, supplied out of token order; the kept prefix is token-ascending.
+        let t = toks(&[("c", 5), ("a", 5), ("b", 5)]);
+        let kept = select(
+            &t,
+            SelectParams {
+                typo_damage: 0,
+                ..params(3, 0)
+            },
+        );
+        assert_eq!(kept, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn non_default_alpha_beta_enters_the_cost() {
+        // alpha=1,beta=1, 8 present, m=2 -> F=6. After 6 (df 1..6): cost = 6 + 21 = 27.
+        let t = toks(&[
+            ("a", 1),
+            ("b", 2),
+            ("c", 3),
+            ("d", 4),
+            ("e", 5),
+            ("f", 6),
+            ("g", 7),
+            ("h", 8),
+        ]);
+        let p = |b: u64| SelectParams {
+            alpha: 1.0,
+            beta: 1.0,
+            ..params(2, b)
+        };
+        assert_eq!(
+            select(&t, p(27)).len(),
+            6,
+            "cost 27 >= 27 stops at the floor"
+        );
+        assert_eq!(select(&t, p(28)).len(), 7, "cost 27 < 28 admits one more");
+    }
+
+    #[test]
+    fn floor_clamps_when_m_exceeds_present_count() {
+        // m=5 -> F=9, but only 2 tokens present: keep both, not 9.
+        let t = toks(&[("a", 1), ("b", 2)]);
+        assert_eq!(select(&t, params(5, 0)).len(), 2);
+    }
+
+    #[test]
+    fn breadth_grows_the_kept_set_monotonically() {
+        let t = toks(&[
+            ("a", 1),
+            ("b", 2),
+            ("c", 3),
+            ("d", 4),
+            ("e", 5),
+            ("f", 6),
+            ("g", 7),
+            ("h", 8),
+        ]);
+        let mut prev = 0usize;
+        for b in [0u64, 22, 28, 36, u64::MAX] {
+            let n = select(&t, params(2, b)).len();
+            assert!(n >= prev, "kept count must not shrink as B grows ({b})");
+            prev = n;
+        }
+    }
 }

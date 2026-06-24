@@ -430,11 +430,112 @@ mod tests {
         fold(&conn, &ns).unwrap();
         write(&conn, &ns, "abc", &[], &[1]); // now empty
         let stats = fold(&conn, &ns).unwrap();
-        assert!(stats.terms_dropped >= 1);
+        // Exactly one token dropped — not two. The token empties in the fold loop
+        // AND its df row is pruned by the trailing sweep; the stat must count it once.
+        assert_eq!(stats.terms_dropped, 1);
         assert!(posting(&conn, &ns, "abc").is_empty());
         // df row pruned (df <= 0).
         assert_eq!(df(&conn, &ns, "abc"), None);
         assert_eq!(term_count(&conn, &ns).unwrap(), 0);
+    }
+
+    #[test]
+    fn fold_is_idempotent_with_no_pending_delta() {
+        let (conn, ns) = harness();
+        write(&conn, &ns, "abc", &[1, 2], &[]);
+        fold(&conn, &ns).unwrap();
+        // A second fold has no delta rows to process and must be a clean no-op.
+        let again = fold(&conn, &ns).unwrap();
+        assert_eq!(again, FoldStats::default());
+        assert_eq!(posting(&conn, &ns, "abc"), [1, 2]);
+    }
+
+    #[test]
+    fn readd_of_a_removed_id_before_fold_purges_nothing() {
+        let (conn, ns) = harness();
+        write(&conn, &ns, "abc", &[1, 2, 3], &[]);
+        fold(&conn, &ns).unwrap(); // base = {1,2,3}
+        write(&conn, &ns, "abc", &[], &[2]); // stage removal of 2
+        write(&conn, &ns, "abc", &[2], &[]); // re-add 2 before the fold rescinds it
+        let stats = fold(&conn, &ns).unwrap();
+        assert_eq!(
+            stats.ids_purged, 0,
+            "the rescinded removal leaves the base intact"
+        );
+        assert_eq!(posting(&conn, &ns, "abc"), [1, 2, 3]);
+        assert_eq!(df(&conn, &ns, "abc"), Some(3));
+    }
+
+    #[test]
+    fn a_token_resurrects_after_being_fully_pruned() {
+        let (conn, ns) = harness();
+        write(&conn, &ns, "abc", &[1], &[]);
+        fold(&conn, &ns).unwrap();
+        write(&conn, &ns, "abc", &[], &[1]);
+        fold(&conn, &ns).unwrap(); // fully pruned: no post/term/delta rows
+        assert_eq!(df(&conn, &ns, "abc"), None);
+        // A later write on the same token must rebuild it from scratch (no base).
+        write(&conn, &ns, "abc", &[2], &[]);
+        assert_eq!(df(&conn, &ns, "abc"), Some(1));
+        assert_eq!(posting(&conn, &ns, "abc"), [2]);
+        fold(&conn, &ns).unwrap();
+        assert_eq!(posting(&conn, &ns, "abc"), [2]);
+    }
+
+    #[test]
+    fn replacing_a_terms_id_nets_zero_df_but_updates_the_posting() {
+        // The legal monotonic-id replace: an old id leaves and a fresh id arrives in
+        // one write. The cardinality is unchanged (df stays), but the posting swaps.
+        let (conn, ns) = harness();
+        write(&conn, &ns, "abc", &[1], &[]);
+        assert_eq!(df(&conn, &ns, "abc"), Some(1));
+        apply_writes(
+            &conn,
+            &ns,
+            &[TermWrite {
+                term: "abc",
+                add: &[2],
+                remove: &[1],
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            df(&conn, &ns, "abc"),
+            Some(1),
+            "one out, one in: df unchanged"
+        );
+        assert_eq!(posting(&conn, &ns, "abc"), [2]);
+    }
+
+    #[test]
+    fn corrupt_base_blob_surfaces_an_error_not_a_panic() {
+        let (conn, ns) = harness();
+        write(&conn, &ns, "abc", &[1, 2, 3], &[]);
+        fold(&conn, &ns).unwrap(); // base now stored in `post`
+        conn.execute(
+            &format!("UPDATE {} SET base = ?1 WHERE term = 'abc'", ns.post()),
+            [vec![0xFFu8, 0x00, 0x13, 0x37]],
+        )
+        .unwrap();
+        assert!(matches!(
+            effective_postings(&conn, &ns, &["abc"]),
+            Err(crate::Error::Posting(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_delta_blob_surfaces_an_error_not_a_panic() {
+        let (conn, ns) = harness();
+        write(&conn, &ns, "abc", &[1], &[]); // delta row exists
+        conn.execute(
+            &format!("UPDATE {} SET added = ?1 WHERE term = 'abc'", ns.delta()),
+            [vec![0xFFu8, 0xFF, 0xFF]],
+        )
+        .unwrap();
+        assert!(matches!(
+            effective_postings(&conn, &ns, &["abc"]),
+            Err(crate::Error::Posting(_))
+        ));
     }
 
     #[test]

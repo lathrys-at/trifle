@@ -1,0 +1,29 @@
+[package]
+name = "trifle-benchmarks"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Latency/throughput + recall benchmark harness for trifle (design §10). Not published."
+
+[dependencies]
+# `tracing` feature on: the profile pass attaches a collector to trifle's per-query
+# "overlap candidate generation" event to read Σ(kept-posting cardinality) (§10.2).
+# With no subscriber installed (the latency/quality runs) the events cost ~nothing.
+trifle = { path = "..", features = ["tracing"] }
+# The FTS5-trigram (BM25) and LIKE-scan baselines run in-process against the same
+# bundled SQLite trifle links, so the footrace is apples-to-apples on the store.
+rusqlite = { version = "0.37", features = ["bundled"] }
+# Parse the committed pinned-source manifests (url + sha256 + attribution).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Each engine builds into its own throwaway temp directory.
+tempfile = "3"
+# The §10.2 work-done collector reads trifle's hot-path event fields.
+tracing = "0.1"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "trifle-bench"
+path = "src/main.rs"

@@ -1,3 +1,13 @@
+[workspace]
+members = ["benchmarks"]
+
+# Shared lint bar, inherited by every workspace member (incl. the benchmark crate).
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
 [package]
 name = "trifle"
 version = "0.0.1"
@@ -9,6 +19,9 @@ repository = "https://github.com/lathrys-at/trifle"
 readme = "README.md"
 keywords = ["search", "fuzzy", "trigram", "sqlite", "ngram"]
 categories = ["text-processing", "database-implementations"]
+# The benchmark harness is a separate, unpublished workspace crate; keep it (and the
+# downloaded-corpus cache) out of the published `trifle` tarball.
+exclude = ["/benchmarks", "/.cache"]
 
 [features]
 default = []
@@ -33,18 +46,7 @@ tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 
-[[bench]]
-name = "search"
-harness = false
-
-[profile.bench]
-debug = true  # keep symbols so the scaling sweep can be profiled
-
-[lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
+[lints]
+workspace = true

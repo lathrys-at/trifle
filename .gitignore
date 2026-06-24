@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Benchmark corpus cache — downloaded, hash-verified, NEVER committed. Only the
+# pinned manifests under benchmarks/sources/ are tracked (see benchmarks/README.md).
+/.cache

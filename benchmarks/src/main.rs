@@ -90,6 +90,11 @@ SEARCH-TUNING OPTIONS (latency, quality, profile) — trifle only (§10.3):
     --min-shared <M>              Match floor m (shared rare tokens)   [default: engine]
     --breadth <B>                 Breadth budget B (recall/latency)    [default: engine]
 
+ENGINE SELECTION (latency, quality):
+    --filter <engine>             Skip an engine; repeatable. Engines:
+                                  trifle, fts5-trigram-bm25, like-scan.
+                                  e.g. --filter like-scan (slow on huge corpora)
+
 LATENCY OPTIONS:
     --queries <N>                 Queries to run                       [default: 2000]
     --k <N>                       Top-k per query                      [default: 10]
@@ -110,6 +115,7 @@ EXAMPLES:
     trifle-bench latency --docs 100000 --queries 5000 --seed 42
     trifle-bench latency --docs 100000 --batched
     trifle-bench latency --docs 500000 --concurrent 8
+    trifle-bench latency --docs 2000000 --filter like-scan
     trifle-bench quality --corpus msmarco --docs 100000
     trifle-bench profile --docs 1000000
 ";
@@ -120,14 +126,16 @@ EXAMPLES:
 /// booleans. Deliberately tiny and std-only (the harness vendors no arg crate, in
 /// keeping with its hand-rolled RNG and shell-out asset fetch).
 struct Flags {
-    valued: HashMap<String, String>,
+    /// Values per flag, accumulated in order so a flag may repeat (e.g. `--filter`).
+    /// Scalar accessors take the last occurrence (last-wins); `values` returns all.
+    valued: HashMap<String, Vec<String>>,
     bools: HashSet<String>,
 }
 
 impl Flags {
     fn parse(args: &[String], bool_flags: &[&str]) -> Result<Flags, String> {
         let bset: HashSet<&str> = bool_flags.iter().copied().collect();
-        let mut valued = HashMap::new();
+        let mut valued: HashMap<String, Vec<String>> = HashMap::new();
         let mut bools = HashSet::new();
         let mut i = 0;
         while i < args.len() {
@@ -136,7 +144,7 @@ impl Flags {
                 .strip_prefix("--")
                 .ok_or_else(|| format!("unexpected argument: {a}"))?;
             if let Some((k, v)) = key.split_once('=') {
-                valued.insert(k.to_string(), v.to_string());
+                valued.entry(k.to_string()).or_default().push(v.to_string());
                 i += 1;
             } else if bset.contains(key) {
                 bools.insert(key.to_string());
@@ -146,7 +154,7 @@ impl Flags {
                     .get(i + 1)
                     .filter(|v| !v.starts_with("--"))
                     .ok_or_else(|| format!("--{key} expects a value"))?;
-                valued.insert(key.to_string(), v.clone());
+                valued.entry(key.to_string()).or_default().push(v.clone());
                 i += 2;
             }
         }
@@ -165,9 +173,16 @@ impl Flags {
         Ok(())
     }
 
+    /// The last value given for `key` (last-wins for a repeated scalar flag).
+    fn last(&self, key: &str) -> Option<&String> {
+        self.valued.get(key).and_then(|v| v.last())
+    }
+    /// Every value given for a repeatable flag, in order (empty if never given).
+    fn values(&self, key: &str) -> &[String] {
+        self.valued.get(key).map(Vec::as_slice).unwrap_or(&[])
+    }
     fn str(&self, key: &str, default: &str) -> String {
-        self.valued
-            .get(key)
+        self.last(key)
             .cloned()
             .unwrap_or_else(|| default.to_string())
     }
@@ -178,7 +193,7 @@ impl Flags {
         self.bools.contains(key)
     }
     fn u64(&self, key: &str, default: u64) -> Result<u64, String> {
-        match self.valued.get(key) {
+        match self.last(key) {
             Some(v) => parse_u64(v).ok_or_else(|| format!("--{key}: not an integer: {v}")),
             None => Ok(default),
         }
@@ -187,7 +202,7 @@ impl Flags {
         Ok(self.u64(key, default as u64)? as usize)
     }
     fn opt_u32(&self, key: &str) -> Result<Option<u32>, String> {
-        match self.valued.get(key) {
+        match self.last(key) {
             Some(v) => v
                 .parse::<u32>()
                 .map(Some)
@@ -196,7 +211,7 @@ impl Flags {
         }
     }
     fn opt_u64(&self, key: &str) -> Result<Option<u64>, String> {
-        match self.valued.get(key) {
+        match self.last(key) {
             Some(v) => parse_u64(v)
                 .map(Some)
                 .ok_or_else(|| format!("--{key}: not an integer: {v}")),
@@ -240,13 +255,50 @@ fn tuning(flags: &Flags) -> Result<Tuning, String> {
 
 const CORPUS_OPTS: &[&str] = &["corpus", "docs", "seed", "min-shared", "breadth"];
 
+/// The engine identifiers accepted by `--filter`. These must match the strings each
+/// engine returns from `baselines::Engine::name()`.
+const ENGINE_TRIFLE: &str = "trifle";
+const ENGINE_FTS5: &str = "fts5-trigram-bm25";
+const ENGINE_LIKE: &str = "like-scan";
+const ALL_ENGINES: [&str; 3] = [ENGINE_TRIFLE, ENGINE_FTS5, ENGINE_LIKE];
+
+/// The set of engines to skip, collected from repeated `--filter <engine>` flags.
+/// Each value must name a known engine — a typo is an error, not a silent no-op (the
+/// same strictness `reject_unknown` applies to option *names*).
+fn skipped_engines(flags: &Flags) -> Result<HashSet<String>, String> {
+    let mut skip = HashSet::new();
+    for v in flags.values("filter") {
+        if !ALL_ENGINES.contains(&v.as_str()) {
+            return Err(format!(
+                "--filter {v}: unknown engine (expected one of {})",
+                ALL_ENGINES.join(", ")
+            ));
+        }
+        skip.insert(v.clone());
+    }
+    Ok(skip)
+}
+
 // ----- latency ----------------------------------------------------------------
 
 fn cmd_latency(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args, &["batched"])?;
     let mut allowed = CORPUS_OPTS.to_vec();
-    allowed.extend(["queries", "k", "warmup", "repeat", "batched", "concurrent"]);
+    allowed.extend([
+        "queries",
+        "k",
+        "warmup",
+        "repeat",
+        "batched",
+        "concurrent",
+        "filter",
+    ]);
     flags.reject_unknown(&allowed)?;
+
+    let skip = skipped_engines(&flags)?;
+    if ALL_ENGINES.iter().all(|e| skip.contains(*e)) {
+        return Err("all engines filtered out — nothing to run".into());
+    }
 
     let (corpus, seed) = build_corpus(&flags)?;
     let n = flags.usize("queries", 2000)?;
@@ -280,22 +332,36 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
         mix[2],
         warmup.min(nq),
     );
+    if !skip.is_empty() {
+        let mut names: Vec<&str> = skip.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        println!("# filter: skipping {}", names.join(", "));
+    }
 
     if concurrent > 1 {
+        if skip.contains(ENGINE_TRIFLE) {
+            return Err("concurrent mode runs trifle only, but it is filtered out".into());
+        }
         println!("# mode=concurrent threads={concurrent} (trifle only — the read-pool axis)");
         bench_concurrent(&corpus, &qtexts, k, concurrent, tuning, warmup);
         return Ok(());
     }
 
     println!("# mode={}", if batched { "batched" } else { "serial" });
-    let trifle = Trifle::build(&corpus, tuning);
-    bench_engine(&trifle, &qtexts, k, warmup, repeat, batched);
-    match Fts5::build(&corpus) {
-        Some(fts5) => bench_engine(&fts5, &qtexts, k, warmup, repeat, batched),
-        None => eprintln!("note: FTS5 trigram unavailable in the linked SQLite — skipping"),
+    if !skip.contains(ENGINE_TRIFLE) {
+        let trifle = Trifle::build(&corpus, tuning);
+        bench_engine(&trifle, &qtexts, k, warmup, repeat, batched);
     }
-    let like = Like::build(&corpus);
-    bench_engine(&like, &qtexts, k, warmup, repeat, batched);
+    if !skip.contains(ENGINE_FTS5) {
+        match Fts5::build(&corpus) {
+            Some(fts5) => bench_engine(&fts5, &qtexts, k, warmup, repeat, batched),
+            None => eprintln!("note: FTS5 trigram unavailable in the linked SQLite — skipping"),
+        }
+    }
+    if !skip.contains(ENGINE_LIKE) {
+        let like = Like::build(&corpus);
+        bench_engine(&like, &qtexts, k, warmup, repeat, batched);
+    }
     println!(
         "# (hidden axes — durability, footprint kind, update cost, semantics — in README §matrix)"
     );
@@ -409,8 +475,13 @@ fn bench_concurrent(
 fn cmd_quality(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args, &[])?;
     let mut allowed = CORPUS_OPTS.to_vec();
-    allowed.extend(["queries", "k", "edits"]);
+    allowed.extend(["queries", "k", "edits", "filter"]);
     flags.reject_unknown(&allowed)?;
+
+    let skip = skipped_engines(&flags)?;
+    if skip.contains(ENGINE_TRIFLE) && skip.contains(ENGINE_FTS5) {
+        return Err("both quality engines (trifle, fts5-trigram-bm25) filtered out".into());
+    }
 
     let (corpus, seed) = build_corpus(&flags)?;
     let n = flags.usize("queries", 1000)?;
@@ -424,9 +495,17 @@ fn cmd_quality(args: &[String]) -> Result<(), String> {
         vec![0, 1, 2]
     };
 
-    let trifle = Trifle::build(&corpus, tuning);
-    let fts5 = Fts5::build(&corpus);
-    if fts5.is_none() {
+    let trifle = if skip.contains(ENGINE_TRIFLE) {
+        None
+    } else {
+        Some(Trifle::build(&corpus, tuning))
+    };
+    let fts5 = if skip.contains(ENGINE_FTS5) {
+        None
+    } else {
+        Fts5::build(&corpus)
+    };
+    if fts5.is_none() && !skip.contains(ENGINE_FTS5) {
         eprintln!("note: FTS5 trigram unavailable in the linked SQLite — BM25 column blank");
     }
 
@@ -444,14 +523,16 @@ fn cmd_quality(args: &[String]) -> Result<(), String> {
         }
         let labels: Vec<i64> = qs.iter().map(|q| q.source_doc).collect();
         let qtexts: Vec<&str> = qs.iter().map(|q| q.text.as_str()).collect();
-        let tr = recall_at_k(&trifle.search_many(&qtexts, k), &labels);
-        let fr = fts5
+        let recall = |e: &dyn Engine| recall_at_k(&e.search_many(&qtexts, k), &labels);
+        let tr_s = trifle
             .as_ref()
-            .map(|e| recall_at_k(&e.search_many(&qtexts, k), &labels));
-        let fr_s = fr
-            .map(|r| format!("{:.3}", r))
+            .map(|e| format!("{:.3}", recall(e)))
             .unwrap_or_else(|| "—".into());
-        println!("{edits:>6}  {:>8}  {:>10.3}  {fr_s:>10}", qtexts.len(), tr);
+        let fr_s = fts5
+            .as_ref()
+            .map(|e| format!("{:.3}", recall(e)))
+            .unwrap_or_else(|| "—".into());
+        println!("{edits:>6}  {:>8}  {tr_s:>10}  {fr_s:>10}", qtexts.len());
     }
     Ok(())
 }

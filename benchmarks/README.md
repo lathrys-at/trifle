@@ -1,11 +1,15 @@
 # trifle benchmarks (design §10)
 
-The rerunnable harness behind trifle's performance claims. Two distinct benchmarks
-live here, because conflating them measures the wrong thing (§10):
+The rerunnable harness behind trifle's performance claims. Three evals live here,
+because conflating distinct questions measures the wrong thing (§10):
 
-- **latency / throughput** — no labels needed; realistic corpus + realistic query
-  commonness. *How fast?*
-- **quality / recall** — needs relevance judgments. *How good, vs BM25?*
+- **`latency` / throughput** — no labels; realistic corpus + query commonness. *How fast?*
+- **`relevance`** — MS MARCO **real dev queries + qrels** (§10.4). *How good is recall on
+  paraphrased queries, vs BM25?* Real queries share no guaranteed substring with their
+  answer, so this is the honest relevance ceiling.
+- **`fuzzy`** — **entity name + injected edits** over GeoNames (§10.5). *Does the
+  pruner + overlap + tokenizer pipeline survive typos?* — on the task that construction
+  faithfully models (you type a corrupted target name, find the target).
 
 A speed superlative is **earned, not asserted**: the README's headline claim ships
 only once this harness backs it, with a link here.
@@ -21,16 +25,23 @@ typo-tolerant, much faster" — and ownership of an underserved cell: **durable 
 embedded + incrementally-updatable + corpus-scale fuzzy, with provenance, fast enough
 to feel instant.** So the comparison is a footrace *and* a matrix.
 
-### The footrace (`latency`, `quality`)
+### The engines, and which eval each baselines
 
 Same task, same corpus, same queries, in-process, so the comparison isolates the
-matching strategy from the store — all three link the *same* bundled SQLite:
+matching strategy from the store — every engine links the *same* bundled SQLite:
 
 | Engine | What it is | Role |
 |--------|-----------|------|
 | **trifle** | this crate | the subject |
-| **fts5-trigram-bm25** | a trigram FTS5 table, `ORDER BY rank` (BM25) | the in-DB cousin; the **quality baseline** |
+| **fts5-trigram-bm25** | a trigram FTS5 table, `ORDER BY rank` (BM25) | latency cousin (phrase MATCH); **fuzzy** baseline (OR-bag of the query's trigrams — a *fair* fuzzy rival, where a bm25-phrase would score ~0 on typos) |
+| **fts5-word-bm25** | a `unicode61` FTS5 table, BM25 | the **canonical BM25** baseline for `relevance` (real BM25 over words) |
 | **like-scan** | `LIKE '%…%'` over a plain table | the naive substring floor |
+
+The baseline is **deliberately matched to the eval.** `relevance` (real paraphrased
+queries) compares against BM25 — word-level canonical *and* the trigram cousin. `fuzzy`
+(typo'd names) compares against FTS5 *fuzzy* (trigram-MATCH) + the LIKE floor — **never
+bm25 on a typo eval**, where an exact-term bm25 scores zero by construction and the "win"
+is empty. `latency` keeps the phrase-MATCH FTS5 unchanged.
 
 ### The matrix (read this before reading the race)
 
@@ -54,26 +65,37 @@ queries, and fill the table.
 
 ## Corpora — and why no single one suffices (§10.4)
 
-| `--corpus` | What | Why |
+| corpus / command | What | Why |
 |------------|------|-----|
-| `synthetic` *(default)* | real English words (dwyl wordlist) sampled with a **Zipfian** frequency law, 6–20 words/doc | trigram document-frequencies look like real text — common trigrams in many docs, rare ones in few. A tiny vocabulary collapses every trigram onto near-every document and measures a **degenerate dense-posting regime** — the wrong thing. |
-| `msmarco` | a deterministic subsample of MS MARCO passages | real prose, real vocabulary and co-occurrence; the strongest single fit for latency *and* the BM25 quality baseline. |
+| `synthetic` *(latency/profile, default)* | real English words (dwyl wordlist) sampled with a **Zipfian** law, 6–20 words/doc | trigram document-frequencies look like real text. A tiny vocabulary would collapse every trigram onto near-every document — a **degenerate dense-posting regime**, the wrong thing. |
+| `msmarco` *(latency/profile)* | a deterministic subsample of MS MARCO passages | real prose, real co-occurrence; the strongest single fit for latency. |
+| `relevance` *(command)* | MS MARCO passages built **answers + distractors**: every qrel-relevant passage for the sampled real dev queries, plus `--docs` random distractors | guarantees the known answer is indexed, so recall@k measures *ranking it over the distractors* for a real paraphrased query — not whether the answer happened to fall in a random subsample. |
+| `geonames-cities` *(fuzzy, default)* / `geonames-all` *(fuzzy)* | GeoNames place names (cities > 15k pop, ~34k; or the full gazetteer, ~12M) | short, structured, low-paraphrase names — the regime where name+edit injection is *faithful*, with natural near-match distractors (many similar names). |
 
-Both download on demand, hash-verified, into the gitignored repo-root `.cache/bench/`.
-Their bytes are **never committed** — only the pinned manifests in `sources/`. See
-[`ASSETS.md`](ASSETS.md) for licenses (MS MARCO is non-commercial research only).
+Assets download on demand, hash-verified where the source is immutable, into the
+gitignored repo-root `.cache/bench/<corpus>/` (each corpus namespaced so identically
+named files never collide). Their bytes are **never committed** — only the manifests in
+`sources/`. GeoNames dumps regenerate ~daily, so they are intentionally *unpinned*. See
+[`ASSETS.md`](ASSETS.md) for licenses (MS MARCO is non-commercial research only; GeoNames
+is CC BY 4.0).
 
-## Queries — in-corpus snippets ± typos (§10.5)
+## Queries — matched to the eval (§10.5)
 
-The realistic query is an **in-corpus document snippet**, optionally with injected
-single-character typos — which sidesteps "where do realistic queries come from": the
-snippet's vocabulary and co-occurrence are exactly the corpus's, and the source
-document is a **free ground-truth label**.
+- `latency`/`profile` — **in-corpus document snippets** (2–5 words, 0–2 typos), no
+  labels: their vocabulary/co-occurrence are exactly the corpus's, which is all a latency
+  measurement needs.
+- `relevance` — **real MS MARCO dev queries**, labeled by qrels. These *paraphrase* an
+  information need (no guaranteed substring with the answer) — the honest relevance test.
+  (Self-derived snippets — the old `quality` eval — were a known-item smoke test against a
+  zero-by-construction baseline; that drift is what this harness fixes.)
+- `fuzzy` — an **entity name + exactly *k* edits** (the four operations — transposition,
+  substitution, deletion, insertion — weighted toward realistic adjacent-key typos),
+  labeled by the entity. On *names* this is faithful ("type the target, maybe wrong"),
+  reported 1- vs 2-edit, with a trigram-survival column and a near-distractor density so a
+  trivially-easy run is visible.
 
-- `latency`/`profile` — snippets of 2–5 words, 0–2 typos, no labels needed.
-- `quality` — snippets of 3–6 words with exactly *k* edits, labeled by source doc;
-  edits are the four operations (transposition, substitution, deletion, insertion),
-  weighted toward realistic typos (adjacent-key, transpositions).
+Both recall evals tag each miss **selection / below-floor / ranking** (§4) — whether the
+fix lives in the pruner / `m` / `B`, or in the `Ranker`.
 
 ## Reproducibility
 
@@ -85,27 +107,26 @@ keep it fixed to compare a code change against a baseline. The size knobs — `-
 
 ## Running it
 
-The build machine here has **no network**; fetch on a connected machine first, then
-run offline against the warm cache.
+If your build environment is offline, `fetch` the assets on a connected machine first,
+then run against the warm cache. (`relevance` needs the ~1 GiB MS MARCO passage
+collection; `fuzzy --corpus geonames-cities` is only a few MB.)
 
 ```bash
-# 1. (network machine) warm the cache — downloads + hash-verifies the corpus assets
-cargo run -p trifle-benchmarks --release -- fetch --corpus synthetic
-cargo run -p trifle-benchmarks --release -- fetch --corpus msmarco   # ~1 GiB, non-commercial license
+# 1. warm the cache (downloads + verifies where the source is immutable)
+cargo run -p trifle-benchmarks --release -- fetch --corpus relevance       # collection + queries + qrels (~1 GiB)
+cargo run -p trifle-benchmarks --release -- fetch --corpus geonames-cities  # ~3 MB
 
-# 2. the footrace: latency + throughput, serial
+# 2. the footrace: latency + throughput (serial; add --batched, or --concurrent 8)
 cargo run -p trifle-benchmarks --release -- latency --docs 100000 --queries 5000 --seed 42
 
-# the batched axis (one search_batch call shares posting/frequency reads)
-cargo run -p trifle-benchmarks --release -- latency --docs 100000 --batched
+# 3. relevance: set-recall@k on real dev queries+qrels, vs word/trigram BM25
+cargo run -p trifle-benchmarks --release -- relevance --docs 100000 --queries 5000
 
-# the read-pool parallelism axis (trifle only)
-cargo run -p trifle-benchmarks --release -- latency --docs 500000 --concurrent 8
+# 4. fuzzy: name+edit recall (1- and 2-edit), vs FTS5 trigram-MATCH + the LIKE floor
+cargo run -p trifle-benchmarks --release -- fuzzy --corpus geonames-cities --queries 5000
+#    --corpus geonames-all   for the corpus-scale fuzzy run
 
-# 3. quality: recall@k vs BM25, swept over {0,1,2} edits
-cargo run -p trifle-benchmarks --release -- quality --corpus msmarco --docs 100000
-
-# 4. the work-done curve: Σ(kept-posting cardinality), the §10.2 flatness instrument
+# 5. the work-done curve: Σ(kept-posting cardinality), the §10.2 flatness instrument
 cargo run -p trifle-benchmarks --release -- profile --docs 1000000
 ```
 
@@ -132,7 +153,18 @@ if not, look at hydration or the predicate.
 
 ## Caveats (§10.6)
 
-Nobody's queries are *your users'* queries. MS MARCO's distribution is a proxy for
-"natural search"; typo injection a proxy for "autocomplete". Weight the **relative**
-signal (trifle vs BM25; with-typos vs without; tail vs median) over absolute numbers,
-and re-run on your own corpus before trusting any of it.
+Nobody's queries are *your users'* queries. Weight the **relative** signal (trifle vs
+BM25; with-typos vs without; tail vs median) over absolute numbers, and re-run on your
+own corpus before trusting any of it. Two specifics:
+
+- **`relevance` understates recall.** MS MARCO dev qrels are **sparse** (~1 judged passage
+  per query), so set-recall@k against a single label is a narrow slice — read it as "did
+  the one known answer land in the top k," not full relevance recall. Both engines score
+  against the *identical* in-corpus qrels and *identical* k (the harness drops any query
+  with no in-corpus answer for every engine alike); the reported `scored-queries` count is
+  the real denominator.
+- **`fuzzy` does not transfer to prose.** Entity-name fuzzy is a **favorable** regime
+  (short, structured, low-paraphrase). Strong recall there validates the fuzzy *machinery*
+  on its home turf; it says nothing about fuzzy retrieval over paraphrase-heavy prose —
+  that harder question is `relevance`'s job. Watch the **near-distractor density**: if it
+  is low, no confusables were sampled and the numbers are inflated.

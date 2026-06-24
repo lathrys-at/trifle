@@ -1,0 +1,9 @@
+{
+  "name": "MS MARCO dev-small qrels (qrels.dev.small.tsv)",
+  "license": "MS MARCO Non-Commercial Research License",
+  "repo": "https://microsoft.github.io/msmarco/",
+  "url": "https://msmarco.z22.web.core.windows.net/msmarcoranking/qrels.dev.small.tsv",
+  "sha256": "ddc607dbe7b748d7168e8675a242f0811d47febaa2e69d3af09d7ab249c68d7e",
+  "bytes": 143300,
+  "note": "TREC-style `qid 0 pid 1`, uncompressed. 6980 dev queries, ~1 judged-relevant passage each (sparse qrels -> recall@k understates). Immutable research artifact, so pinned."
+}

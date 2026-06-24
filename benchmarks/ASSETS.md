@@ -7,8 +7,11 @@ repo-root `.cache/bench/`, hash-verified against the pinned manifests in
 
 | Asset | Used for | License | Pinned in |
 |-------|----------|---------|-----------|
-| **dwyl/english-words** `words_alpha.txt` | the synthetic-from-wordlist corpus (the default; a real English vocabulary sampled with a Zipfian frequency law, so character-trigram document frequencies look like real text) | The Unlicense (public domain) | [`sources/words_alpha.json`](sources/words_alpha.json) — pinned to commit `8179fe6…`, sha256 verified |
-| **MS MARCO passage collection** | the `--corpus msmarco` real-document corpus (a deterministic subsample of real passages) | MS MARCO Non-Commercial Research License | [`sources/msmarco.json`](sources/msmarco.json) — sha256 left empty until first fetch |
+| **dwyl/english-words** `words_alpha.txt` | the synthetic-from-wordlist corpus (latency default; a real English vocabulary sampled Zipfian so character-trigram document frequencies look like real text) | The Unlicense (public domain) | [`sources/words_alpha.json`](sources/words_alpha.json) — pinned to commit `8179fe6…`, sha256 verified |
+| **MS MARCO passage collection** | the `latency`/`profile` `--corpus msmarco` subsample, and the passage text for the `relevance` eval | MS MARCO Non-Commercial Research License | [`sources/msmarco.json`](sources/msmarco.json) — sha256 left empty until first fetch (~1 GiB) |
+| **MS MARCO dev queries** `queries.dev.tsv` | the real query strings for the `relevance` eval | MS MARCO Non-Commercial Research License | [`sources/msmarco-queries.json`](sources/msmarco-queries.json) — sha256 pinned |
+| **MS MARCO dev-small qrels** `qrels.dev.small.tsv` | the relevance judgments (ground truth) for the `relevance` eval | MS MARCO Non-Commercial Research License | [`sources/msmarco-qrels.json`](sources/msmarco-qrels.json) — sha256 pinned |
+| **GeoNames** `cities15000` / `allCountries` | the entity corpora for the `fuzzy` (name+edit) eval | CC BY 4.0 | [`sources/geonames-cities15000.json`](sources/geonames-cities15000.json), [`sources/geonames-all.json`](sources/geonames-all.json) — intentionally **unpinned** |
 
 ## Notes on each source
 
@@ -17,10 +20,16 @@ repo-root `.cache/bench/`, hash-verified against the pinned manifests in
   so the vocabulary (and therefore the trigram-DF distribution) is reproducible.
 - **MS MARCO** — released by Microsoft for **non-commercial research**. Review the
   license before use; it is *not* redistributable here, which is the other reason the
-  archive is fetch-on-demand and never committed. The manifest's `sha256` is empty
-  until the first fetch on a network machine prints the computed hash to paste back in
-  (after which every run verifies against it). The ~1 GiB archive is downloaded and
-  `tar`-extracted into the cache; the harness streams `collection.tsv` and subsamples.
+  assets are fetch-on-demand and never committed. The three artifacts (collection,
+  `queries.dev.tsv`, `qrels.dev.small.tsv`) are immutable research files: the
+  queries/qrels manifests are sha256-pinned; the ~1 GiB collection's `sha256` is left
+  empty until the first fetch prints the computed hash to paste back in. The `relevance`
+  eval reuses the same cached `collection.tsv` as the `msmarco` latency corpus.
+- **GeoNames** — geographical names under **CC BY 4.0** (attribution: © GeoNames,
+  <https://www.geonames.org/>). The dumps regenerate roughly daily, so a fixed sha256
+  would fail strict verification on every upstream refresh — these manifests are
+  **intentionally unpinned**, and reproducibility comes from the cached snapshot plus
+  `--seed`. The harness reads col 1 (geonameid, the doc id) and col 2 (name).
 
 ## The offline fallback
 

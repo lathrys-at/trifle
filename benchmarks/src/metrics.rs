@@ -1,6 +1,7 @@
 //! Summaries — pure, dependency-free. Latency percentiles, throughput, recall@k,
 //! and a plain u64 distribution (reused for the Σ-cardinality work-done curve).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// Nearest-rank percentile of a *sorted* slice: the value at rank
@@ -75,20 +76,39 @@ pub fn throughput(queries: usize, elapsed: Duration) -> f64 {
     queries as f64 / secs
 }
 
-/// recall@k: the fraction of labeled queries whose ground-truth document id appears
-/// in that query's returned id list. `results[i]` is the engine's answer for the
-/// query whose relevant doc is `labels[i]`.
-pub fn recall_at_k(results: &[Vec<i64>], labels: &[i64]) -> f64 {
-    if labels.is_empty() {
-        return 0.0;
-    }
-    let mut hits = 0usize;
-    for (got, &want) in results.iter().zip(labels.iter()) {
-        if got.contains(&want) {
-            hits += 1;
+/// **set-recall@k** over (possibly multi-passage, sparse) relevance judgments:
+/// `mean over queries of |top-k(results[i]) ∩ relevant[i]| / |relevant[i]|`.
+///
+/// `relevant[i]` is the in-corpus judged-relevant id set for query `i`. Both engines
+/// MUST be scored against the *same* `relevant` slice with the *same* `k` — that is the
+/// symmetry contract; a per-engine label set or k is how a bogus delta sneaks in. A
+/// query with an empty `relevant[i]` is undefined (0/0) and is **excluded from the
+/// denominator identically for every engine**, never scored for one side only. The
+/// metric truncates each result to `k` itself, so an engine that over-returns can't
+/// inflate. The count actually scored is [`scored_queries`].
+pub fn set_recall_at_k(results: &[Vec<i64>], relevant: &[Vec<i64>], k: usize) -> f64 {
+    let mut scored = 0usize;
+    let mut acc = 0.0f64;
+    for (got, rel) in results.iter().zip(relevant.iter()) {
+        if rel.is_empty() {
+            continue;
         }
+        scored += 1;
+        let topk: HashSet<i64> = got.iter().copied().take(k).collect();
+        let hits = rel.iter().filter(|r| topk.contains(r)).count();
+        acc += hits as f64 / rel.len() as f64;
     }
-    hits as f64 / labels.len() as f64
+    if scored == 0 {
+        0.0
+    } else {
+        acc / scored as f64
+    }
+}
+
+/// How many queries [`set_recall_at_k`] actually scores (those with ≥1 in-corpus
+/// relevant id) — report this so a silently-shrunk query set is visible.
+pub fn scored_queries(relevant: &[Vec<i64>]) -> usize {
+    relevant.iter().filter(|r| !r.is_empty()).count()
 }
 
 /// Render a `Duration` compactly in the largest unit that keeps it readable.
@@ -127,10 +147,28 @@ mod tests {
     }
 
     #[test]
-    fn recall_counts_membership() {
+    fn set_recall_singleton_is_classic_recall() {
+        // one-element relevant sets behave like classic recall@k (the fuzzy eval's case)
         let results = vec![vec![1, 2, 3], vec![9, 8], vec![4]];
-        let labels = vec![2, 7, 4];
-        assert!((recall_at_k(&results, &labels) - 2.0 / 3.0).abs() < 1e-9);
+        let relevant = vec![vec![2], vec![7], vec![4]];
+        assert!((set_recall_at_k(&results, &relevant, 10) - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_recall_partial_multi_passage() {
+        // 1 of 2 relevant retrieved -> 0.5 for that query
+        let results = vec![vec![5, 1]];
+        let relevant = vec![vec![1, 2]];
+        assert!((set_recall_at_k(&results, &relevant, 10) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_recall_truncates_at_k_and_excludes_empty() {
+        // target at rank 3 is excluded at k=2; the empty-relevant query is not counted
+        let results = vec![vec![9, 8, 1], vec![1]];
+        let relevant = vec![vec![1], vec![]];
+        assert_eq!(set_recall_at_k(&results, &relevant, 2), 0.0);
+        assert_eq!(scored_queries(&relevant), 1);
     }
 
     #[test]

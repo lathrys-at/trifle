@@ -7,8 +7,15 @@
 //!   vs the in-process SQLite baselines (FTS5-trigram BM25, `LIKE` scan). Reports
 //!   p50/p90/p99/max and throughput, serial *and* concurrent (the read pool's
 //!   parallelism is a distinct axis). No labels needed.
-//! - **`quality`** — recall@k of trifle vs the FTS5-trigram (BM25) baseline on
-//!   typo-injected queries (§10.5), reported per edit-count.
+//! - **`relevance`** — recall@k on MS MARCO **real dev queries + qrels** (§10.4), vs a
+//!   word-level BM25 baseline (and the trigram-bm25 cousin). The paraphrase/relevance
+//!   truth: real queries share no guaranteed substring with their answer.
+//! - **`fuzzy`** — recall@k on **entity-name + injected-edit** queries over a GeoNames
+//!   corpus (§10.5), vs FTS5 trigram-MATCH and the LIKE floor (never bm25-phrase). The
+//!   faithful home for the typo eval; reports 1- vs 2-edit recall.
+//!
+//! Both recall evals tag each miss selection / floor / ranking (§4) to say whether a
+//! fix lives in the pruner/`m` or the ranker.
 //!
 //! Plus two utilities:
 //!
@@ -28,14 +35,16 @@ mod profile;
 mod query;
 mod rng;
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 use std::sync::Barrier;
 use std::time::{Duration, Instant};
 
-use baselines::{Engine, Fts5, Like, Trifle, Tuning};
-use corpus::Corpus;
-use metrics::{Dist, Latency, fmt_dur, recall_at_k, throughput};
+use baselines::{Engine, Fts5, Fts5Word, Like, MatchMode, Trifle, Tuning};
+use corpus::{Corpus, Entity};
+use metrics::{Dist, Latency, fmt_dur, scored_queries, set_recall_at_k, throughput};
+use trifle::tokenize::{Tokenizer, TrigramTokenizer};
 
 /// The default master seed (`0x5EED…`). Override with `--seed`.
 const DEFAULT_SEED: u64 = 0x5EED_5EED_5EED_5EED;
@@ -48,7 +57,8 @@ fn main() -> ExitCode {
     };
     let result = match command.as_str() {
         "latency" => cmd_latency(rest),
-        "quality" => cmd_quality(rest),
+        "relevance" => cmd_relevance(rest),
+        "fuzzy" => cmd_fuzzy(rest),
         "profile" => cmd_profile(rest),
         "fetch" => cmd_fetch(rest),
         "help" | "--help" | "-h" => {
@@ -74,49 +84,50 @@ USAGE:
 
 COMMANDS:
     latency    Footrace: search latency + throughput, trifle vs in-process baselines
-    quality    recall@k of trifle vs the FTS5-trigram (BM25) baseline, per edit-count
+    relevance  MS MARCO real dev queries+qrels: set-recall@k vs word BM25 (+trigram) (§10.4)
+    fuzzy      Entity name+edit recall vs FTS5 trigram-MATCH / LIKE, per edit-count (§10.5)
     profile    Σ(kept-posting cardinality) distribution — the §10.2 work-done curve
     fetch      Download + verify the pinned corpus assets into the cache (no bench)
     help       Show this message
 
-CORPUS OPTIONS (latency, quality, profile):
-    --corpus <synthetic|msmarco>  Corpus source                       [default: synthetic]
-    --docs <N>                    Documents to index (the index size) [default: 50000]
-    --seed <N>                    Master seed; drives BOTH corpus sampling and query
-                                  generation. Same seed -> identical run. Accepts
-                                  decimal or 0x-hex.                   [default: 0x5EED..]
+COMMON OPTIONS:
+    --docs <N>                    Index size. For `relevance`, the distractor target
+                                  (answers are always indexed)   [default: 50000, fuzzy 200000]
+    --queries <N>                 Queries (relevance: sampled real queries; fuzzy: target
+                                  entities)                      [default: latency 2000, relevance 1000, fuzzy 2000]
+    --k <N>                       Top-k cutoff                                    [default: 10]
+    --seed <N>                    Master seed (decimal or 0x-hex); fixes corpus + query
+                                  sampling for a byte-reproducible run        [default: 0x5EED..]
 
-SEARCH-TUNING OPTIONS (latency, quality, profile) — trifle only (§10.3):
-    --min-shared <M>              Match floor m (shared rare tokens)   [default: engine]
-    --breadth <B>                 Breadth budget B (recall/latency)    [default: engine]
+SEARCH-TUNING (trifle only, §10.3):
+    --min-shared <M>              Match floor m (shared rare tokens)           [default: engine]
+    --breadth <B>                 Breadth budget B (recall/latency)            [default: engine]
 
-ENGINE SELECTION (latency, quality):
-    --filter <engine>             Skip an engine; repeatable. Engines:
-                                  trifle, fts5-trigram-bm25, like-scan.
+ENGINE SELECTION (latency, relevance, fuzzy):
+    --filter <engine>             Skip an engine; repeatable. Engines: trifle,
+                                  fts5-trigram-bm25, fts5-word-bm25, like-scan.
                                   e.g. --filter like-scan (slow on huge corpora)
 
-LATENCY OPTIONS:
-    --queries <N>                 Queries to run                       [default: 2000]
-    --k <N>                       Top-k per query                      [default: 10]
-    --warmup <N>                  Untimed warmup queries               [default: 200]
-    --repeat <N>                  Measured passes (samples accumulate) [default: 1]
-    --batched                     Issue all queries in ONE search_batch call (shares
-                                  posting/frequency reads) instead of one search() each
-    --concurrent <T>              Run trifle across T reader threads (the read-pool
-                                  parallelism axis; baselines are serial-only) [default: 0]
+LATENCY:
+    --corpus <synthetic|msmarco>  Corpus source                              [default: synthetic]
+    --warmup <N>                  Untimed warmup queries                            [default: 200]
+    --repeat <N>                  Measured passes (samples accumulate)                [default: 1]
+    --batched                     One search_batch call (shares posting/frequency reads)
+    --concurrent <T>              Run trifle across T reader threads (read-pool axis)  [default: 0]
 
-QUALITY OPTIONS:
-    --queries <N>                 Labeled queries per edit-count       [default: 1000]
-    --k <N>                       Top-k recall cutoff                  [default: 10]
-    --edits <N>                   Typos per query. Omit to sweep {0,1,2} (§10.3).
+FUZZY:
+    --corpus <geonames-cities|geonames-all>   Entity corpus           [default: geonames-cities]
+    --edits <N>                   Typos per query. Omit to run {1, 2} separately (§10.3).
+
+PROFILE:
+    --corpus <synthetic|msmarco>  Corpus source                              [default: synthetic]
 
 EXAMPLES:
-    trifle-bench fetch --corpus synthetic
+    trifle-bench fetch --corpus geonames-cities
     trifle-bench latency --docs 100000 --queries 5000 --seed 42
-    trifle-bench latency --docs 100000 --batched
-    trifle-bench latency --docs 500000 --concurrent 8
     trifle-bench latency --docs 2000000 --filter like-scan
-    trifle-bench quality --corpus msmarco --docs 100000
+    trifle-bench relevance --docs 100000 --queries 2000
+    trifle-bench fuzzy --corpus geonames-cities --edits 1
     trifle-bench profile --docs 1000000
 ";
 
@@ -256,11 +267,13 @@ fn tuning(flags: &Flags) -> Result<Tuning, String> {
 const CORPUS_OPTS: &[&str] = &["corpus", "docs", "seed", "min-shared", "breadth"];
 
 /// The engine identifiers accepted by `--filter`. These must match the strings each
-/// engine returns from `baselines::Engine::name()`.
+/// engine returns from `baselines::Engine::name()`. Not every command runs every
+/// engine (latency/fuzzy use the trigram FTS5; relevance adds the word-level BM25).
 const ENGINE_TRIFLE: &str = "trifle";
 const ENGINE_FTS5: &str = "fts5-trigram-bm25";
+const ENGINE_FTS5_WORD: &str = "fts5-word-bm25";
 const ENGINE_LIKE: &str = "like-scan";
-const ALL_ENGINES: [&str; 3] = [ENGINE_TRIFLE, ENGINE_FTS5, ENGINE_LIKE];
+const ALL_ENGINES: [&str; 4] = [ENGINE_TRIFLE, ENGINE_FTS5, ENGINE_FTS5_WORD, ENGINE_LIKE];
 
 /// The set of engines to skip, collected from repeated `--filter <engine>` flags.
 /// Each value must name a known engine — a typo is an error, not a silent no-op (the
@@ -296,7 +309,11 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
     flags.reject_unknown(&allowed)?;
 
     let skip = skipped_engines(&flags)?;
-    if ALL_ENGINES.iter().all(|e| skip.contains(*e)) {
+    // latency runs the three footrace engines (the word-level BM25 is relevance-only).
+    if [ENGINE_TRIFLE, ENGINE_FTS5, ENGINE_LIKE]
+        .iter()
+        .all(|e| skip.contains(*e))
+    {
         return Err("all engines filtered out — nothing to run".into());
     }
 
@@ -332,11 +349,7 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
         mix[2],
         warmup.min(nq),
     );
-    if !skip.is_empty() {
-        let mut names: Vec<&str> = skip.iter().map(String::as_str).collect();
-        names.sort_unstable();
-        println!("# filter: skipping {}", names.join(", "));
-    }
+    print_filter(&skip);
 
     if concurrent > 1 {
         if skip.contains(ENGINE_TRIFLE) {
@@ -353,7 +366,8 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
         bench_engine(&trifle, &qtexts, k, warmup, repeat, batched);
     }
     if !skip.contains(ENGINE_FTS5) {
-        match Fts5::build(&corpus) {
+        // Phrase mode: the latency baseline is unchanged by the recall realignment.
+        match Fts5::build(&corpus, MatchMode::Phrase) {
             Some(fts5) => bench_engine(&fts5, &qtexts, k, warmup, repeat, batched),
             None => eprintln!("note: FTS5 trigram unavailable in the linked SQLite — skipping"),
         }
@@ -470,71 +484,352 @@ fn bench_concurrent(
     );
 }
 
-// ----- quality ----------------------------------------------------------------
+// ----- recall evals (shared) --------------------------------------------------
 
-fn cmd_quality(args: &[String]) -> Result<(), String> {
-    let flags = Flags::parse(args, &[])?;
-    let mut allowed = CORPUS_OPTS.to_vec();
-    allowed.extend(["queries", "k", "edits", "filter"]);
-    flags.reject_unknown(&allowed)?;
+/// View a token as `&str`. `Token: Borrow<str>`, but every type also `Borrow`s as
+/// itself, so a bare `t.borrow()` is ambiguous; the `-> &str` return pins the str view.
+fn token_str<T: Borrow<str>>(t: &T) -> &str {
+    t.borrow()
+}
 
-    let skip = skipped_engines(&flags)?;
-    if skip.contains(ENGINE_TRIFLE) && skip.contains(ENGINE_FTS5) {
-        return Err("both quality engines (trifle, fts5-trigram-bm25) filtered out".into());
+/// The distinct trigram set of `s` under trifle's tokenizer (NFC + lowercase).
+fn trigram_set(tok: &TrigramTokenizer, s: &str) -> HashSet<String> {
+    tok.tokenize(s).map(|t| token_str(&t).to_string()).collect()
+}
+
+/// Distinct-trigram overlap between two strings under trifle's tokenizer — the raw
+/// count trifle's overlap counter sees, before df-selection.
+fn shared_trigrams(tok: &TrigramTokenizer, a: &str, b: &str) -> usize {
+    trigram_set(tok, a)
+        .intersection(&trigram_set(tok, b))
+        .count()
+}
+
+/// `id -> text` over a corpus's docs, for resolving a label id to its (target) text.
+fn text_index(corpus: &Corpus) -> HashMap<i64, &str> {
+    corpus
+        .docs
+        .iter()
+        .map(|d| (d.id, d.text.as_str()))
+        .collect()
+}
+
+/// The effective match floor `m` for a run (trifle's default is 2, clamped ≥ 1).
+fn effective_m(tuning: Tuning) -> usize {
+    tuning.min_shared.unwrap_or(2).max(1) as usize
+}
+
+/// Where trifle's recall misses' fixes live (handoff §4), tagged cheaply from the
+/// shared-trigram count between each missed query and its target — no internals, no
+/// re-search.
+#[derive(Default)]
+struct MissTally {
+    /// No shared trigrams: overlap could never surface the target. The pruner/tokenizer
+    /// is the ceiling — the most concerning bucket.
+    selection: usize,
+    /// Shares trigrams, but fewer than the match floor `m` — points at `m`/`B` (the
+    /// strictness dials), not the ranker.
+    floor: usize,
+    /// Shares ≥ `m` trigrams (cleared the raw overlap floor) but ranked past k — a
+    /// ranking gap (better `Ranker` territory). On long multi-word queries trifle
+    /// selects only the rarest tokens, so a few here may instead be selection-pruned;
+    /// the *definitive* signals are the other two buckets.
+    ranking: usize,
+}
+
+impl MissTally {
+    fn record(&mut self, shared: usize, m: usize) {
+        if shared == 0 {
+            self.selection += 1;
+        } else if shared < m {
+            self.floor += 1;
+        } else {
+            self.ranking += 1;
+        }
     }
+    fn total(&self) -> usize {
+        self.selection + self.floor + self.ranking
+    }
+    fn line(&self) -> String {
+        format!(
+            "misses={} (selection/no-overlap {}, below-floor/m {}, ranking {})",
+            self.total(),
+            self.selection,
+            self.floor,
+            self.ranking
+        )
+    }
+}
 
-    let (corpus, seed) = build_corpus(&flags)?;
+/// Tag trifle's recall misses. `results`/`relevant` are trifle's, in query order;
+/// `text_of` resolves a relevant id to its target text; `m` is the match floor.
+fn tag_misses(
+    qtexts: &[&str],
+    relevant: &[Vec<i64>],
+    results: &[Vec<i64>],
+    k: usize,
+    text_of: &HashMap<i64, &str>,
+    m: usize,
+) -> MissTally {
+    let tok = TrigramTokenizer::new();
+    let mut tally = MissTally::default();
+    for ((got, rel), q) in results.iter().zip(relevant).zip(qtexts) {
+        if rel.is_empty() {
+            continue;
+        }
+        let topk: HashSet<i64> = got.iter().copied().take(k).collect();
+        if rel.iter().any(|r| topk.contains(r)) {
+            continue; // a hit, not a miss
+        }
+        let shared = rel
+            .iter()
+            .filter_map(|r| text_of.get(r))
+            .map(|t| shared_trigrams(&tok, q, t))
+            .max()
+            .unwrap_or(0);
+        tally.record(shared, m);
+    }
+    tally
+}
+
+/// Score one labeled engine column against the *shared* label set (the symmetry
+/// contract: identical `relevant`, identical `k` for every engine).
+fn recall_col<E: Engine>(engine: &E, qtexts: &[&str], relevant: &[Vec<i64>], k: usize) -> f64 {
+    set_recall_at_k(&engine.search_many(qtexts, k), relevant, k)
+}
+
+// ----- relevance --------------------------------------------------------------
+
+fn cmd_relevance(args: &[String]) -> Result<(), String> {
+    let flags = Flags::parse(args, &[])?;
+    flags.reject_unknown(&[
+        "docs",
+        "queries",
+        "k",
+        "seed",
+        "min-shared",
+        "breadth",
+        "filter",
+    ])?;
+    let skip = skipped_engines(&flags)?;
+
+    let docs = flags.usize("docs", 50_000)?;
+    if docs == 0 {
+        return Err("--docs must be >= 1".into());
+    }
     let n = flags.usize("queries", 1000)?;
     let k = flags.usize("k", 10)?;
+    let seed = flags.u64("seed", DEFAULT_SEED)?;
     let tuning = tuning(&flags)?;
-    // A single --edits pins one count; otherwise sweep {0,1,2} (§10.3: report 1- and
-    // 2-edit recall separately, with the exact-match floor as the 0-edit baseline).
+
+    let rel = corpus::msmarco_relevance(docs, n, seed).map_err(|e| format!("msmarco: {e}"))?;
+    let corpus = &rel.corpus;
+    if rel.queries.is_empty() {
+        return Err("no scored queries (no qrel-relevant passage made it into the corpus)".into());
+    }
+    let qtexts: Vec<&str> = rel.queries.iter().map(|q| q.text.as_str()).collect();
+    // The identical in-corpus label set scored for EVERY engine (the symmetry contract).
+    let relevant: Vec<Vec<i64>> = rel.queries.iter().map(|q| q.relevant.clone()).collect();
+
+    println!("# relevance (set-recall@{k}) — {}", corpus.provenance);
+    println!(
+        "# docs={} scored-queries={} (sparse qrels ~1 relevant/query: recall@k UNDERSTATES true recall)",
+        corpus.docs.len(),
+        scored_queries(&relevant)
+    );
+    println!(
+        "# real paraphrased queries (no guaranteed substring). baseline = word BM25 (canonical) + trigram-bm25 cousin."
+    );
+    print_filter(&skip);
+    println!("{:>20}  {:>10}", "engine", "recall");
+
+    // trifle (the subject) — also drives the miss breakdown.
+    if !skip.contains(ENGINE_TRIFLE) {
+        let trifle = Trifle::build(corpus, tuning);
+        let res = trifle.search_many(&qtexts, k);
+        println!(
+            "{:>20}  {:>10.3}",
+            ENGINE_TRIFLE,
+            set_recall_at_k(&res, &relevant, k)
+        );
+        let text_of = text_index(corpus);
+        let tally = tag_misses(&qtexts, &relevant, &res, k, &text_of, effective_m(tuning));
+        println!("# trifle {}", tally.line());
+    }
+    // Canonical word-level BM25.
+    if !skip.contains(ENGINE_FTS5_WORD) {
+        match Fts5Word::build(corpus) {
+            Some(e) => println!(
+                "{:>20}  {:>10.3}",
+                ENGINE_FTS5_WORD,
+                recall_col(&e, &qtexts, &relevant, k)
+            ),
+            None => eprintln!("note: FTS5 (word) unavailable in the linked SQLite"),
+        }
+    }
+    // Same-tokenization trigram BM25 (OR-bag).
+    if !skip.contains(ENGINE_FTS5) {
+        match Fts5::build(corpus, MatchMode::TrigramOr) {
+            Some(e) => println!(
+                "{:>20}  {:>10.3}",
+                ENGINE_FTS5,
+                recall_col(&e, &qtexts, &relevant, k)
+            ),
+            None => eprintln!("note: FTS5 (trigram) unavailable in the linked SQLite"),
+        }
+    }
+    Ok(())
+}
+
+// ----- fuzzy ------------------------------------------------------------------
+
+fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
+    let flags = Flags::parse(args, &[])?;
+    flags.reject_unknown(&[
+        "corpus",
+        "docs",
+        "queries",
+        "k",
+        "edits",
+        "seed",
+        "min-shared",
+        "breadth",
+        "filter",
+    ])?;
+    let skip = skipped_engines(&flags)?;
+    if skip.contains(ENGINE_TRIFLE) {
+        return Err("trifle is the subject of the fuzzy eval and cannot be filtered out".into());
+    }
+
+    let corpus_key = flags.str("corpus", corpus::CORPUS_GEONAMES_CITIES);
+    if corpus_key != corpus::CORPUS_GEONAMES_CITIES && corpus_key != corpus::CORPUS_GEONAMES_ALL {
+        return Err(format!(
+            "unknown --corpus {corpus_key} ({} | {})",
+            corpus::CORPUS_GEONAMES_CITIES,
+            corpus::CORPUS_GEONAMES_ALL
+        ));
+    }
+    let docs = flags.usize("docs", 200_000)?;
+    if docs == 0 {
+        return Err("--docs must be >= 1".into());
+    }
+    let n_targets = flags.usize("queries", 2000)?;
+    let k = flags.usize("k", 10)?;
+    let seed = flags.u64("seed", DEFAULT_SEED)?;
+    let tuning = tuning(&flags)?;
     let edit_counts: Vec<usize> = if flags.has("edits") {
         vec![flags.usize("edits", 1)?]
     } else {
-        vec![0, 1, 2]
+        vec![1, 2]
     };
 
-    let trifle = if skip.contains(ENGINE_TRIFLE) {
-        None
-    } else {
-        Some(Trifle::build(&corpus, tuning))
-    };
+    let ent = corpus::geonames(&corpus_key, docs, n_targets, seed)
+        .map_err(|e| format!("geonames: {e}"))?;
+    let corpus = &ent.corpus;
+    if ent.targets.is_empty() {
+        return Err("no entities loaded (corpus empty)".into());
+    }
+
+    let trifle = Trifle::build(corpus, tuning); // the subject — always built
     let fts5 = if skip.contains(ENGINE_FTS5) {
         None
     } else {
-        Fts5::build(&corpus)
+        Fts5::build(corpus, MatchMode::TrigramOr)
     };
     if fts5.is_none() && !skip.contains(ENGINE_FTS5) {
-        eprintln!("note: FTS5 trigram unavailable in the linked SQLite — BM25 column blank");
+        eprintln!("note: FTS5 (trigram) unavailable in the linked SQLite — column blank");
     }
+    let like = (!skip.contains(ENGINE_LIKE)).then(|| Like::build(corpus));
+    let text_of = text_index(corpus);
+    let m = effective_m(tuning);
 
-    println!("# quality (recall@{k}) — {}", corpus.provenance);
-    println!("# docs={} queries/edit={}", corpus.docs.len(), n);
+    println!("# fuzzy (recall@{k}) — {}", corpus.provenance);
     println!(
-        "{:>6}  {:>8}  {:>10}  {:>10}",
-        "edits", "queries", "trifle", "fts5-bm25"
+        "# baseline = FTS5 trigram-MATCH (OR-bag, bm25) + LIKE floor — NOT bm25-phrase (that scores ~0 on typos by construction)."
     );
+    println!(
+        "# CAVEAT: entity-name fuzzy is a FAVORABLE regime (short, structured, low-paraphrase). \
+         Strong recall here validates the fuzzy MACHINERY; it does NOT transfer to prose fuzzy — \
+         that is the `relevance` eval's job."
+    );
+    let density = near_distractor_density(&trifle, &ent.targets, k);
+    println!(
+        "# near-distractor density = {density:.3} (fraction of targets whose clean name surfaces \
+         another indexed entity; low => trivially-easy run, recall inflated)."
+    );
+    print_filter(&skip);
+    println!(
+        "{:>6}  {:>8}  {:>9}  {:>10}  {:>10}  {:>10}",
+        "edits", "queries", "survival", "trifle", "fts5-tri", "like"
+    );
+
+    let tok = TrigramTokenizer::new();
     for edits in edit_counts {
-        let qs = query::quality_queries(&corpus, n, edits, seed);
+        let qs = query::fuzzy_queries(&ent.targets, edits, seed);
         if qs.is_empty() {
-            println!("{edits:>6}  {:>8}  (no queries generated)", 0);
+            println!("{edits:>6}  (no queries generated)");
             continue;
         }
-        let labels: Vec<i64> = qs.iter().map(|q| q.source_doc).collect();
         let qtexts: Vec<&str> = qs.iter().map(|q| q.text.as_str()).collect();
-        let recall = |e: &dyn Engine| recall_at_k(&e.search_many(&qtexts, k), &labels);
-        let tr_s = trifle
+        // Singleton relevant sets — the same set-recall@k path as relevance.
+        let relevant: Vec<Vec<i64>> = qs.iter().map(|q| vec![q.target]).collect();
+        // Trigram survival: avg fraction of the clean name's trigrams the edits leave.
+        let mut surv = 0.0f64;
+        for q in &qs {
+            let clean = trigram_set(&tok, &q.clean);
+            if !clean.is_empty() {
+                surv += shared_trigrams(&tok, &q.text, &q.clean) as f64 / clean.len() as f64;
+            }
+        }
+        let survival = surv / qs.len() as f64;
+
+        let tr_res = trifle.search_many(&qtexts, k);
+        let tr = set_recall_at_k(&tr_res, &relevant, k);
+        let ft_s = fts5
             .as_ref()
-            .map(|e| format!("{:.3}", recall(e)))
+            .map(|e| format!("{:.3}", recall_col(e, &qtexts, &relevant, k)))
             .unwrap_or_else(|| "—".into());
-        let fr_s = fts5
+        let lk_s = like
             .as_ref()
-            .map(|e| format!("{:.3}", recall(e)))
+            .map(|e| format!("{:.3}", recall_col(e, &qtexts, &relevant, k)))
             .unwrap_or_else(|| "—".into());
-        println!("{edits:>6}  {:>8}  {tr_s:>10}  {fr_s:>10}", qtexts.len());
+        println!(
+            "{edits:>6}  {:>8}  {survival:>9.3}  {tr:>10.3}  {ft_s:>10}  {lk_s:>10}",
+            qtexts.len()
+        );
+        let tally = tag_misses(&qtexts, &relevant, &tr_res, k, &text_of, m);
+        println!("# trifle edits={edits}: {}", tally.line());
     }
     Ok(())
+}
+
+/// Fraction of targets whose *clean* name surfaces ≥1 other indexed entity in trifle —
+/// i.e. has a near-match distractor present (§10.5). A low value means the run is
+/// trivially easy (no confusables sampled) and the recall numbers are inflated.
+fn near_distractor_density(trifle: &Trifle, targets: &[Entity], k: usize) -> f64 {
+    if targets.is_empty() {
+        return 0.0;
+    }
+    let mut with = 0usize;
+    for t in targets {
+        if trifle
+            .search(&t.name, k.max(2))
+            .iter()
+            .any(|&id| id != t.id)
+        {
+            with += 1;
+        }
+    }
+    with as f64 / targets.len() as f64
+}
+
+/// Print the `# filter: skipping …` line when any engine is filtered out.
+fn print_filter(skip: &HashSet<String>) {
+    if !skip.is_empty() {
+        let mut s: Vec<&str> = skip.iter().map(String::as_str).collect();
+        s.sort_unstable();
+        println!("# filter: skipping {}", s.join(", "));
+    }
 }
 
 // ----- profile ----------------------------------------------------------------

@@ -1,19 +1,32 @@
-//! Query generation from the corpus itself.
+//! Query generation.
 //!
-//! Per the design: the realistic query is an **in-corpus document snippet**, with
-//! or without injected typos. That sidesteps the "where do realistic queries come
-//! from" problem entirely — the snippet's vocabulary and co-occurrence are exactly
-//! the corpus's. The perf harness doesn't need labels (it measures latency); the
-//! quality harness keeps the source document id as the free ground-truth label.
+//! - **Latency** ([`perf_queries`]): in-corpus document snippets ± typos. No labels —
+//!   the snippet's vocabulary/co-occurrence are exactly the corpus's, which sidesteps
+//!   "where do realistic queries come from" for a pure latency measurement.
+//! - **Fuzzy/typo recall** ([`fuzzy_queries`]): an **entity name + injected edits**,
+//!   labeled by the entity (§10.5). On an entity corpus this construction is *faithful*
+//!   ("the user types a corrupted target name, find the target"), unlike the same trick
+//!   on prose passages, where it degenerates into a known-item smoke test.
+//!
+//! (The MS MARCO **relevance** eval uses real dev queries + qrels — those aren't
+//! generated here; see [`corpus::msmarco_relevance`](crate::corpus::msmarco_relevance).)
 
-use crate::corpus::Corpus;
+use crate::corpus::{Corpus, Entity};
 use crate::rng::Rng;
 
-/// A generated query, with the document it was drawn from (its relevant answer).
+/// A generated latency query: the text and how many typos it carries (for the run's
+/// recorded typo mix). Latency needs no label.
 pub struct Query {
     pub text: String,
-    pub source_doc: i64,
     pub edits: usize,
+}
+
+/// A fuzzy-eval query: the corrupted text, the target entity id (the label), and the
+/// clean target name (kept for the trigram-survival / near-distractor diagnostics).
+pub struct FuzzyQuery {
+    pub text: String,
+    pub target: i64,
+    pub clean: String,
 }
 
 /// Take a contiguous run of `len` words starting at a random offset in `text`.
@@ -110,29 +123,32 @@ pub fn perf_queries(corpus: &Corpus, n: usize, seed: u64) -> Vec<Query> {
             };
             Some(Query {
                 text: corrupt(snip, edits, &mut rng),
-                source_doc: doc.id,
                 edits,
             })
         })
         .collect()
 }
 
-/// Generate `n` quality queries with exactly `edits` typos, labeled by source doc,
-/// for recall@k against a baseline.
-pub fn quality_queries(corpus: &Corpus, n: usize, edits: usize, seed: u64) -> Vec<Query> {
-    let mut rng = Rng::new(seed ^ 0x00C0_FFEE_u64);
-    (0..n)
-        .filter_map(|_| {
-            let doc = &corpus.docs[rng.below(corpus.docs.len())];
-            let len = rng.range(3, 6);
-            let snip = snippet(&doc.text, len, &mut rng);
-            if snip.chars().count() < 4 {
+/// Generate one fuzzy query per target entity: the entity name with exactly `edits`
+/// single-character typos (§10.5), labeled by the entity id. Deterministic per
+/// `(seed, edits)`, so 1-edit and 2-edit runs use distinct corruptions. Names too short
+/// to form a trigram query after corruption are skipped (a 1–2 char name can't).
+pub fn fuzzy_queries(targets: &[Entity], edits: usize, seed: u64) -> Vec<FuzzyQuery> {
+    let mut rng = Rng::new(seed ^ 0x00C0_FFEE_u64 ^ ((edits as u64) << 32));
+    targets
+        .iter()
+        .filter_map(|t| {
+            if t.name.chars().count() < 4 {
                 return None;
             }
-            Some(Query {
-                text: corrupt(snip, edits, &mut rng),
-                source_doc: doc.id,
-                edits,
+            let text = corrupt(t.name.clone(), edits, &mut rng);
+            if text.chars().count() < 3 {
+                return None;
+            }
+            Some(FuzzyQuery {
+                text,
+                target: t.id,
+                clean: t.name.clone(),
             })
         })
         .collect()

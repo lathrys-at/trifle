@@ -1,0 +1,8 @@
+{
+  "name": "GeoNames allCountries",
+  "license": "CC BY 4.0 (GeoNames)",
+  "repo": "https://download.geonames.org/export/dump/",
+  "url": "https://download.geonames.org/export/dump/allCountries.zip",
+  "sha256": "",
+  "note": "zip of allCountries.txt — the full GeoNames gazetteer (~12M rows, same columns as cities15000: col 1 = geonameid, col 2 = name, col 15 = population). ~400 MB zipped. The corpus-scale fuzzy run. Regenerates ~daily, so intentionally UNPINNED (see geonames-cities15000.json)."
+}

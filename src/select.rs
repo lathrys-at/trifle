@@ -9,8 +9,7 @@
 //! a batch aggregate or the corpus size — so `search_batch([…, q, …])` ranks `q`
 //! identically to `search(q)` (batch == serial).
 
-/// The behavior + performance knobs the pruner reads (assembled from
-/// [`SearchOpts`](crate::SearchOpts) and [`Advanced`](crate::Advanced)).
+/// The behavior + performance knobs the pruner reads (from [`SearchOpts`](crate::SearchOpts)).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SelectParams {
     /// `m` — the match floor (the strictness dial).
@@ -19,8 +18,8 @@ pub(crate) struct SelectParams {
     pub breadth: u64,
     /// `d` — per-typo token damage; the typo floor is `F = m + d`.
     pub typo_damage: u32,
-    /// `k_max` — the absolute ceiling on kept tokens.
-    pub k_max: usize,
+    /// `t_max` — the absolute ceiling on kept tokens.
+    pub t_max: usize,
     /// `α` — per-kept-list cost coefficient.
     pub alpha: f64,
     /// `β` — per-document-frequency cost coefficient.
@@ -40,7 +39,7 @@ impl SelectParams {
 ///
 /// Keeps the present (df > 0) tokens rarest-first up to the typo floor `F = m + d`,
 /// then admits more until the cumulative [`cost`](SelectParams::cost) reaches the
-/// breadth budget `B`, never exceeding `k_max`. Every absent (df = 0) token is then
+/// breadth budget `B`, never exceeding `t_max`. Every absent (df = 0) token is then
 /// appended uncharged — with a live frequency column a df-0 token has a provably
 /// empty posting, so it costs nothing to scan and never reaches the overlap floor
 /// (which the ranker derives from the postings actually present).
@@ -58,7 +57,7 @@ pub(crate) fn select<Tk: Clone + Ord>(tokens: &[(Tk, i64)], params: SelectParams
     // near `u32::MAX` cannot overflow the add.
     let f = params.min_shared as usize + params.typo_damage as usize;
     let floor = f.max(params.min_shared as usize).min(present.len());
-    let ceiling = params.k_max.max(floor);
+    let ceiling = params.t_max.max(floor);
 
     let mut kept: Vec<Tk> = Vec::with_capacity(ceiling);
     let mut sum_df: i64 = 0;
@@ -94,7 +93,7 @@ mod tests {
             min_shared,
             breadth,
             typo_damage: 4,
-            k_max: 12,
+            t_max: 12,
             alpha: 0.0,
             beta: 1.0,
         }
@@ -157,12 +156,12 @@ mod tests {
     }
 
     #[test]
-    fn k_max_caps_breadth_under_a_large_budget() {
+    fn t_max_caps_breadth_under_a_large_budget() {
         let t: Vec<(String, i64)> = (0..20).map(|i| (format!("{i:02}"), i + 1)).collect();
         let kept = select(
             &t,
             SelectParams {
-                k_max: 12,
+                t_max: 12,
                 ..params(2, u64::MAX)
             },
         );
@@ -170,8 +169,8 @@ mod tests {
     }
 
     #[test]
-    fn k_max_never_undercuts_the_typo_floor() {
-        // A misconfigured k_max below F must not drop below the floor.
+    fn t_max_never_undercuts_the_typo_floor() {
+        // A misconfigured t_max below F must not drop below the floor.
         let t = toks(&[
             ("a", 1),
             ("b", 2),
@@ -184,11 +183,11 @@ mod tests {
         let kept = select(
             &t,
             SelectParams {
-                k_max: 3,
+                t_max: 3,
                 ..params(2, 0)
             },
         );
-        assert_eq!(kept.len(), 6, "floor F=6 wins over k_max=3");
+        assert_eq!(kept.len(), 6, "floor F=6 wins over t_max=3");
     }
 
     #[test]

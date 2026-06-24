@@ -85,33 +85,13 @@ const DEFAULT_MIN_SHARED: u32 = 2;
 const DEFAULT_BREADTH: u64 = 0;
 /// Per-typo token damage `d`; the typo floor is `F = m + d`.
 const TYPO_DAMAGE: u32 = 4;
-/// Default absolute ceiling `k_max` on selected tokens.
-const DEFAULT_K_MAX: usize = 12;
+/// Default absolute ceiling `t_max` on selected tokens.
+const DEFAULT_T_MAX: usize = 12;
+/// Default selection-cost coefficients — a pure `Σdf` cost (`α = 0`, `β = 1`).
+const DEFAULT_ALPHA: f64 = 0.0;
+const DEFAULT_BETA: f64 = 1.0;
 /// How many times a read retries a transient `SQLITE_BUSY`/`LOCKED`/`SCHEMA`.
 const RETRY_MAX: usize = 5;
-
-/// Advanced, rarely-touched tuning. The defaults are a pure `Σdf` selection cost
-/// and a fixed safety ceiling; reach for these only when calibrating against a
-/// benchmark.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Advanced {
-    /// `α` — per-kept-token selection cost coefficient.
-    pub alpha: f64,
-    /// `β` — per-document-frequency selection cost coefficient.
-    pub beta: f64,
-    /// `k_max` — the absolute ceiling on selected tokens.
-    pub k_max: usize,
-}
-
-impl Default for Advanced {
-    fn default() -> Self {
-        Advanced {
-            alpha: 0.0,
-            beta: 1.0,
-            k_max: DEFAULT_K_MAX,
-        }
-    }
-}
 
 /// Index configuration.
 ///
@@ -123,8 +103,6 @@ pub struct Config {
     /// The caller's drift/epoch token. Bumping it on reopen invalidates the cache
     /// (drops it to empty), so the next [`rebuild`](Index::rebuild) repopulates.
     pub data_version: u64,
-    /// Advanced selection tuning (rarely touched).
-    pub advanced: Advanced,
     /// A [`TextResolver`] to run **contentless** (store no text snapshot, fetch text
     /// from the caller's source). `None` (default) stores a self-contained snapshot.
     /// See the [crate] docs and [`TextResolver`] for the contract.
@@ -138,12 +116,6 @@ impl Config {
             data_version,
             ..Config::default()
         }
-    }
-
-    /// Set the advanced tuning.
-    pub fn with_advanced(mut self, advanced: Advanced) -> Self {
-        self.advanced = advanced;
-        self
     }
 
     /// Run contentless against the given resolver instead of storing a text snapshot.
@@ -301,6 +273,14 @@ pub struct SearchOpts<'a> {
     pub min_shared: Option<u32>,
     /// `B` — the breadth budget in selection cost units. `None` → `0`.
     pub breadth: Option<u64>,
+    /// `t_max` — absolute ceiling on selected tokens. `None` → `12`. Advanced: with the
+    /// default `breadth = 0`, selection stops at the typo floor and never reaches it.
+    pub t_max: Option<usize>,
+    /// `α` — per-kept-token selection-cost coefficient. `None` → `0` (a pure `Σdf` cost).
+    /// Advanced; pairs with [`beta`](SearchOpts::beta) under the [`breadth`](SearchOpts::breadth) budget.
+    pub alpha: Option<f64>,
+    /// `β` — per-document-frequency selection-cost coefficient. `None` → `1`.
+    pub beta: Option<f64>,
     /// A per-query [`Ranker`]. `None` → the built-in [`OverlapRanker`] (when reranking is
     /// off) or [`Bm25Ranker`] (the [`Effort`] precision tier).
     pub ranker: Option<&'a dyn Ranker>,
@@ -324,6 +304,9 @@ impl<'a> SearchOpts<'a> {
             limit,
             min_shared: None,
             breadth: None,
+            t_max: None,
+            alpha: None,
+            beta: None,
             ranker: None,
             scope: None,
             effort: Effort::default(),
@@ -339,6 +322,19 @@ impl<'a> SearchOpts<'a> {
     /// Set the breadth budget `B`.
     pub fn breadth(mut self, b: u64) -> Self {
         self.breadth = Some(b);
+        self
+    }
+
+    /// Set the absolute ceiling `t_max` on selected tokens.
+    pub fn t_max(mut self, t_max: usize) -> Self {
+        self.t_max = Some(t_max);
+        self
+    }
+
+    /// Set the selection-cost coefficients `α` (per kept token) and `β` (per df).
+    pub fn cost(mut self, alpha: f64, beta: f64) -> Self {
+        self.alpha = Some(alpha);
+        self.beta = Some(beta);
         self
     }
 
@@ -422,7 +418,6 @@ enum Content {
 pub struct Index<T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
     backend: B,
     tokenizer: T,
-    advanced: Advanced,
     data_version: u64,
     content: Content,
 }
@@ -461,7 +456,6 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let index = Index {
             backend,
             tokenizer,
-            advanced: config.advanced,
             data_version: config.data_version,
             content,
         };
@@ -888,9 +882,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             min_shared,
             breadth,
             typo_damage: TYPO_DAMAGE,
-            k_max: self.advanced.k_max,
-            alpha: self.advanced.alpha,
-            beta: self.advanced.beta,
+            t_max: opts.t_max.unwrap_or(DEFAULT_T_MAX),
+            alpha: opts.alpha.unwrap_or(DEFAULT_ALPHA),
+            beta: opts.beta.unwrap_or(DEFAULT_BETA),
         };
         // The reranker: an explicit `opts.ranker` wins; otherwise the precision tier
         // ([`Bm25Ranker`]) when reranking is active, else plain overlap order.

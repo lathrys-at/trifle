@@ -162,10 +162,12 @@ fn check(idx: &Idx, oracle: &Oracle) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(160))]
+    // Sized to thrash hard while staying under a ~30s wall-clock budget on a debug
+    // `cargo test` (the lane CI runs); the one deliberately heavy test.
+    #![proptest_config(ProptestConfig::with_cases(400))]
 
     #[test]
-    fn thrashing_preserves_every_invariant(ops in prop::collection::vec(op_strategy(), 4..40)) {
+    fn thrashing_preserves_every_invariant(ops in prop::collection::vec(op_strategy(), 6..48)) {
         let h = Harness::new();
         let mut oracle = Oracle::new();
         for op in ops {

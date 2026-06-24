@@ -52,7 +52,7 @@ A segment is `(doc_id, source, ref, text)`:
 - `text` — stored raw; the tokenizer normalizes for matching.
 
 A document may have many segments. `insert` replaces all segments under a `(doc_id,
-source)` pair; `remove` removes all segments of a `doc_id`.
+source)` pair; `remove_source` deletes that pair; `remove` deletes a whole `doc_id`.
 
 ## Features
 

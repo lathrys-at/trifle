@@ -586,6 +586,26 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
+    /// Remove every segment of `doc_id` under one `source`, leaving the doc's other
+    /// sources intact, in one transaction. A `(doc_id, source)` pair with no segments
+    /// is a no-op. This is the delete counterpart to [`insert`](Self::insert) (which
+    /// replaces a `(doc_id, source)` group); [`remove`](Self::remove) drops every source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store write fails.
+    pub fn remove_source(&self, doc_id: i64, source: &str) -> Result<()> {
+        let mut guard = self.backend.write()?;
+        let ns = self.backend.namespace();
+        let tx = guard.transaction()?;
+        let mut changes = TokenChanges::default();
+        // Replacing the group with no segments deletes it.
+        self.replace_group(&tx, ns, doc_id, source, &[], &mut changes)?;
+        changes.apply(&tx, ns)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Delete-then-insert one `(doc_id, source)` group, accumulating its token
     /// changes into `changes` (applied once per write batch).
     fn replace_group(

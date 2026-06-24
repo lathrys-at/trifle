@@ -237,6 +237,33 @@ fn insert_batch_replaces_only_the_groups_present() {
 }
 
 #[test]
+fn remove_source_wipes_one_category_and_leaves_the_others() {
+    let h = Harness::new();
+    // Doc 1 has two categories; doc 2 shares the "ocr" source as a distractor.
+    h.put(1, "ocr", "scan", "alpha ocr distinctive");
+    h.put(1, "caption", "alt", "beta caption distinctive");
+    h.put(2, "ocr", "scan", "gamma other document");
+
+    h.index.remove_source(1, "ocr").unwrap();
+
+    assert!(!finds(&h, "alpha ocr", 1), "doc 1 ocr category wiped");
+    assert!(
+        finds(&h, "beta caption", 1),
+        "doc 1 caption category survives"
+    );
+    assert!(
+        finds(&h, "gamma other", 2),
+        "another doc's same source untouched"
+    );
+    assert_eq!(h.index.stats().unwrap().segments, 2);
+
+    // Removing a (doc, source) pair with no segments is a no-op.
+    h.index.remove_source(1, "ocr").unwrap();
+    h.index.remove_source(99, "nope").unwrap();
+    assert_eq!(h.index.stats().unwrap().segments, 2);
+}
+
+#[test]
 fn rebuild_indexes_duplicate_doc_ids_verbatim() {
     let h = Harness::new();
     h.index

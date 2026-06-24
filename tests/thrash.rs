@@ -49,6 +49,10 @@ enum Op {
     Remove {
         doc: i64,
     },
+    RemoveSource {
+        doc: i64,
+        source: String,
+    },
     Compact,
     Rebuild {
         corpus: Vec<(i64, String, String, String)>,
@@ -65,13 +69,15 @@ fn refid() -> impl Strategy<Value = String> {
     prop::sample::select(REFS).prop_map(String::from)
 }
 fn segs() -> impl Strategy<Value = Vec<(String, String)>> {
-    prop::collection::vec((refid(), text()), 1..4)
+    // 0 is allowed: an empty group means `insert(doc, source, &[])`, which wipes the pair.
+    prop::collection::vec((refid(), text()), 0..4)
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         6 => (1i64..=6, source(), segs()).prop_map(|(doc, source, segs)| Op::Insert { doc, source, segs }),
         2 => (1i64..=6).prop_map(|doc| Op::Remove { doc }),
+        2 => (1i64..=6, source()).prop_map(|(doc, source)| Op::RemoveSource { doc, source }),
         2 => Just(Op::Compact),
         1 => prop::collection::vec((1i64..=6, source(), refid(), text()), 0..6)
                 .prop_map(|corpus| Op::Rebuild { corpus }),
@@ -85,12 +91,20 @@ fn apply(idx: &Idx, oracle: &mut Oracle, op: Op) {
             let pairs: Vec<(&str, &str)> =
                 segs.iter().map(|(r, t)| (r.as_str(), t.as_str())).collect();
             idx.insert(doc, &source, &pairs).unwrap();
-            // Upsert replaces the whole (doc, source) group.
-            oracle.insert((doc, source), segs);
+            // Upsert replaces the whole (doc, source) group; an empty group wipes it.
+            if segs.is_empty() {
+                oracle.remove(&(doc, source));
+            } else {
+                oracle.insert((doc, source), segs);
+            }
         }
         Op::Remove { doc } => {
             idx.remove(doc).unwrap();
             oracle.retain(|(d, _), _| *d != doc);
+        }
+        Op::RemoveSource { doc, source } => {
+            idx.remove_source(doc, &source).unwrap();
+            oracle.remove(&(doc, source));
         }
         Op::Compact => {
             idx.compact().unwrap();

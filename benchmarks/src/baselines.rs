@@ -23,8 +23,8 @@ use crate::corpus::Corpus;
 
 /// A search engine under test: build once from a corpus, then answer queries.
 ///
-/// `search` answers one query; `search_many` answers a set. The default
-/// `search_many` loops `search`, so a per-query-stateless engine gets batching
+/// `search` answers one query; `search_batch` answers a set. The default
+/// `search_batch` loops `search`, so a per-query-stateless engine gets batching
 /// for free; trifle overrides it to share posting/frequency reads across the set
 /// (its `search_batch`), which is the whole point of the `--batched` axis.
 pub trait Engine {
@@ -32,7 +32,7 @@ pub trait Engine {
     /// Return the matched document ids, best-first, capped at `k`.
     fn search(&self, query: &str, k: usize) -> Vec<i64>;
     /// Answer a batch of queries, one id list per query in order.
-    fn search_many(&self, queries: &[&str], k: usize) -> Vec<Vec<i64>> {
+    fn search_batch(&self, queries: &[&str], k: usize) -> Vec<Vec<i64>> {
         queries.iter().map(|q| self.search(q, k)).collect()
     }
 }
@@ -121,7 +121,7 @@ impl Engine for Trifle {
             .map(|m| m.doc_id)
             .collect()
     }
-    fn search_many(&self, queries: &[&str], k: usize) -> Vec<Vec<i64>> {
+    fn search_batch(&self, queries: &[&str], k: usize) -> Vec<Vec<i64>> {
         self.index
             .search_batch(queries, self.opts(k))
             .unwrap()

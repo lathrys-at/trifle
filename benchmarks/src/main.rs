@@ -415,13 +415,13 @@ fn bench_engine(
 ) {
     let w = warmup.min(queries.len());
     if w > 0 {
-        let _ = engine.search_many(&queries[..w], k);
+        let _ = engine.search_batch(&queries[..w], k);
     }
     if batched {
         let mut best = Duration::MAX;
         for _ in 0..repeat {
             let t = Instant::now();
-            let _ = engine.search_many(queries, k);
+            let _ = engine.search_batch(queries, k);
             best = best.min(t.elapsed());
         }
         println!(
@@ -617,7 +617,7 @@ fn tag_misses(
 /// Score one labeled engine column against the *shared* label set (the symmetry
 /// contract: identical `relevant`, identical `k` for every engine).
 fn recall_col<E: Engine>(engine: &E, qtexts: &[&str], relevant: &[Vec<i64>], k: usize) -> f64 {
-    set_recall_at_k(&engine.search_many(qtexts, k), relevant, k)
+    set_recall_at_k(&engine.search_batch(qtexts, k), relevant, k)
 }
 
 // ----- relevance --------------------------------------------------------------
@@ -669,7 +669,7 @@ fn cmd_relevance(args: &[String]) -> Result<(), String> {
     // trifle (the subject) — also drives the miss breakdown.
     if !skip.contains(ENGINE_TRIFLE) {
         let trifle = Trifle::build(corpus, tuning);
-        let res = trifle.search_many(&qtexts, k);
+        let res = trifle.search_batch(&qtexts, k);
         println!(
             "{:>20}  {:>10.3}",
             ENGINE_TRIFLE,
@@ -807,7 +807,7 @@ fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
         }
         let survival = surv / qs.len() as f64;
 
-        let tr_res = trifle.search_many(&qtexts, k);
+        let tr_res = trifle.search_batch(&qtexts, k);
         let tr = set_recall_at_k(&tr_res, &relevant, k);
         let ft_s = fts5
             .as_ref()

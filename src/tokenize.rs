@@ -367,47 +367,59 @@ impl<const N: usize, const CAP: usize> Tokenizer for NgramTokenizer<N, CAP> {
     }
 
     fn span(&self, text: &str, tokens: &[&str]) -> Option<(usize, usize)> {
-        // Build the normalized + case-folded char stream WITH the raw byte offset
-        // each emitted char came from, then window it like `tokenize` does and map a
-        // matched window back to raw bytes.
+        // Re-derive the normalized + case-folded token stream and map a matched window
+        // back to raw bytes, **streaming** — O(N) stack state, zero heap allocation.
         //
         // Normalization runs per *combining-sequence cluster* (a starter plus its
         // trailing combining marks), not per char: NFC composition and NFD canonical
         // reordering both act within a combining sequence, so a per-cluster pass
         // produces exactly the same tokens as `prepare`'s whole-string pass — fixing
-        // the spans that a per-char pass would lose on decomposed or non-canonically
+        // the spans a per-char pass would lose on decomposed or non-canonically
         // ordered input. Every char a cluster emits is mapped to the cluster's whole
         // raw byte range, so the returned offsets are always raw char boundaries.
-        let chars: Vec<(usize, char)> = text.char_indices().collect();
-        let mut norm: Vec<char> = Vec::with_capacity(chars.len());
-        let mut start: Vec<usize> = Vec::with_capacity(chars.len());
-        let mut end: Vec<usize> = Vec::with_capacity(chars.len());
-        let mut i = 0;
-        while i < chars.len() {
-            let cluster_start = chars[i].0;
-            let mut j = i + 1;
-            while j < chars.len() && is_combining_mark(chars[j].1) {
-                j += 1;
-            }
-            let cluster_end = chars.get(j).map_or(text.len(), |(off, _)| *off);
-            self.normalize_cluster(&text[cluster_start..cluster_end], |nc| {
-                norm.push(nc);
-                start.push(cluster_start);
-                end.push(cluster_end);
-            });
-            i = j;
-        }
-        if norm.len() < N {
-            return None;
-        }
+        //
+        // The window holds the last N emitted chars and their raw ranges; a long
+        // document never materializes an O(text) buffer (span runs for the ≤ limit
+        // survivors, but a survivor can itself be large).
         let mut first: Option<usize> = None;
         let mut last = 0usize;
-        for w in 0..=norm.len() - N {
-            if let Some(g) = Ngram::<CAP>::from_chars(&norm[w..w + N]) {
-                if tokens.contains(&g.as_str()) {
-                    first.get_or_insert(start[w]);
-                    last = end[w + N - 1];
+        {
+            let mut win_ch = ['\0'; N];
+            let mut win_start = [0usize; N];
+            let mut win_end = [0usize; N];
+            let mut filled = 0usize;
+            let mut consider = |ch: char, cluster_start: usize, cluster_end: usize| {
+                if N > 1 {
+                    win_ch.copy_within(1..N, 0);
+                    win_start.copy_within(1..N, 0);
+                    win_end.copy_within(1..N, 0);
                 }
+                win_ch[N - 1] = ch;
+                win_start[N - 1] = cluster_start;
+                win_end[N - 1] = cluster_end;
+                filled += 1;
+                if filled >= N {
+                    if let Some(g) = Ngram::<CAP>::from_chars(&win_ch) {
+                        if tokens.contains(&g.as_str()) {
+                            first.get_or_insert(win_start[0]);
+                            last = win_end[N - 1];
+                        }
+                    }
+                }
+            };
+
+            // Walk the raw text in clusters without materializing it: a peekable
+            // `char_indices` finds each cluster's `[start, end)` byte range, and the
+            // cluster substring is normalized straight into the window.
+            let mut it = text.char_indices().peekable();
+            while let Some((cluster_start, _)) = it.next() {
+                while it.peek().is_some_and(|&(_, c)| is_combining_mark(c)) {
+                    it.next();
+                }
+                let cluster_end = it.peek().map_or(text.len(), |&(off, _)| off);
+                self.normalize_cluster(&text[cluster_start..cluster_end], &mut |ch| {
+                    consider(ch, cluster_start, cluster_end)
+                });
             }
         }
         first.map(|f| (f, last))
@@ -416,35 +428,38 @@ impl<const N: usize, const CAP: usize> Tokenizer for NgramTokenizer<N, CAP> {
 
 impl<const N: usize, const CAP: usize> NgramTokenizer<N, CAP> {
     /// Apply this tokenizer's normalization + casefolding to one combining-sequence
-    /// cluster, emitting the resulting char(s). Mirrors [`prepare`](Self::prepare)
-    /// exactly (same normalization form, same casefold, same `assume_normalized`
-    /// skip) but on a cluster substring, so [`span`](Self::span) re-derives the same
-    /// token stream while tracking raw offsets.
-    fn normalize_cluster(&self, cluster: &str, mut push: impl FnMut(char)) {
-        let normalized: Vec<char> = if self.assume_normalized {
-            match self.normalization {
-                Normalization::NfdStripMarks => {
-                    cluster.chars().filter(|c| !is_combining_mark(*c)).collect()
-                }
-                _ => cluster.chars().collect(),
-            }
-        } else {
-            match self.normalization {
-                Normalization::Nfc => cluster.nfc().collect(),
-                Normalization::Nfd => cluster.nfd().collect(),
-                Normalization::NfdStripMarks => {
-                    cluster.nfd().filter(|c| !is_combining_mark(*c)).collect()
-                }
-                Normalization::None => cluster.chars().collect(),
-            }
-        };
-        for c in normalized {
-            if self.casefold {
+    /// cluster, emitting the resulting char(s) one at a time (no intermediate
+    /// buffer). Mirrors [`prepare`](Self::prepare) exactly (same normalization form,
+    /// same casefold, same `assume_normalized` skip) but on a cluster substring, so
+    /// [`span`](Self::span) re-derives the same token stream while tracking offsets.
+    fn normalize_cluster(&self, cluster: &str, push: &mut dyn FnMut(char)) {
+        let casefold = self.casefold;
+        let mut emit = |c: char| {
+            if casefold {
                 for lc in c.to_lowercase() {
                     push(lc);
                 }
             } else {
                 push(c);
+            }
+        };
+        if self.assume_normalized {
+            match self.normalization {
+                Normalization::NfdStripMarks => cluster
+                    .chars()
+                    .filter(|c| !is_combining_mark(*c))
+                    .for_each(&mut emit),
+                _ => cluster.chars().for_each(&mut emit),
+            }
+        } else {
+            match self.normalization {
+                Normalization::Nfc => cluster.nfc().for_each(&mut emit),
+                Normalization::Nfd => cluster.nfd().for_each(&mut emit),
+                Normalization::NfdStripMarks => cluster
+                    .nfd()
+                    .filter(|c| !is_combining_mark(*c))
+                    .for_each(&mut emit),
+                Normalization::None => cluster.chars().for_each(&mut emit),
             }
         }
     }

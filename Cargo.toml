@@ -2,9 +2,48 @@
 name = "trifle"
 version = "0.0.1"
 edition = "2024"
-description = "A small, embedded, typo-tolerant fuzzy search engine backed by SQLite."
-license = "MIT"
+rust-version = "1.85"
+description = "Embedded, typo-tolerant trigram fuzzy search backed by SQLite, for large corpora of small documents."
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/lathrys-at/trifle"
 readme = "README.md"
+keywords = ["search", "fuzzy", "trigram", "sqlite", "ngram"]
+categories = ["text-processing", "database-implementations"]
+
+[features]
+default = []
+# Emit `tracing` spans/events on the hot paths (selection, posting reads, overlap
+# counting, hydration). Off by default so the core imposes no runtime dependency
+# (§7.6); a host already running `tracing` flips it on for instrumentation.
+tracing = ["dep:tracing"]
 
 [dependencies]
+# Bundled (statically linked) SQLite for deterministic availability + a single
+# linked sqlite; `array` registers the in-memory carray/rarray vtab used to bind a
+# whole id list to one prepared `WHERE id IN rarray(?1)` statement (batched
+# provenance hydration), avoiding a temp btree on the page-cache mutex.
+rusqlite = { version = "0.37", features = ["bundled", "array"] }
+# The owned inverted index: one base+delta roaring posting per token.
+roaring = "0.11"
+# NFC/NFD normalization so canonically-equivalent forms match (configurable per
+# tokenizer; the default folds to NFC + lowercase).
+unicode-normalization = "0.1"
+thiserror = "2"
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "search"
+harness = false
+
+[profile.bench]
+debug = true  # keep symbols so the scaling sweep can be profiled
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

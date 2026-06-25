@@ -1,0 +1,137 @@
+name: Release
+
+# Tag-triggered release. Pushing a `v*` tag runs the full gate on every supported
+# platform (per-PR CI is ubuntu-only; a release is the moment to pay for the rest), cuts
+# a GitHub Release with the packaged `.crate` + its SHA256 attached, and — on a FINAL tag
+# only — publishes to crates.io.
+#
+# Pre-release tags (vX.Y.Z-rc.N, -alpha, …) are marked as GitHub pre-releases and skip the
+# crates.io publish; only final tags publish.
+#
+# crates.io publishing uses Trusted Publishing (OIDC, no stored token) — the crates.io
+# analogue of PyPI's. TWO MANUAL STEPS, once, that cannot be done from here:
+#   1. The first publish of a brand-new crate name cannot use Trusted Publishing (there is
+#      no crate yet to attach a publisher to). Publish 0.1.0 by hand once; this workflow
+#      handles every release after.
+#   2. On crates.io → trifle → Settings → Trusted Publishing, add a GitHub publisher for
+#      repo lathrys-at/trifle, workflow `release.yaml`, environment `crates-io`.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # The full CI gate, on every supported platform. PRs run ubuntu-only; a release must be
+  # green everywhere before we publish. Lints/docs/version-check run once (Linux); the
+  # test suite runs on each platform.
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag matches Cargo.toml version
+        if: runner.os == 'Linux'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="trifle").version')"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $ver"
+            exit 1
+          fi
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+      - name: Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --verbose
+      - name: Doc
+        if: runner.os == 'Linux'
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  # Create the GitHub Release (all tags) with the packaged crate + checksum attached.
+  # Notes come from the matching CHANGELOG.md section for a final release, else they are
+  # auto-generated from commits.
+  release:
+    name: GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package the crate
+        run: cargo package --locked
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+
+          # A SemVer pre-release identifier (the hyphen in v0.1.0-rc.1) marks this as a
+          # GitHub pre-release.
+          prerelease=""
+          [[ "$version" == *-* ]] && prerelease="--prerelease"
+
+          # Curated notes: the "## [VERSION]" section of CHANGELOG.md up to the next "## "
+          # heading, if the file and section exist; otherwise auto-generate from commits.
+          notes="--generate-notes"
+          if [[ -z "$prerelease" && -f CHANGELOG.md ]]; then
+            awk -v hdr="## [$version]" '
+              index($0, hdr) == 1 { capture = 1; next }
+              capture && /^## / { exit }
+              capture { print }
+            ' CHANGELOG.md > notes.md
+            sed -i -e '/./,$!d' notes.md
+            [[ -s notes.md ]] && notes="--notes-file notes.md"
+          fi
+
+          crate="target/package/trifle-${version}.crate"
+          sha256sum "$crate" > "$crate.sha256"
+          gh release create "$tag" "$crate" "$crate.sha256" --title "$tag" $prerelease $notes
+
+  # Publish to crates.io on a final tag, via Trusted Publishing (OIDC) — no stored token.
+  # Skipped for pre-release (rc/alpha) tags, which carry a SemVer hyphen.
+  publish:
+    name: Publish to crates.io
+    needs: verify
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write # mint the OIDC token crates.io Trusted Publishing verifies
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

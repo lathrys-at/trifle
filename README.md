@@ -1,7 +1,7 @@
 # trifle
 
 [![CI](https://github.com/lathrys-at/trifle/actions/workflows/test.yaml/badge.svg)](https://github.com/lathrys-at/trifle/actions/workflows/test.yaml)
-[![Coverage](https://codecov.io/gh/lathrys-at/trifle/branch/main/graph/badge.svg)](https://codecov.io/gh/lathrys-at/trifle)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/lathrys-at/trifle/badges/coverage.json)](https://github.com/lathrys-at/trifle/actions/workflows/coverage.yaml)
 [![crates.io](https://img.shields.io/crates/v/trifle.svg)](https://crates.io/crates/trifle)
 [![docs.rs](https://img.shields.io/docsrs/trifle)](https://docs.rs/trifle)
 [![MSRV](https://img.shields.io/crates/msrv/trifle)](https://crates.io/crates/trifle)

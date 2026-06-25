@@ -91,6 +91,30 @@ for n in 10000 50000 100000 500000 1000000; do
 done
 ```
 
+### Latency JSON, plots & profiling
+
+The `latency` command also reports **in-corpus recall@k** for the sampled queries (each
+query is a snippet of a real document; that document is the relevant answer), and can:
+
+- **measure several efforts from one index build** — `--effort-sweep low,medium,high`;
+- **emit machine-readable JSON** — `--format json` writes one object carrying, per
+  (engine, effort), the p50/p90/p99/max latency, throughput, recall@k, **and the raw
+  per-query samples** (so a post-processor can recompute anything without re-running);
+- **profile a run** — `--instrument xctrace` (Instruments' Time Profiler, macOS) or
+  `--instrument samply` (cross-platform) re-execs the run under a sampling profiler and
+  writes a trace artifact. A hook for *where* the time goes, separate from the JSON's
+  *how much*.
+
+`tools/latency_plot.py` drives all of this: it sweeps the corpus-size ladder, persists the
+raw JSON, and renders the grouped p50/p90/p99 chart (recall@k + `*`max annotated) plus the
+throughput-vs-`N` plot. See [`tools/README.md`](tools/README.md).
+
+```bash
+cargo run -p trifle-benchmarks --release -- fetch --corpus msmarco   # ~1 GiB, once
+python3 benchmarks/tools/latency_plot.py --queries 100 --seed 42     # sweep + plots
+python3 benchmarks/tools/latency_plot.py --reuse-raw                 # re-plot, no re-run
+```
+
 ## Caveats
 
 These are not your users' queries. Prefer relative signal (trifle vs BM25; typo vs no-typo;

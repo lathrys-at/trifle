@@ -87,6 +87,43 @@ impl Trifle {
         o
     }
 
+    /// Options at an explicit [`Effort`], keeping the run's `min_shared`/`t_max` tuning
+    /// but overriding the rerank effort. Backs the latency command's effort sweep: one
+    /// built index measured at Low/Medium/High without rebuilding (effort is a per-search
+    /// pool-depth knob, not an index property).
+    fn opts_effort(&self, k: usize, effort: Effort) -> SearchOpts<'static> {
+        let mut o = SearchOpts::new(k).rerank(effort);
+        if let Some(m) = self.tuning.min_shared {
+            o = o.min_shared(m);
+        }
+        if let Some(t) = self.tuning.t_max {
+            o = o.t_max(t);
+        }
+        o
+    }
+
+    /// Search at an explicit [`Effort`] (rest of the tuning unchanged), best-first doc ids.
+    pub fn search_effort(&self, query: &str, k: usize, effort: Effort) -> Vec<i64> {
+        self.index
+            .search(query, self.opts_effort(k, effort))
+            .unwrap()
+            .into_iter()
+            .map(|m| m.doc_id)
+            .collect()
+    }
+
+    /// Batch counterpart of [`search_effort`](Self::search_effort) (shares posting/freq
+    /// reads across the set — the `search_batch` path). `batch == serial` holds, so recall
+    /// is identical either way; this is the form the latency command times and scores.
+    pub fn search_batch_effort(&self, queries: &[&str], k: usize, effort: Effort) -> Vec<Vec<i64>> {
+        self.index
+            .search_batch(queries, self.opts_effort(k, effort))
+            .unwrap()
+            .into_iter()
+            .map(|ms| ms.into_iter().map(|m| m.doc_id).collect())
+            .collect()
+    }
+
     /// Search the top-`pool` overlap candidates, reranked by the BM25 precision tier,
     /// returning doc ids best-first. Exact pool control for the `ranksweep` calibration:
     /// `Effort::None` disables the √(kN) auto-pool (so pool == `limit`), while the

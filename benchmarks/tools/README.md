@@ -189,5 +189,99 @@ cached (`cargo run -p trifle-benchmarks --release -- fetch --corpus relevance`).
   trigrams) push the answer deeper by overlap → a steeper `N`-dependence. `--edits` controls
   it for the synthetic/geonames corpora.
 
+---
+
+# Latency & throughput plots
+
+`latency_plot.py` sweeps the `latency` benchmark across a **corpus-size ladder** and renders
+the speed story: how trifle's p50/p90/p99 and throughput compare to the in-process SQLite
+baselines, and how they scale with `N`. It is the analysis half; the measurement half is the
+`latency` subcommand with `--format json`.
+
+```
+python3 benchmarks/tools/latency_plot.py --queries 100 --seed 42      # full msmarco sweep
+python3 benchmarks/tools/latency_plot.py --reuse-raw                  # re-plot, no re-run
+```
+
+## The measurement seam (`latency --format json`)
+
+`latency` measures, for the *same* sampled queries, every engine — and trifle at every
+**effort** in `--effort-sweep` (e.g. `low,medium,high`) from a **single index build**
+(effort is a per-search pool-depth knob, not an index property). With `--format json` it
+emits one machine-readable object per invocation:
+
+```jsonc
+{
+  "corpus": "msmarco", "docs": 25000, "queries": 100, "k": 10, "seed": 42,
+  "mode": "serial", "typo_mix": {"e0":..,"e1":..,"e2":..},
+  "conditions": { "git_commit": "...", "rustc": "...", "arch": "...", "profile": "release", "cpus": 10 },
+  "records": [
+    { "engine": "trifle", "effort": "low",
+      "recall_at_k": 0.83, "recall_k": 10, "throughput_qps": 12345.6,
+      "latency_ns": { "p50":.., "p90":.., "p99":.., "max":.., "mean":.., "n":100 },
+      "samples_ns": [ /* raw per-query ns, in call order */ ] },
+    { "engine": "fts5-trigram-bm25", "effort": null, ... },
+    { "engine": "like-scan", "effort": null, ... }
+  ]
+}
+```
+
+Every record carries the **raw per-query samples**, not just the summary — so the
+post-processor (or a future one) can recompute any statistic, or change the plotting
+entirely, **without re-running the benchmark**. The driver persists each `N`'s object under
+`<out>/raw/`, a combined `<out>/raw.json`, and a tidy `<out>/summary.csv`; `--reuse-raw`
+re-plots from those.
+
+Recall is **in-corpus recall@k**: each latency query is a snippet (± typos) of a real
+document, and that document is the relevant answer — so the speed numbers carry a quality
+figure for the identical queries. `--k` sets both the result cutoff and the recall `k`.
+
+## What it renders
+
+| file | what |
+|------|------|
+| `latency_grouped.png` | one panel per `N`; a bar **group per alternative** (trifle Low/Medium/High + each baseline), each group a p50/p90/p99 triple. Color = effort/engine; percentile = position + alpha. **recall@k** and the **`*`max** latency are annotated above each group. |
+| `throughput_vs_N.png` | throughput (q/s) vs `N`, one line per alternative, **recall@k annotated above each point**. |
+| `latency_vs_N.png` | supplementary: p50 and p99 vs `N` — the flat-latency-as-`N`-grows story. |
+| `summary.csv`, `raw.json`, `raw/*.json` | the captured data, for re-plotting (`--reuse-raw`). |
+
+## Usage
+
+```
+python3 benchmarks/tools/latency_plot.py [options]
+
+  --corpus      latency corpus (msmarco | synthetic)                  [msmarco]
+  --docs        comma-separated index sizes N      [1000,5000,25000,125000,625000,3125000]
+  --queries N   query samples per N                                   [100]
+  --k N         top-k cutoff (and recall@k)                           [10]
+  --seed N      master seed                                           [42]
+  --efforts     trifle efforts to sweep                              [low,medium,high]
+  --warmup N    untimed warmup queries                                [100]
+  --max-like-n  drop like-scan above this N (its O(N) scan is impractical at the top of
+                the ladder; the omission is logged, never silent)     [625000]
+  --out DIR     output directory                       [benchmarks/reports/latency-<corpus>]
+  --reuse-raw   re-plot from <out>/raw.json (skip the benchmark)
+```
+
+Requirements: a release build of `trifle-benchmarks` (built on first run), Python with
+`numpy` + `matplotlib`, and — for `--corpus msmarco` — the ~1 GiB passage collection cached
+(`cargo run -p trifle-benchmarks --release -- fetch --corpus msmarco`).
+
+## Profiling a run (`--instrument`)
+
+To see *where* a latency run spends its time (not just how much), `latency` can re-exec
+itself under a Rust-friendly **sampling profiler** — a hook modeled on shrike's benchmark
+driver, but with Rust-only instrumenters:
+
+```
+cargo run -p trifle-benchmarks --release -- latency --corpus msmarco --docs 125000 \
+    --instrument xctrace          # Instruments' Time Profiler (macOS) → a .trace bundle
+    # or: --instrument samply      # cross-platform → Firefox-profiler JSON (samply load …)
+```
+
+An env guard keeps the profiled child from re-instrumenting; the artifact lands under
+`--instrument-out` (default `.cache/bench/instruments`). This is orthogonal to `--format
+json`: instrument to find a hot path, emit JSON to record the distribution.
+
 [`Bm25Ranker`]: ../../src/rank.rs
 [`Effort`]: ../../src/lib.rs

@@ -51,3 +51,19 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans sources
+
+  # Single aggregating check for the `main` branch protection rule: require only
+  # "ci-ok". It runs always() and fails unless every other job succeeded, so a failed,
+  # cancelled, or skipped job blocks the merge — while the protection rule stays one
+  # stable check name (no need to re-list jobs or matrix legs as CI grows).
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [test, msrv, deny]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all CI jobs to have succeeded
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        run: |
+          echo "::error::a required CI job did not succeed: ${{ join(needs.*.result, ', ') }}"
+          exit 1

@@ -137,21 +137,25 @@ not automatic:
 
 ## Comparison
 
-How Trifle compares to other embedded fuzzy- and substring-search tools, across the axes
-that matter when choosing one:
+How Trifle compares to other fuzzy- and substring-search tools, across the axes that matter
+when choosing one:
 
-| | durable? | embedded / no server? | incremental update vs rebuild? | corpus-scale (100k+ small docs)? | provenance? | matching semantics | footprint |
-|---|---|---|---|---|---|---|---|
-| **trifle** | ✅ disk (SQLite) | ✅ | ✅ incremental (base+delta) | ✅ | ✅ (source/ref) | trigram overlap | disk |
-| FTS5-trigram | ✅ | ✅ | ✅ incremental | ✅ | rowid only | trigram + BM25 | disk |
-| pg_trgm | ✅ | ❌ server | ✅ | ✅ | table cols | trigram similarity | disk |
-| Tantivy + Levenshtein | ✅ | ✅ | ✅ (segments) | ✅ | fields | Levenshtein automaton | disk |
-| fzf / nucleo / fuzzy-matcher | ❌ | ✅ | rebuild-on-startup | ⚠️ RAM-bound | — | subsequence | RAM |
-| fst / SymSpell / strsim | ⚠️ immutable | ✅ | rebuild-to-update | ✅ | key-oriented | delete-neighborhood / edit-distance | RAM/disk |
+| | embedded (no server)? | updates | scales to 1M+ small docs? | provenance | matching semantics | storage |
+|---|---|---|---|---|---|---|
+| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | source / ref | trigram overlap + BM25-shaped rerank | disk (SQLite) |
+| **[SQLite FTS5](https://www.sqlite.org/fts5.html#the_trigram_tokenizer)** | yes | incremental | yes | rowid | trigram substring (`MATCH` / `LIKE`) | disk (SQLite) |
+| **[pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html)** | no (server) | incremental (GIN / GiST) | yes | table rows | trigram similarity | disk (server) |
+| **[Tantivy](https://github.com/quickwit-oss/tantivy)** | yes | incremental (segments) | yes | stored fields | Levenshtein automaton (≤ 2 edits) | disk (segments) |
+| **[fzf](https://github.com/junegunn/fzf) / [nucleo](https://github.com/helix-editor/nucleo) / [fuzzy-matcher](https://github.com/skim-rs/fuzzy-matcher)** | yes | rebuild on startup | RAM-bound | none | subsequence | RAM |
+| **[fst](https://github.com/BurntSushi/fst) / [SymSpell](https://github.com/wolfgarbe/SymSpell) / [strsim](https://github.com/rapidfuzz/strsim-rs)** | yes | rebuild (immutable) | yes | key / term | edit-distance / delete-neighborhood | mmap / RAM |
 
-The in-memory subsequence filters (fzf, nucleo) are faster when everything is RAM-resident
-and rebuilt on startup. A search server like Tantivy or a database extension like pg_trgm is
-the better fit when you already run one.
+The in-memory matchers (fzf, nucleo, fuzzy-matcher) are faster when the corpus stays
+RAM-resident and is rebuilt each run, but they keep no durable index. pg_trgm fits when you
+already run Postgres; Tantivy is the fuller embedded library — field schemas, stored
+documents, edit-distance term queries — when you want Lucene-shaped search. FTS5 and Trifle
+both live in a SQLite file: FTS5 matches substrings against its trigram index through
+`MATCH`/`LIKE`, while Trifle generates candidates by trigram overlap and reranks them with a
+BM25-shaped scorer.
 
 ## Non-goals
 

@@ -343,19 +343,29 @@ def plot_throughput(data, ns, corpus, k, path):
     plt.close(fig)
 
 
-def plot_latency_vs_n(data, ns, corpus, path):
-    """Supplementary: p50 and p99 latency vs N (the flat-latency-as-N-grows story)."""
+def plot_latency_vs_n(data, ns, corpus, k, path):
+    """Supplementary: p50 and p99 latency vs N (the latency-scaling story), with recall@k
+    annotated above each point (same per-engine label stagger as the throughput plot, so the
+    close trifle-effort lines don't overprint)."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 6), squeeze=False)
     all_keys = [key for key in SERIES_ORDER if any(key in data[n] for n in ns)]
     for ax, p in zip(axes.flat, ["p50", "p99"]):
-        for key in all_keys:
-            xs, ys = [], []
+        for si, key in enumerate(all_keys):
+            engine = key.split("/")[0]
+            same_engine = [j for j, kk in enumerate(all_keys) if kk.split("/")[0] == engine]
+            dy = 8 + same_engine.index(si) * 9
+            xs, ys, recs = [], [], []
             for n in ns:
                 if key in data[n]:
                     xs.append(n)
                     ys.append(data[n][key][f"{p}_ns"] / 1_000.0)
-            if xs:
-                ax.plot(xs, ys, marker="o", ms=5, color=color_of(key), label=label_of(key))
+                    recs.append(data[n][key]["recall"])
+            if not xs:
+                continue
+            ax.plot(xs, ys, marker="o", ms=5, color=color_of(key), label=label_of(key))
+            for x, y, r in zip(xs, ys, recs):
+                ax.annotate(recall_str(r), (x, y), textcoords="offset points", xytext=(0, dy),
+                            ha="center", fontsize=6.5, color=color_of(key), zorder=4)
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xlabel("corpus size N (docs, log)")
@@ -363,7 +373,8 @@ def plot_latency_vs_n(data, ns, corpus, path):
         ax.set_title(f"{p} latency vs N")
         ax.grid(alpha=0.3, which="both")
     axes.flat[0].legend(fontsize=8, title="alternative")
-    fig.suptitle(f"Latency scaling with corpus size — {corpus}", fontsize=13)
+    fig.suptitle(f"Latency scaling with corpus size — {corpus}\n"
+                 f"(recall@{k} annotated above each point)", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(path, dpi=120)
     plt.close(fig)
@@ -412,7 +423,7 @@ def main():
     write_csv(data, out / "summary.csv")
     plot_latency_grouped(data, ns, args.corpus, args.k, out / "latency_grouped.png")
     plot_throughput(data, ns, args.corpus, args.k, out / "throughput_vs_N.png")
-    plot_latency_vs_n(data, ns, args.corpus, out / "latency_vs_N.png")
+    plot_latency_vs_n(data, ns, args.corpus, args.k, out / "latency_vs_N.png")
 
     print(f"\nwrote: {out}/summary.csv, raw.json, raw/, "
           f"latency_grouped.png, throughput_vs_N.png, latency_vs_N.png")

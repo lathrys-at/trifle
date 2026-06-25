@@ -1,61 +1,64 @@
 # `t_max` selection-cap characterization
 
-`t_max` caps how many query trigrams the rarest-first selector keeps. Selection keeps at
-least the typo floor `F = m + d = 6` and at most `t_max`. Raising the cap lets more
-candidates clear the overlap floor and enter the rerank pool, but the trigrams added past the
-rare anchors are common (high document-frequency): they cost scan latency and inject overlap
-noise. The cap therefore trades recall against latency, and three questions decide where it
-belongs and whether it must scale with anything:
+`t_max` caps how many of a query's trigrams the rarest-first selector keeps. It always keeps at
+least the typo floor `F = m + d = 6`, and never more than `t_max`. A higher cap lets more
+candidates clear the overlap floor and reach the rerank pool. But the extra trigrams it admits
+are the common ones (high document-frequency), which are slow to scan and add noise to the
+overlap counts. So the cap trades recall for latency. Three questions decide what it should be:
 
-- does the right cap grow with query length?
-- does it drift with corpus size `N`?
-- is a cap above the floor worth its latency cost at all?
+- Does the best cap depend on query length?
+- Does it change with corpus size `N`?
+- Is a cap above the floor worth the latency it costs?
 
-The sweep answers all three across two opposite corpora — MS MARCO (prose, sparse) and
-GeoNames all-countries (structured names, dense) — and `N` from 1k to 1M.
+The sweep covers two very different corpora: MS MARCO (long, sparse prose) and GeoNames
+all-countries (short, dense names), at sizes from 1k to 1M documents.
 
 ## Method
 
-Recall is measured per query, as a knee, not as mean-recall-vs-`t_max`. Averaging binary
-recall over queries whose individual knees differ produces a smooth plateau where each query
-in fact has a sharp knee, and an uneven length distribution can turn that artifact into a
-spurious length law. The per-query statistics avoid both:
+Recall is measured per query, as a knee. Averaging recall across queries at each `t_max` would
+be misleading here: different queries reach their knee at different `t_max` values, so the
+average smooths them into a gentle slope even when every query has a sharp knee. And if query
+length lines up with where the knee falls, that smoothing can look like a length law that isn't
+real. The per-query measurements avoid this:
 
-- `t_enter(q, k)` — smallest `t_max` that recovers `q`'s relevant doc into top-k.
-- `t_exit(q, k)` — largest `t_max` that still holds it there (the per-query hump).
-- Queries never recovered at any `t_max` are right-censored: reported as a recovery rate, not
-  dropped, since dropping them biases toward easy queries.
+- `t_enter(q, k)`: the smallest `t_max` that brings `q`'s relevant document into the top k.
+- `t_exit(q, k)`: the largest `t_max` that still keeps it there. Above this it drops out again,
+  and that span is the per-query hump.
+- Queries that never recover at any `t_max` are right-censored. They are reported as a recovery
+  rate rather than dropped, since dropping them would bias the results toward easy queries.
 
-Two pool depths separate the two costs `t_max` controls:
+`t_max` affects recall in two ways, and two pool sizes pull them apart:
 
-- A **generous** pool (`2·√(50·N)`, capped) isolates the selection ceiling — the relevant doc
-  is in the pool regardless of `t_max`, so only selection quality varies.
-- A **production** pool (`Effort::Medium`, `0.05·√(50·N)`) is the realistic operating point.
-  Here `t_max` also decides whether the doc reaches the small pool at all, so it carries the
-  real value.
+- A generous pool (`2·√(50·N)`, capped) measures selection on its own. The relevant document
+  is in the pool at any `t_max`, so `t_max` only changes how selection ranks it.
+- A production pool (`Effort::Medium`, `0.05·√(50·N)`) is the size a real query uses. Here
+  `t_max` also decides whether the document gets into the pool at all, which is where most of
+  its effect is.
 
-`N`-ladder {1k, 5k, 25k, 125k, 625k}, plus a 1M anchor (one point, checked against a 2×-pool
-adequacy test: doubling the pool moved the 1M ceiling by ±0.007). `t_max` grid dense over
-6–16, anchors at 20 and 28. Effect sizes carry bootstrap CIs, in linear space.
+Corpus sizes are 1k, 5k, 25k, 125k, and 625k, plus a single run at 1M. (At 1M, doubling the
+pool moved the recall ceiling by only ±0.007, so the one run is enough.) The `t_max` values
+tested are closely spaced from 6 to 16, plus 20 and 28. Confidence intervals are bootstrapped,
+computed in linear space.
 
 ## Length dependence
 
-Pooled entry-knee-vs-length slope (`t_max` per trigram), 95% CI:
+Slope of the entry knee against query length (`t_max` per trigram), with 95% confidence interval:
 
 | | MS MARCO | GeoNames |
 |---|---|---|
 | k=10 | `+0.010 [+0.005, +0.017]` (span +0.8 `t_max`) | `+0.005 [+0.001, +0.009]` (span +0.2) |
-| k=50 | `+0.010 [+0.004, +0.016]` (span +0.8) | `+0.001 [-0.001, +0.004]` — **no effect** |
+| k=50 | `+0.010 [+0.004, +0.016]` (span +0.8) | `+0.001 [-0.001, +0.004]` (no effect) |
 
-The slope is positive — a tail of long queries pulls the mean up — but the implied knee
-movement across the entire length range is under 1 `t_max`, too small to act on. On GeoNames at
-k=50 there is no length effect at all, and the data are ample enough to detect a small one.
-Neither regime has a length law.
+The slope is positive: longer queries have a slightly higher knee, mostly because a few very
+long queries pull the average up. But across the whole range of lengths the knee moves by less
+than one `t_max`, which is too small to matter. On GeoNames at k=50 there is no measurable
+effect, and the sample is big enough that a real one would show. Neither corpus has a length
+law.
 
 ## Drift with corpus size
 
-Median `t_enter@k=10` by (length bucket × `N`) sits at the floor (6) in every cell, both
-corpora, for every `N` from 1k to 1M:
+The median `t_enter` at k=10, split by query-length bucket and corpus size, sits at the floor
+(6) in every cell. This holds for both corpora and every `N` from 1k to 1M:
 
 ```
 MS MARCO    len 10-13  14-18  19-25  26-35  36-50  51+
@@ -66,60 +69,65 @@ GeoNames    len 4-6  7-9  10-13  14-18  19-25  26-35  36-50
   N=1k..1M    6    6     6      6      6      6      6     (every cell)
 ```
 
-The typical query recovers at the floor regardless of length or corpus size. The structural
-prediction that large `N` should want *fewer* trigrams surfaces only in the tail (the hump,
-below), never as a moving median.
+So the typical query recovers at the floor, whatever its length or the corpus size. You might
+expect a bigger corpus to want fewer trigrams, since more documents means more accidental
+matches on common ones. That does happen, but only to a tail of queries (the hump, below), and
+it never moves the median.
 
 ![Per-query entry-knee, MS MARCO](images/entryknee_msmarco.png)
 ![Per-query entry-knee, GeoNames](images/entryknee_geonames.png)
 
-*Boxes pinned at the floor with an upper tail that grows with query length: the median is the
-floor; what little length dependence there is sits in the tail.*
+The boxes sit on the floor; only the top whisker grows with query length. The median is the
+floor, and the small length effect that exists is all in the tail.
 
 ## Value above the floor
 
-Recall@50 at the production pool, floor (`t=6`) vs the best `t_max`:
+Recall@50 at the production pool. Each cell gives the gain over the floor (`t=6`), the `t_max`
+that achieves it (in parentheses), and the latency cost compared with the floor.
 
 | N | MS MARCO gain (best `t`) @ latency× | GeoNames gain (best `t`) @ latency× |
 |---|---|---|
 | 1k | +0.016 (11) @3.5× | +0.002 (7) @1.0× |
 | 25k | +0.034 (16) @1.9× | +0.058 (9) @1.4× |
 | 125k | +0.048 (13) @1.6× | +0.105 (11) @2.9× |
-| 625k | +0.038 (14) @1.8× | **+0.173 (12) @2.8×** |
+| 625k | +0.038 (14) @1.8× | +0.173 (12) @2.8× |
 | 1M | +0.067 (10) @1.4× | +0.224 (14) @4.2× (sub-ms) |
 
-A cap above the floor is the largest single recall effect in either report, and the gain grows
-with `N`: on GeoNames it reaches +0.17 recall@50 at 625k and +0.22 at 1M. The best `t_max` itself
-does not move — it stays a small fixed cap (~8–16) in both regimes at every `N`. What grows with
-the corpus is the recall that cap is worth, not its position. Latency cost is modest (1–4×,
-sub-millisecond for GeoNames). The gain shows only at the production pool: at the generous pool
-the relevant doc is already in the pool, so `t_max` changes recall by ~2 points at a misleading
-12–26× latency. At the smaller production pool, `t_max` decides whether that doc is in the pool
-at all.
+This is the biggest recall effect anywhere in either report, and it grows with `N`. On GeoNames
+the gain reaches +0.17 at 625k documents and +0.22 at 1M. The best `t_max` stays small and
+roughly fixed (about 8 to 16) in both corpora at every size; only the recall it buys grows. The
+latency cost is small: 1 to 4 times the floor, and under a millisecond for GeoNames.
+
+This effect only appears at the production pool. At the generous pool the right document is
+already included whatever `t_max` is, so changing `t_max` moves recall by about 2 points while
+costing 12 to 26 times the latency, which makes it look minor. The production pool is small
+enough that `t_max` decides whether the document gets in, and that is where the recall comes
+from.
 
 ![Above-floor gain vs N](images/qvalue_vs_N.png)
 
 ## The hump
 
-Per-query drop-out fraction — recovered into top-k, then demoted by pushing `t_max` to 28 —
-grows with `N` on prose and stays near zero on structured names:
+Fraction of queries that reach the top k and then drop out again when `t_max` is pushed up to
+28. This grows with `N` on prose and stays near zero on names:
 
 | drop-out @k=10 | N=1k | N=125k | N=625k | N=1M |
 |---|---|---|---|---|
 | MS MARCO | 0.018 | 0.105 | 0.107 | 0.148 |
 | GeoNames | 0.000 | 0.005 | 0.012 | 0.022 |
 
-Prose's trigram frequencies are Zipfian with a thick body of common, high-`DF` trigrams;
-raising `t_max` past the rare anchors reaches into that body and injects accidental overlap
-that demotes the true doc — a cost that grows with `N`. Structured names have a sparser body
-and few such collisions. Both regimes point the same way: a cap above the optimum only loses
-recall.
+In prose, a handful of trigrams are very common and the rest are rare. Once `t_max` runs past
+the rare trigrams in a query, it starts adding common ones. Common trigrams match many unrelated
+documents, and that extra noise can push the right document back out of the top k. A bigger
+corpus has more documents to supply the noise, so the effect grows with `N`. Names have far
+fewer common trigrams, so it barely happens. Either way, setting `t_max` above the best value
+only costs recall.
 
-The hump also gives independent support to the pool-depth model. The
-[pool-depth report](../pool-law) argues from Zipf's law that prose's thick body of common
-trigrams should bury relevant documents deeper as `N` grows; the hump is that burial, measured
-here by a different statistic (per-query drop-out) on a separate sweep. The two-regime split
-therefore shows up in two unrelated measurements, not just one fit.
+This also backs up the [pool-depth report](../pool-law). That report uses the same fact about
+common trigrams to predict that a bigger corpus pushes the right document lower in prose, but
+not in names. The hump measures that same effect a different way, with a different statistic on
+a different sweep, and finds the same split between the two corpora. So the result does not rest
+on a single measurement.
 
 ![Recall ceiling vs t_max, MS MARCO](images/ceiling_msmarco.png)
 ![Recall ceiling vs t_max, GeoNames](images/ceiling_geonames.png)
@@ -128,23 +136,23 @@ therefore shows up in two unrelated measurements, not just one fit.
 
 ## Recovery
 
-Recovery rate falls with `N` as the task gets harder, reported separately from the knee
-distribution:
+How often the right document can be found at all (generous pool, any `t_max`). This falls as
+`N` grows. It is reported separately from the knee numbers above:
 
 | recall-ever @50 | 1k | 25k | 125k | 625k | 1M |
 |---|---|---|---|---|---|
 | MS MARCO | 0.992 | 0.966 | 0.904 | 0.802 | 0.770 |
 | GeoNames | 0.856 | 0.820 | 0.813 | 0.761 | 0.737 |
 
-GeoNames starts *below* MS MARCO at small `N` (0.856 vs 0.992 at 1k) — the dense corpus
-recovers worse where the task should be easiest. The cause is query construction, not the
-index. GeoNames queries are short names with two injected edits, and two edits corrupt a far
-larger *fraction* of a short name's trigrams than of a long passage: a 6-character name carries
-~4 trigrams, of which two edits can damage most, whereas the same two edits touch a handful of
-a passage's dozens. For a baseline ~14% of GeoNames queries the surviving rare-trigram signature
-is too degraded to recover at any `t_max` (or it now resolves to a different real name), so they
-are unrecoverable independent of `N`. MS MARCO's queries are real paraphrases, almost all
-recoverable at 1k. The gap is a property of edit injection on short strings.
+At small `N`, GeoNames recovers worse than MS MARCO (0.856 versus 0.992 at 1k), even though the
+dense corpus should be the easier one. This is about how the queries are built, not the index.
+GeoNames queries are short names with two edits added. Two edits damage a much larger share of a
+short name's trigrams than of a long passage: a 6-character name has about 4 trigrams and two
+edits can wreck most of them, while the same two edits touch only a few of a passage's dozens.
+For about 14% of GeoNames queries, too little of the original name survives to find it at any
+`t_max` (or what survives now matches a different real name), so those queries fail at any corpus
+size. MS MARCO uses real paraphrase queries, which are almost all recoverable at 1k. The gap
+comes from adding edits to short strings.
 
 ## Two regimes
 
@@ -156,36 +164,38 @@ recoverable at 1k. The gap is a property of edit injection on short strings.
 | Above-floor gain @ production pool, 625k | +0.048 | +0.173 |
 | Best fixed `t_max` | ~8–16 | ~7–12 |
 
-The two opposite regimes converge on one shape: a small fixed optimum, no length law, and no
-drift in the median. The length dependence that a mean-recall statistic reports is an
-aggregation artifact; the per-query knee removes it.
+The two corpora are very different, and they agree on the shape of the answer: a small fixed
+best value, no length law, and no change in the median with corpus size. The length law you
+seem to get from averaging recall is an artifact of the averaging; the per-query knee removes
+it.
 
 ## Conclusion
 
-`t_max` is a high-value parameter. Its above-floor gain is the largest single recall effect in
-either report and grows with `N`, up to +0.22 recall@50 at 1M on GeoNames. The best cap does not
-move with `N`: it stays a small fixed value (~8–16) in both regimes at every corpus size. What
-changes with the corpus is how much recall the cap is worth.
+`t_max` matters a lot. The recall it buys above the floor is the largest single effect in
+either report, and it grows with the corpus, up to +0.22 at 1M documents on GeoNames. The best
+value for `t_max` does not change: it stays small (about 8 to 16) in both corpora at every size.
+The corpus only changes how much that fixed value is worth.
 
-Two views hide this. The median query recovers at the floor in every cell, and at the generous
-diagnostic pool the relevant doc is already in the pool, so `t_max` changes recall by only ~2
-points; both make the cap look almost irrelevant. It is not — the gain shows at the smaller
-production pool, where the cap decides whether the relevant doc is in the pool at all.
+Two things can make `t_max` look unimportant. The median query recovers at the floor in every
+case, and at a large diagnostic pool the right document is already included, so `t_max` moves
+recall by only about 2 points. Both are misleading. The effect is real, and it shows at the
+smaller pool a real query uses, where `t_max` decides whether the right document is included.
 
 | question | finding | implication |
 |---|---|---|
-| length | real but < 1 `t_max` across the length range | no length-scaled `t_max` |
-| drift with `N` | median knee = floor at every `N` to 1M | no `t_max(N)` rule |
-| value | large, and grows with `N` (up to +0.22 at 1M, dense) | a fixed cap captures it without per-`N` tuning |
-| effort coupling | dropping to the floor costs up to +0.17–0.22 recall (GeoNames) | effort must not lower it |
+| length | real, but under 1 `t_max` across all lengths | don't scale `t_max` by length |
+| corpus size | median knee = floor at every `N` up to 1M | no rule that varies `t_max` with `N` |
+| value | large, grows with `N` (up to +0.22 at 1M on names) | one fixed cap captures it |
+| Effort | dropping to the floor costs up to 0.17–0.22 recall (GeoNames) | Effort must not lower `t_max` |
 
-A fixed `t_max = 12` captures it. Twelve sits at or above the regime optima at every `N` (MS
-MARCO ~10–16, GeoNames ~7–14): it takes the large dense-regime gain nearly in full, stays within
-~1 recall point of the MS MARCO optimum, and falls below where the prose hump bites — with no
-per-length or per-`N` rule. The largest gains are in the dense regime — short, structured records
-rather than long prose, which is the kind of corpus trifle is for. Cutting the cap back
-toward the floor at a low `Effort` gives up to +0.17–0.22 of recall back, so `Effort` must leave
-`t_max` alone.
+`t_max = 12` is a good fixed choice. It is at or above the best value for both corpora at every
+size (MS MARCO about 10 to 16, GeoNames about 7 to 14), so it gets almost all of the large gain
+on names, stays within about one recall point of the best value on prose, and stays below the
+point where the prose hump starts costing recall. No rule that depends on query length or corpus
+size does better. The largest gains are on short, structured records rather than long prose,
+which is the kind of data trifle is built for. Lowering `t_max` toward the floor at a low
+`Effort` setting would give back up to 0.17 to 0.22 of recall, so `Effort` should leave `t_max`
+alone.
 
 ## Reproduce
 
@@ -202,4 +212,4 @@ python3 benchmarks/tools/tmax_perquery.py --csv OUT-gen/tmax_raw.csv --out OUT-g
 
 Tooling: `benchmarks/src/main.rs` (`tmaxsweep`), `benchmarks/tools/tmax_knee.py` (sweep
 driver, peak-based facets), `benchmarks/tools/tmax_perquery.py` (the per-query knee
-statistic). `N`-ladder {1k, 5k, 25k, 125k, 625k} is the standard for these sweeps.
+statistic). The corpus sizes 1k, 5k, 25k, 125k, 625k are the standard set for these sweeps.

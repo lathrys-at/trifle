@@ -195,7 +195,7 @@ def main():
     ax.set_xscale("log")
     ax.set_xlabel("N")
     ax.set_ylabel("median entry-knee t_max @k=10")
-    ax.set_title("Q-DRIFT preview: entry-knee center vs N, by length")
+    ax.set_title("median entry-knee t_max vs N, by length")
     ax.grid(alpha=.3)
     ax.legend(fontsize=7)
     fig.tight_layout()

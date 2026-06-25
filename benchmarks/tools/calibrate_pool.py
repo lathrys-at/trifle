@@ -127,7 +127,7 @@ def plot_manifold(m, corpus, path):
         ax.set_xlabel("rerank pool depth"); ax.set_ylabel("recall"); ax.grid(alpha=.3)
         ax.axvline(k, color="gray", ls=":", lw=1)
     axes.flat[0].legend(fontsize=7)
-    fig.suptitle(f"Recall vs rerank-pool depth — {corpus} — faceted by k, lines by N")
+    fig.suptitle(f"recall vs rerank-pool depth — {corpus}")
     fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
 
 
@@ -142,7 +142,7 @@ def plot_pstar(m, frac, path):
         ax.plot(xs, ys, marker="o", label=f"k={k}")
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("N (index size)"); ax.set_ylabel(f"p* (pool for {frac:.0%} of ceiling)")
-    ax.set_title(f"p*(k, N) at {frac:.0%} of ceiling — floor at p=k, then power-law rise")
+    ax.set_title(f"p* vs N at {frac:.0%} of ceiling")
     ax.grid(alpha=.3, which="both"); ax.legend()
     fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
 
@@ -166,7 +166,7 @@ def plot_collapse(m, frac, fit, path):
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel(f"k^{a:.2f}·N^{b:.2f} (fitted predictor)")
     ax.set_ylabel(f"p* at {frac:.0%} of ceiling")
-    ax.set_title(f"Power-law collapse (R²={fit['r2']:.3f})")
+    ax.set_title(f"p* vs fitted predictor (R²={fit['r2']:.3f})")
     ax.grid(alpha=.3, which="both"); ax.legend()
     fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
 

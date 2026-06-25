@@ -245,7 +245,7 @@ def plot_opt_vs_len(stab, fits, out):
                 label=f"fit@{CEIL_K}: min({f['T_cap']:.0f}, {f['a']:.2f}·len+{f['b']:.1f})")
     ax.set_xlabel("query length (mean trigram count in bucket)")
     ax.set_ylabel("near-optimal t_max")
-    ax.set_title("Operating-point t_max vs query length, by k")
+    ax.set_title("near-optimal t_max vs query length, by k")
     ax.grid(alpha=.3)
     ax.legend(fontsize=8)
     fig.tight_layout()
@@ -281,12 +281,12 @@ def main():
     df.attrs["corpus"] = args.corpus
     df, res, stab, fits, buckets, Ns = analyse(df, out)
 
-    facet(df, buckets, Ns, CEIL_K, f"recall@{CEIL_K} (ceiling)", "ceiling_vs_tmax.png", out,
-          f"Recall@{CEIL_K} vs t_max (selection ceiling, generous pool) — {args.corpus}")
-    facet(df, buckets, Ns, SMALL_K, f"recall@{SMALL_K} (precision)", "hump_vs_tmax.png", out,
-          f"Recall@{SMALL_K} vs t_max — the precision hump — {args.corpus}")
+    facet(df, buckets, Ns, CEIL_K, f"recall@{CEIL_K}", "ceiling_vs_tmax.png", out,
+          f"recall@{CEIL_K} vs t_max — {args.corpus}")
+    facet(df, buckets, Ns, SMALL_K, f"recall@{SMALL_K}", "hump_vs_tmax.png", out,
+          f"recall@{SMALL_K} vs t_max — {args.corpus}")
     facet(df, buckets, Ns, None, "median latency (µs)", "latency_vs_tmax.png", out,
-          f"Latency vs t_max (cost side) — {args.corpus}")
+          f"latency vs t_max — {args.corpus}")
     plot_opt_vs_len(stab, fits, out)
 
     pd.set_option("display.width", 200)

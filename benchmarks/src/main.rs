@@ -107,7 +107,7 @@ COMMON OPTIONS:
 
 SEARCH-TUNING (trifle only):
     --min-shared <M>              Match floor m (shared rare tokens) [default: engine]
-    --breadth <B>                 Breadth budget B (recall/latency) [default: engine]
+    --t-max <T>                   Selection cap t_max — rarest tokens kept (recall/latency) [default: engine]
     --effort <none|low|medium|high|max>  Rerank effort (pool depth c·√(kN) + the BM25
                                   precision tier). Omit to use trifle's default (Medium)
 
@@ -268,7 +268,7 @@ fn build_corpus(flags: &Flags) -> Result<(Corpus, u64), String> {
 fn tuning(flags: &Flags) -> Result<Tuning, String> {
     Ok(Tuning {
         min_shared: flags.opt_u32("min-shared")?,
-        breadth: flags.opt_u64("breadth")?,
+        t_max: flags.opt_u64("t-max")?.map(|v| v as usize),
         effort: parse_effort(flags)?,
     })
 }
@@ -288,7 +288,7 @@ fn parse_effort(flags: &Flags) -> Result<Option<Effort>, String> {
     }))
 }
 
-const CORPUS_OPTS: &[&str] = &["corpus", "docs", "seed", "min-shared", "breadth", "effort"];
+const CORPUS_OPTS: &[&str] = &["corpus", "docs", "seed", "min-shared", "t-max", "effort"];
 
 /// The engine identifiers accepted by `--filter`. These must match the strings each
 /// engine returns from `baselines::Engine::name()`. Not every command runs every
@@ -632,7 +632,7 @@ fn cmd_relevance(args: &[String]) -> Result<(), String> {
         "k",
         "seed",
         "min-shared",
-        "breadth",
+        "t-max",
         "filter",
         "effort",
     ])?;
@@ -718,7 +718,7 @@ fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
         "edits",
         "seed",
         "min-shared",
-        "breadth",
+        "t-max",
         "filter",
         "effort",
     ])?;
@@ -988,7 +988,7 @@ fn cmd_ranksweep(args: &[String]) -> Result<(), String> {
         "edits",
         "seed",
         "min-shared",
-        "breadth",
+        "t-max",
         "max-pool",
     ])?;
     let n = flags.usize("docs", 100_000)?;

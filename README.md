@@ -72,7 +72,7 @@ These roles cover two distinct patterns:
 ## Features
 
 - **Typo / partial tolerance** via trigram overlap; strictness (`min_shared`) and recall
-  (`breadth`) dials.
+  (`t_max`, the rarest query tokens kept) dials.
 - **Configurable normalization** — NFC (default), NFD, accent-insensitive
   (`NfdStripMarks`), or none. Unicode casefolding is on by default.
 - **Reranking** — bit-sliced posting list overlap generates candidates; the default

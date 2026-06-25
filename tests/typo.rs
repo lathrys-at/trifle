@@ -95,26 +95,25 @@ fn min_shared_controls_strictness_when_both_trigrams_are_present() {
 }
 
 #[test]
-fn breadth_never_loses_a_narrow_hit() {
+fn wider_t_max_never_loses_a_narrow_hit() {
     let h = Harness::new();
     load_fixture(&h);
-    // A query narrow (B=0) provably matches several fixture docs — no vacuous guard.
+    // A query at the typo floor (t_max=6) provably matches several fixture docs — no
+    // vacuous guard.
     let q = "quick brown";
-    let narrow = h.index.search(q, SearchOpts::new(10)).unwrap();
-    let wide = h
-        .index
-        .search(q, SearchOpts::new(10).breadth(10_000))
-        .unwrap();
+    let narrow = h.index.search(q, SearchOpts::new(10).t_max(6)).unwrap();
+    let wide = h.index.search(q, SearchOpts::new(10).t_max(12)).unwrap();
     assert!(
         !narrow.is_empty(),
         "narrow must hit something for this to be meaningful"
     );
-    // Monotonicity: every doc narrow found, wide must also find (breadth only widens).
+    // Monotonicity: every doc narrow found, wide must also find (more kept tokens only
+    // widens the candidate set).
     let wide_ids = ids(&wide);
     for d in ids(&narrow) {
         assert!(
             wide_ids.contains(&d),
-            "breadth dropped doc {d} that narrow found"
+            "wider t_max dropped doc {d} that narrow found"
         );
     }
 }

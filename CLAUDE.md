@@ -89,9 +89,10 @@ A search flows through four stages, each its own module — this is the spine of
    (`Trigram`/`Bigram`/`Quadgram` aliases) slides an N-codepoint window over a normalized form
    and emits zero-allocation inline `Ngram` tokens. Normalization (NFC default, NFD,
    accent-stripping, casefold) is the tokenizer's job.
-2. **Select** (`src/select.rs`) — a cost-budget pruner keeps a **rarest-first** prefix of the
-   query's tokens (rare = both cheapest to scan and most discriminating). Derives only from
-   *this query's* token document-frequencies, never a batch aggregate — so
+2. **Select** (`src/select.rs`) — keeps a **rarest-first** prefix of the query's tokens, from
+   the typo floor `F = m + d` up to `t_max` (rare = both cheapest to scan and most
+   discriminating; the kept tokens' `Σdf` is the rows scanned). Derives only from *this
+   query's* token document-frequencies, never a batch aggregate — so
    `search_batch([…,q,…])` ranks `q` identically to `search(q)` (**batch == serial**, an
    invariant tested in `tests/scope_ranker.rs`).
 3. **Candidate generation + rank** (`src/rank.rs`) — reads each selected token's roaring

@@ -37,13 +37,13 @@ pub trait Engine {
     }
 }
 
-/// Search-strictness knobs for trifle (`m`, `B`) plus the rerank [`Effort`].
+/// Search-strictness knobs for trifle (`m`, `t_max`) plus the rerank [`Effort`].
 /// `None` leaves the engine default (Effort defaults to Medium). Baselines have no
 /// analogue and ignore these.
 #[derive(Clone, Copy, Default)]
 pub struct Tuning {
     pub min_shared: Option<u32>,
-    pub breadth: Option<u64>,
+    pub t_max: Option<usize>,
     pub effort: Option<Effort>,
 }
 
@@ -78,8 +78,8 @@ impl Trifle {
         if let Some(m) = self.tuning.min_shared {
             o = o.min_shared(m);
         }
-        if let Some(b) = self.tuning.breadth {
-            o = o.breadth(b);
+        if let Some(t) = self.tuning.t_max {
+            o = o.t_max(t);
         }
         if let Some(e) = self.tuning.effort {
             o = o.rerank(e);
@@ -97,8 +97,8 @@ impl Trifle {
         if let Some(m) = self.tuning.min_shared {
             o = o.min_shared(m);
         }
-        if let Some(b) = self.tuning.breadth {
-            o = o.breadth(b);
+        if let Some(t) = self.tuning.t_max {
+            o = o.t_max(t);
         }
         self.index
             .search(query, o)
@@ -108,16 +108,14 @@ impl Trifle {
             .collect()
     }
 
-    /// Like [`search_pool`](Self::search_pool) but with an explicit selection cap `t_max`
-    /// and an unbounded breadth budget, so the rarest `t_max` query trigrams are kept —
-    /// selection is the swept variable while the pool is held generous. Backs the t_max
-    /// knee sweep (`tools/tmax_knee.py`).
+    /// Like [`search_pool`](Self::search_pool) but with an explicit selection cap `t_max`,
+    /// so the rarest `t_max` query trigrams are kept — selection is the swept variable
+    /// while the pool is held generous. Backs the t_max knee sweep (`tools/tmax_knee.py`).
     pub fn search_pool_tmax(&self, query: &str, pool: usize, t_max: usize) -> Vec<i64> {
         let ranker = trifle::rank::Bm25Ranker;
         let mut o = SearchOpts::new(pool)
             .ranker(&ranker)
             .rerank(Effort::None)
-            .breadth(u64::MAX)
             .t_max(t_max);
         if let Some(m) = self.tuning.min_shared {
             o = o.min_shared(m);

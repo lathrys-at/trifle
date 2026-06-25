@@ -81,15 +81,10 @@ use tokenize::{Tokenizer, TrigramTokenizer};
 
 /// Default match floor `m` — shared rare tokens required for a hit.
 const DEFAULT_MIN_SHARED: u32 = 2;
-/// Default breadth budget `B` — `0` keeps exactly the typo floor.
-const DEFAULT_BREADTH: u64 = 0;
 /// Per-typo token damage `d`; the typo floor is `F = m + d`.
 const TYPO_DAMAGE: u32 = 4;
-/// Default absolute ceiling `t_max` on selected tokens.
+/// Default `t_max` — the number of rarest query tokens selection keeps.
 const DEFAULT_T_MAX: usize = 12;
-/// Default selection-cost coefficients — a pure `Σdf` cost (`α = 0`, `β = 1`).
-const DEFAULT_ALPHA: f64 = 0.0;
-const DEFAULT_BETA: f64 = 1.0;
 /// How many times a read retries a transient `SQLITE_BUSY`/`LOCKED`/`SCHEMA`.
 const RETRY_MAX: usize = 5;
 
@@ -202,7 +197,7 @@ pub type ScopeFn<'a> = dyn Fn(i64, &str, &str) -> bool + 'a;
 /// | [`Low`](Effort::Low)       | 0.03 | ~50% | |
 /// | [`Medium`](Effort::Medium) | 0.05 | ~90% | **the default** |
 /// | [`High`](Effort::High)     | 0.10 | ~95% | |
-/// | [`Max`](Effort::Max)       | 0.30 | ~99% (saturation tail) | deepest |
+/// | [`Max`](Effort::Max)       | 0.45 | ~99% (saturation tail) | deepest |
 ///
 /// Deeper pool → more hydration + scoring, so latency grows ~linearly with the pool
 /// while recall grows logarithmically. The pool is always at least `limit`.
@@ -216,7 +211,7 @@ pub enum Effort {
     Medium,
     /// ~95% of the recall ceiling (`c = 0.10`).
     High,
-    /// ~99% of the recall ceiling (`c = 0.30`) — the flat saturation tail; large pool
+    /// ~99% of the recall ceiling (`c = 0.45`) — the flat saturation tail; large pool
     /// for the last few points.
     Max,
     /// An explicit coefficient `c` in `pool = max(limit, round(c·√(limit·N)))`. `0`
@@ -239,7 +234,7 @@ impl Effort {
             Effort::Low => 0.03,
             Effort::Medium => 0.05,
             Effort::High => 0.10,
-            Effort::Max => 0.30,
+            Effort::Max => 0.45,
             Effort::Custom(c) => c.max(0.0),
         }
     }
@@ -265,22 +260,18 @@ impl Effort {
 ///
 /// Construct with [`SearchOpts::new`] and the builder setters, or the public fields.
 /// Most searches only set [`min_shared`](SearchOpts::min_shared) (`m`, the strictness
-/// dial); [`breadth`](SearchOpts::breadth) (`B`) is the orthogonal recall axis.
+/// dial); [`t_max`](SearchOpts::t_max) is the recall axis (how many rarest query tokens
+/// selection keeps).
 pub struct SearchOpts<'a> {
     /// Maximum number of matches to return (top-k).
     pub limit: usize,
     /// `m` — the match floor (shared rare tokens for a hit). `None` → `2`.
     pub min_shared: Option<u32>,
-    /// `B` — the breadth budget in selection cost units. `None` → `0`.
-    pub breadth: Option<u64>,
-    /// `t_max` — absolute ceiling on selected tokens. `None` → `12`. Advanced: with the
-    /// default `breadth = 0`, selection stops at the typo floor and never reaches it.
+    /// `t_max` — the number of rarest query tokens selection keeps, above the typo
+    /// floor `F = m + d`. `None` → `12`. This is the selection breadth knob: more tokens
+    /// means more candidates and more posting rows scanned. A `t_max` below `F` is
+    /// raised to `F`.
     pub t_max: Option<usize>,
-    /// `α` — per-kept-token selection-cost coefficient. `None` → `0` (a pure `Σdf` cost).
-    /// Advanced; pairs with [`beta`](SearchOpts::beta) under the [`breadth`](SearchOpts::breadth) budget.
-    pub alpha: Option<f64>,
-    /// `β` — per-document-frequency selection-cost coefficient. `None` → `1`.
-    pub beta: Option<f64>,
     /// A per-query [`Ranker`]. `None` → the built-in [`OverlapRanker`] (when reranking is
     /// off) or [`Bm25Ranker`] (the [`Effort`] precision tier).
     pub ranker: Option<&'a dyn Ranker>,
@@ -303,10 +294,7 @@ impl<'a> SearchOpts<'a> {
         SearchOpts {
             limit,
             min_shared: None,
-            breadth: None,
             t_max: None,
-            alpha: None,
-            beta: None,
             ranker: None,
             scope: None,
             effort: Effort::default(),
@@ -319,22 +307,9 @@ impl<'a> SearchOpts<'a> {
         self
     }
 
-    /// Set the breadth budget `B`.
-    pub fn breadth(mut self, b: u64) -> Self {
-        self.breadth = Some(b);
-        self
-    }
-
-    /// Set the absolute ceiling `t_max` on selected tokens.
+    /// Set `t_max` — the number of rarest query tokens selection keeps.
     pub fn t_max(mut self, t_max: usize) -> Self {
         self.t_max = Some(t_max);
-        self
-    }
-
-    /// Set the selection-cost coefficients `α` (per kept token) and `β` (per df).
-    pub fn cost(mut self, alpha: f64, beta: f64) -> Self {
-        self.alpha = Some(alpha);
-        self.beta = Some(beta);
         self
     }
 
@@ -877,14 +852,10 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             return Ok(Vec::new());
         }
         let min_shared = opts.min_shared.unwrap_or(DEFAULT_MIN_SHARED).max(1);
-        let breadth = opts.breadth.unwrap_or(DEFAULT_BREADTH);
         let sel_params = SelectParams {
             min_shared,
-            breadth,
             typo_damage: TYPO_DAMAGE,
             t_max: opts.t_max.unwrap_or(DEFAULT_T_MAX),
-            alpha: opts.alpha.unwrap_or(DEFAULT_ALPHA),
-            beta: opts.beta.unwrap_or(DEFAULT_BETA),
         };
         // The reranker: an explicit `opts.ranker` wins; otherwise the precision tier
         // ([`Bm25Ranker`]) when reranking is active, else plain overlap order.
@@ -1222,7 +1193,7 @@ mod effort_tests {
         // Large N follows c·√(k·N): k=10, N=1e6, √(kN)=3162.28.
         assert_eq!(Effort::Medium.pool(10, 1_000_000), 158); // 0.05·3162 = 158.1
         assert_eq!(Effort::High.pool(10, 1_000_000), 316); // 0.10·3162 = 316.2
-        assert_eq!(Effort::Max.pool(10, 1_000_000), 949); // 0.30·3162 = 948.7
+        assert_eq!(Effort::Max.pool(10, 1_000_000), 1423); // 0.45·3162 = 1423.0
         // reranks() reflects whether c > 0.
         assert!(!Effort::None.reranks());
         assert!(Effort::Medium.reranks());

@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="docs/assets/trifle-logo.svg" alt="trifle" width="160" />
+</div>
+
 # trifle
 
 [![CI](https://github.com/lathrys-at/trifle/actions/workflows/test.yaml/badge.svg)](https://github.com/lathrys-at/trifle/actions/workflows/test.yaml)

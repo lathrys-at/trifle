@@ -24,3 +24,15 @@ target
 # Added by cargo
 
 /target
+
+# Benchmark corpus cache — downloaded, hash-verified, NEVER committed. Only the
+# pinned manifests under benchmarks/sources/ are tracked (see benchmarks/README.md).
+/.cache
+
+# Claude Code local files: linked worktrees (.claude/worktrees/), session state, and
+# local settings. The tracked project guide is CLAUDE.md at the repo root, which this
+# rule does not match.
+/.claude/
+
+# Output of benchmarks/tools/calibrate_pool.py (matrix CSV + rendered PNGs).
+/calibration-*/

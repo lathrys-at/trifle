@@ -1,0 +1,9 @@
+{
+  "name": "MS MARCO passage collection",
+  "license": "MS MARCO Non-Commercial Research License",
+  "repo": "https://microsoft.github.io/msmarco/",
+  "url": "https://msmarco.z22.web.core.windows.net/msmarcoranking/collection.tar.gz",
+  "sha256": "70667529e474322327d6441c8f7b621f2a805a7f6220897d9f80e5a8294bd62e",
+  "bytes": 1035009698,
+  "note": "~1 GiB gzip'd tar containing collection.tsv (8.8M passages, `id\\ttext`). The harness extracts via `tar -xzf` and subsamples deterministically. Pinned to the immutable research collection."
+}

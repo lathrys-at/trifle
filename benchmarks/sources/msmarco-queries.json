@@ -1,0 +1,9 @@
+{
+  "name": "MS MARCO dev queries (queries.dev.tsv)",
+  "license": "MS MARCO Non-Commercial Research License",
+  "repo": "https://microsoft.github.io/msmarco/",
+  "url": "https://msmarco.z22.web.core.windows.net/msmarcoranking/queries.tar.gz",
+  "sha256": "05e4c62c9c8520cd695725340d4c990627fd1a92eb8a71b88e3c746031ba6de8",
+  "bytes": 18882551,
+  "note": "tar.gz of queries.{dev,eval,train}.tsv (`qid\\tquery`). The relevance eval uses queries.dev.tsv (101093 rows), filtered to the qids present in qrels.dev.small.tsv. Immutable research artifact, so pinned."
+}

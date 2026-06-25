@@ -1,10 +1,59 @@
+[workspace]
+members = ["benchmarks"]
+
+# Shared lint bar, inherited by every workspace member (incl. the benchmark crate).
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
 [package]
 name = "trifle"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
-description = "A small, embedded, typo-tolerant fuzzy search engine backed by SQLite."
-license = "MIT"
+rust-version = "1.85"
+description = "Embedded, typo-tolerant trigram fuzzy search backed by SQLite, for large corpora of small documents."
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/lathrys-at/trifle"
 readme = "README.md"
+keywords = ["search", "fuzzy", "trigram", "sqlite", "ngram"]
+categories = ["text-processing", "database-implementations"]
+# Keep repo-internal files out of the published tarball: the unpublished benchmark
+# crate and its corpus cache, the report PNGs (~1 MB), CI config, and AI guidance.
+exclude = ["/benchmarks", "/.cache", "/docs", "/.github", "/CLAUDE.md", "/deny.toml"]
+
+# docs.rs builds with all features so the `tracing`-gated items are documented.
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+# Emit `tracing` spans/events on the hot paths (selection, posting reads, overlap
+# counting, hydration). Off by default so the core imposes no runtime dependency;
+# a host already running `tracing` flips it on for instrumentation.
+tracing = ["dep:tracing"]
 
 [dependencies]
+# Bundled (statically linked) SQLite for deterministic availability + a single
+# linked sqlite; `array` registers the in-memory carray/rarray vtab used to bind a
+# whole id list to one prepared `WHERE id IN rarray(?1)` statement (batched
+# provenance hydration), avoiding a temp btree on the page-cache mutex.
+rusqlite = { version = "0.37", features = ["bundled", "array"] }
+# The owned inverted index: one base+delta roaring posting per token.
+roaring = "0.11"
+# NFC/NFD normalization so canonically-equivalent forms match (configurable per
+# tokenizer; the default folds to NFC + lowercase).
+unicode-normalization = "0.1"
+thiserror = "2"
+tracing = { version = "0.1", optional = true }
+# SIMD substring search for the default ranker's literal-verification tier: a
+# `memmem::Finder` built once per query, reused across every candidate's text.
+memchr = "2"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+
+[lints]
+workspace = true

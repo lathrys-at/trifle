@@ -1,0 +1,42 @@
+<svg viewBox="0 0 200 220" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="bowl">
+      <path d="M 34,60 C 58,56 142,58 166,61 C 167,97 153,127 128,150 C 116,161 84,160 70,149 C 48,127 34,97 34,60 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- white halo: duplicated silhouette, fat white stroke, traces the form -->
+  <g fill="#FFFFFF" stroke="#FFFFFF" stroke-width="32" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M 34,60 C 58,56 142,58 166,61 C 167,97 153,127 128,150 C 116,161 84,160 70,149 C 48,127 34,97 34,60 Z"/>
+    <path d="M 39,62 C 35,41 58,29 100,29 C 142,29 165,41 161,62 Z"/>
+    <path d="M 93,150 C 92,161 86,165 88,171 C 89,176 93,178 93,187 L 107,187 C 107,178 111,176 112,171 C 114,165 108,161 107,150"/>
+    <path d="M 56,191 C 76,186 124,186 144,191 C 124,197 76,197 56,191 Z"/>
+    <path d="M 101,30 C 104,22 110,18 115,17"/>
+    <circle cx="101" cy="38" r="9"/>
+  </g>
+
+  <!-- art -->
+  <g fill="none" stroke="#2B2B2B" stroke-width="4" stroke-linejoin="round" stroke-linecap="round">
+
+    <!-- foot + stem behind the bowl, so the join tucks under the jelly -->
+    <path d="M 56,191 C 76,186 124,186 144,191 C 124,197 76,197 56,191 Z"/>
+    <path d="M 93,150 C 92,161 86,165 88,171 C 89,176 93,178 93,187 L 107,187 C 107,178 111,176 112,171 C 114,165 108,161 107,150"/>
+
+    <!-- jelly fill + layer line -->
+    <g clip-path="url(#bowl)">
+      <path d="M 12,160 L 188,160 L 188,95 C 165,90 150,100 128,95 C 106,89 86,101 64,95 C 44,90 28,100 12,96 Z" fill="#E25368" stroke="none"/>
+      <path d="M 12,96 C 28,100 44,90 64,95 C 86,101 106,89 128,95 C 150,100 165,90 188,96" stroke-width="3"/>
+    </g>
+
+    <!-- glass bowl -->
+    <path d="M 34,60 C 58,56 142,58 166,61 C 167,97 153,127 128,150 C 116,161 84,160 70,149 C 48,127 34,97 34,60 Z"/>
+
+    <!-- cream -->
+    <path d="M 41,62 C 37,47 51,41 61,47 C 64,34 81,32 89,43 C 95,31 113,33 117,45 C 127,36 147,41 147,53 C 159,51 165,59 159,62 Z" fill="#FFFFFF"/>
+
+    <!-- cherry -->
+    <path d="M 101,30 C 104,22 110,18 115,17" stroke-width="3"/>
+    <circle cx="101" cy="38" r="9" fill="#E25368"/>
+
+  </g>
+</svg>

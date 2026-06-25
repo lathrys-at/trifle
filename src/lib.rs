@@ -202,6 +202,7 @@ pub type ScopeFn<'a> = dyn Fn(i64, &str, &str) -> bool + 'a;
 /// Deeper pool → more hydration + scoring, so latency grows ~linearly with the pool
 /// while recall grows logarithmically. The pool is always at least `limit`.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Effort {
     /// No reranking: return the bit-sliced overlap order (pool = `limit`). Cheapest.
     None,
@@ -258,10 +259,12 @@ impl Effort {
 
 /// Per-search options.
 ///
-/// Construct with [`SearchOpts::new`] and the builder setters, or the public fields.
-/// Most searches only set [`min_shared`](SearchOpts::min_shared) (`m`, the strictness
-/// dial); [`t_max`](SearchOpts::t_max) is the recall axis (how many rarest query tokens
-/// selection keeps).
+/// Construct with [`SearchOpts::new`] and the builder setters, then set any of the public
+/// fields on the returned value. Most searches only set [`min_shared`](SearchOpts::min_shared)
+/// (`m`, the strictness dial); [`t_max`](SearchOpts::t_max) is the recall axis (how many
+/// rarest query tokens selection keeps). `#[non_exhaustive]`: more knobs may be added, so
+/// build from [`new`](SearchOpts::new) rather than a struct literal.
+#[non_exhaustive]
 pub struct SearchOpts<'a> {
     /// Maximum number of matches to return (top-k).
     pub limit: usize,

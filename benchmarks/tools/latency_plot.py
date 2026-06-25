@@ -299,8 +299,9 @@ def plot_latency_grouped(data, ns, corpus, k, path):
     fig.legend(handles=pct_handles, title="percentile (left→right per group)",
                loc="upper right", ncol=3, fontsize=8, title_fontsize=8,
                bbox_to_anchor=(0.995, 0.998))
-    fig.suptitle(f"Search latency by corpus size — {corpus}\n"
-                 f"bar = p50/p90/p99 · annotation: r = recall@{k}, *= max latency",
+    fig.suptitle(f"Search latency by corpus size — {corpus}  (latency: lower is better)\n"
+                 f"bar = p50/p90/p99 · annotation: r = recall@{k} (higher is better), "
+                 f"*= max latency",
                  fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(path, dpi=120)
@@ -334,8 +335,8 @@ def plot_throughput(data, ns, corpus, k, path):
     ax.set_yscale("log")
     ax.set_xlabel("corpus size N (docs, log)")
     ax.set_ylabel("throughput (queries/s, log)")
-    ax.set_title(f"Throughput vs corpus size — {corpus}\n"
-                 f"(recall@{k} annotated above each point)")
+    ax.set_title(f"Throughput vs corpus size — {corpus}  (throughput: higher is better)\n"
+                 f"(recall@{k} — higher is better — annotated above each point)")
     ax.grid(alpha=0.3, which="both")
     ax.legend(title="alternative")
     fig.tight_layout()
@@ -373,8 +374,8 @@ def plot_latency_vs_n(data, ns, corpus, k, path):
         ax.set_title(f"{p} latency vs N")
         ax.grid(alpha=0.3, which="both")
     axes.flat[0].legend(fontsize=8, title="alternative")
-    fig.suptitle(f"Latency scaling with corpus size — {corpus}\n"
-                 f"(recall@{k} annotated above each point)", fontsize=13)
+    fig.suptitle(f"Latency scaling with corpus size — {corpus}  (latency: lower is better)\n"
+                 f"(recall@{k} — higher is better — annotated above each point)", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(path, dpi=120)
     plt.close(fig)

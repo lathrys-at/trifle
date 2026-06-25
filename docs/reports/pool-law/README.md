@@ -63,10 +63,13 @@ distractors counted above `θ` — gives `p* ≈ N · P(S ≥ θ)`, linear in `N
 trigrams co-occur within documents rather than landing independently, which cuts the effective
 number of independent distractors and pulls the growth below that line. The fitted exponent on
 `N` (next sections) is sub-linear, climbs with the recall target, and passes through ≈ ½ across
-the 90–99% band production targets. The symmetric `√(k·N)` (`a = b = ½`) is the form adopted:
-the geometric mean of the pool's two pressures — a floor of `k` results to return, and the
-`N`-driven burial above it — and the parsimonious centre of fitted exponents that are
-individually noisy and anti-correlated.
+the 90–99% band production targets. The symmetric `√(k·N)` (`a = b = ½`) is the form adopted,
+on this mechanism rather than on the fit: it is the geometric mean of the pool's two pressures —
+a floor of `k` results to return, and the `N`-driven burial above it. The fitted exponents are
+consistent with `½` but do not establish it; they are individually noisy and anti-correlated,
+and the log-log R² reported alongside them flatters multiplicative error. The
+honest measure of scatter is the `c` column's p10..p90 spread, and the case for `√(k·N)` rests
+on the mechanism here and the cross-confirmation below, not on any R².
 
 ## Method
 
@@ -78,7 +81,9 @@ individually noisy and anti-correlated.
   spread.
 - `N`-ladder {1k, 5k, 25k, 125k, 625k}; k ∈ {1, 5, 10, 20, 50, 100}.
 - Errors measured in linear space; both the free `k^a·N^b` fit and the symmetric `√(kN)`
-  (`a = b = ½`) are reported. The rationale for the ½ exponent is above.
+  (`a = b = ½`) are reported. `√(kN)` is adopted on the mechanism above — the fitted exponents
+  are consistent with `½` but noisy and anti-correlated, and log-log R² overstates the agreement
+  (the `c` p10..p90 spread is the honest scatter).
 
 ## MS MARCO (prose, sparse): `p* ∝ √(k·N)`
 
@@ -93,7 +98,9 @@ The `N`-exponent grows with the recall target (0.00 → 0.32 → 0.44 → 0.53).
 pool need only hold ~`k` candidates, `N`-independent; the harder-to-recover docs at high
 recall sit deeper in the overlap order as `N` grows, because more distractors accidentally
 out-overlap them. Around the 90–99% targets `a` and `b` settle near ½ each — that is `√(k·N)`.
-`c` rises from 0.04 to 0.48 across the targets.
+`c` rises from 0.04 to 0.48 across the targets. Read the R² as consistency, not proof: a log-log
+fit flatters multiplicative error, so the real scatter is the `c` p10..p90 band — `0.088..0.206`
+at 95%, widening to `0.267..0.751` (a 2–3× spread) at 99%.
 
 ![MS MARCO p* vs N](images/msmarco_pstar_vs_N.png)
 ![MS MARCO collapse](images/msmarco_collapse.png)
@@ -131,24 +138,34 @@ over-provisions the pool — a safe error, costing latency but never recall. Whe
 them diverging on `N`-dependence; in both cases a universal knob sized to the harder regime is
 correct.
 
+The mechanism behind that split is independently confirmed. The Zipf argument predicts that
+prose's thick common-trigram body buries relevant documents deeper as `N` grows; the
+[`t_max` sweep](../tmax-sweep) measures exactly that, as a per-query drop-out "hump" that climbs
+with `N` on prose (`0.018 → 0.148`) and stays flat on structured names (`0.000 → 0.022`) — a
+different statistic, a different sweep, the same physical story. The two-regime model rests on
+that cross-confirmation more than on any single fit.
+
 ## Effort ladder
 
-Shipped constants in `p = max(limit, round(c·√(limit·N)))`, against the MS MARCO calibration —
-the regime where the `√(kN)` form is load-bearing:
+The `Effort` knob sets `c` in `p = max(limit, round(c·√(limit·N)))`. Against the MS MARCO
+calibration — the regime where the `√(kN)` form is load-bearing — each level targets a band of
+the recall ceiling (calibrated `c`):
 
-| Effort | shipped c | ≈ recall ceiling reached (prose) |
+| Effort | c | ≈ recall ceiling (prose) |
 |---|---|---|
 | Low | 0.03 | ~50% |
 | Medium (default) | 0.05 | ~90% |
 | High | 0.10 | ~95% |
-| Max | 0.30 | ~95–97% |
+| Max | 0.45 | ~99% |
 
-The constants are order-right and map sensibly onto recall targets. One caveat: Max (0.30)
-reaches ~95–97% of the ceiling, not a strict 99% — the measured 99% constant is `c ≈ 0.48`
-(and noisy, spread 0.27..0.75), above Max's 0.30. A true 99%-of-ceiling tier would want
-`c ≈ 0.45–0.5`, but the 99% tail is where the fit is weakest and the marginal pool most
-expensive, so stopping Max at 0.30 is defensible. On GeoNames every level over-provisions, so
-the ladder is safe across both regimes.
+Low, Medium, and High are the shipped constants and validate as-is — order-right and mapped
+sensibly onto the 50/90/95% targets. Max is the one rung the calibration revises. As shipped it
+is `c = 0.30`, which reaches only ~95–97% — within a point or two of High at three times the
+pool, so the top rung duplicates High instead of extending past it. The measured 99% constant is
+`c ≈ 0.48` (noisy, 0.27..0.75); setting Max ≈ 0.45 makes it a genuine ~99%-of-ceiling tier,
+distinct from High, at the cost of the deepest, least efficient pool — which is what the
+latency-insensitive caller the tier exists for is asking for. On GeoNames every level
+over-provisions (the law is `N`-independent there), so the change is safe across both regimes.
 
 ![MS MARCO manifold](images/msmarco_manifold.png)
 ![GeoNames manifold](images/geonames_manifold.png)
@@ -158,9 +175,11 @@ the ladder is safe across both regimes.
 The pool depth needed for a recall target scales as `√(k·N)` on prose/sparse corpora and as
 `k` alone on structured/dense ones. A single `√(k·N)` knob is therefore correctly shaped: it
 is doing real work where the law is `√(k·N)`, and over-provisions safely where the law is `k`.
-The shipped `Effort` constants — Low 0.03, Medium 0.05, High 0.10, Max 0.30 — track the
-50/90/95/95–97% recall targets and need no change, with the one documented limit that Max
-falls short of a strict 99%.
+The `Effort` constants Low 0.03, Medium 0.05, and High 0.10 track the 50/90/95% recall-of-ceiling
+targets and validate as-is. The calibration calls for one adjustment: Max, at the shipped 0.30,
+reaches only ~95–97% and nearly duplicates High at three times the pool; raising it to
+`c ≈ 0.45` makes it a genuine ~99% tier (the measured 99% constant is ~0.48), distinct from High
+and matched to the latency-insensitive caller it exists for.
 
 ## Reproduce
 

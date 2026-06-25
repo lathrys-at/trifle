@@ -86,11 +86,15 @@ Recall@50 at the production pool, floor (`t=6`) vs the best `t_max`:
 | 625k | +0.038 (14) @1.8× | **+0.173 (12) @2.8×** |
 | 1M | +0.067 (10) @1.4× | +0.224 (14) @4.2× (sub-ms) |
 
-A cap above the floor is materially valuable, and the value grows with `N` — steeply on
-GeoNames, reaching +0.17 recall@50 at 625k and +0.22 at 1M. The best `t_max` is a small fixed
-cap (~8–16), and the latency cost is modest (1–4×, sub-millisecond in absolute terms for
-GeoNames). The production pool is what exposes this: at the generous pool the relevant doc is
-already pooled, so `t_max` looks marginal (~2 points) at a misleading 12–26× latency.
+A cap above the floor is the largest single recall effect in either report, and it grows
+steeply with `N`: on GeoNames the gain reaches +0.17 recall@50 at 625k and +0.22 at 1M. What
+does *not* grow is the location of the optimum. The best `t_max` holds at a small fixed cap
+(~8–16) across both regimes and every `N`; what scales with the corpus is the payoff for
+sitting there, not where it sits. The latency cost is modest (1–4×, sub-millisecond in absolute
+terms for GeoNames). The production pool is what exposes the value: at the generous pool the
+relevant doc is already pooled, so `t_max` looks marginal (~2 points) at a misleading 12–26×
+latency. The cap earns its keep only once the pool is small enough to exclude the doc it would
+otherwise admit.
 
 ![Above-floor gain vs N](images/qvalue_vs_N.png)
 
@@ -106,9 +110,16 @@ grows with `N` on prose and stays near zero on structured names:
 
 Prose's trigram frequencies are Zipfian with a thick body of common, high-`DF` trigrams;
 raising `t_max` past the rare anchors reaches into that body and injects accidental overlap
-that demotes the true doc — a cost that grows with `N` (the [pool-depth report](../pool-law)
-derives the Zipf mechanism). Structured names have a sparser body and few such collisions.
-Both regimes point the same way: a cap above the optimum only loses recall.
+that demotes the true doc — a cost that grows with `N`. Structured names have a sparser body
+and few such collisions. Both regimes point the same way: a cap above the optimum only loses
+recall.
+
+The hump is also independent corroboration of the pool-depth model. The
+[pool-depth report](../pool-law) derives from Zipf's law that prose's thick common-trigram body
+should bury relevant documents deeper as `N` grows; the hump measures exactly that burial, but
+through an unrelated statistic (per-query drop-out) and a separate sweep. One physical story,
+derived in one report and confirmed by a different measurement in the other — the two-regime
+split is cross-validated, not two independent fits.
 
 ![Recall ceiling vs t_max, MS MARCO](images/ceiling_msmarco.png)
 ![Recall ceiling vs t_max, GeoNames](images/ceiling_geonames.png)
@@ -124,6 +135,16 @@ distribution:
 |---|---|---|---|---|---|
 | MS MARCO | 0.992 | 0.966 | 0.904 | 0.802 | 0.770 |
 | GeoNames | 0.856 | 0.820 | 0.813 | 0.761 | 0.737 |
+
+GeoNames starts *below* MS MARCO at small `N` (0.856 vs 0.992 at 1k) — the dense corpus
+recovers worse where the task should be easiest. The cause is query construction, not the
+index. GeoNames queries are short names with two injected edits, and two edits corrupt a far
+larger *fraction* of a short name's trigrams than of a long passage: a 6-character name carries
+~4 trigrams, of which two edits can damage most, whereas the same two edits touch a handful of
+a passage's dozens. For a baseline ~14% of GeoNames queries the surviving rare-trigram signature
+is too degraded to recover at any `t_max` (or it now resolves to a different real name), so they
+are unrecoverable independent of `N`. MS MARCO's queries are real paraphrases, almost all
+recoverable at 1k. The gap is a property of edit injection on short strings.
 
 ## Two regimes
 
@@ -141,19 +162,34 @@ aggregation artifact; the per-query knee removes it.
 
 ## Conclusion
 
+`t_max` is a high-value parameter — its above-floor gain is the largest single recall effect in
+either report, and it grows steeply with `N` (up to +0.22 recall@50 at 1M on GeoNames). What is
+`N`-invariant is not that value but the *location* of the optimum: the best cap holds at a small
+fixed point (~8–16) across both regimes and every `N`, even as the payoff for being there grows
+with the corpus.
+
+That distinction corrects an easy misread. Through the median knee (floor in every cell) or the
+generous pool (where the doc is already pooled and the cap looks worth ~2 points), `t_max` looks
+nearly inert. It is not — the location is inert, the value is not — and the value shows at the
+production pool, the shipped cost, where `t_max` decides whether the relevant doc reaches the
+small pool at all.
+
 | question | finding | implication |
 |---|---|---|
 | length | real but < 1 `t_max` across the length range | no length-scaled `t_max` |
 | drift with `N` | median knee = floor at every `N` to 1M | no `t_max(N)` rule |
-| value | material at a fixed small cap (~8–16), grows with `N` | a fixed small `t_max` earns its cost |
-| effort coupling | dropping to the floor costs up to +0.17 recall (GeoNames 625k) | effort must not lower it |
+| value | large and `N`-growing (up to +0.22 at 1M, dense) | a fixed cap captures it without per-`N` tuning |
+| effort coupling | dropping to the floor costs up to +0.17–0.22 recall (GeoNames) | effort must not lower it |
 
-A single fixed `t_max = 12` satisfies all four. It sits between the regime optima (MS MARCO
-~10–16, GeoNames ~7–14), captures almost all of GeoNames' at-scale value, stays within ~1
-recall point of the MS MARCO optimum, and falls below where the prose hump bites. The median
-query is already recovered at the floor, so the cap serves the hard tail and the small
-production pool without demoting the median. No per-length, per-`N`, or per-effort coupling is
-warranted. This coincides with the configured default of 12.
+A single fixed `t_max = 12` captures this. It sits at or above the regime optima at every `N`
+(MS MARCO ~10–16, GeoNames ~7–14), so it takes the large dense-regime gain nearly in full,
+stays within ~1 recall point of the MS MARCO optimum, and falls below where the prose hump
+bites — with no per-length or per-`N` rule. The large value lives in the dense, structured
+regime, which is closer to trifle's design target (large corpora of short, structured segments)
+than MS MARCO's prose passages: this is recall bought in the regime trifle ships into, not an
+academic corner. Lowering the cap toward the floor under a low `Effort` would forfeit up to
++0.17–0.22 of it, so `Effort` must not touch `t_max`. The value coincides with the configured
+default of 12.
 
 ## Reproduce
 

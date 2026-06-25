@@ -274,8 +274,8 @@ mod tests {
             "low,medium,high".to_string(),
         ];
         assert_eq!(
-            artifact_stem("perf", &args),
-            "perf-corpusmsmarco-docs5000-effort-sweeplow_medium_high"
+            artifact_stem("eval", &args),
+            "eval-corpusmsmarco-docs5000-effort-sweeplow_medium_high"
         );
     }
 

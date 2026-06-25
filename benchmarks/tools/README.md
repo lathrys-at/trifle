@@ -191,12 +191,12 @@ cached (`cargo run -p trifle-benchmarks --release -- fetch --corpus relevance`).
 
 ---
 
-# Latency + recall plots (the `perf` profile)
+# Latency + recall plots (the `eval` profile)
 
-`latency_plot.py` sweeps the **`perf`** benchmark across a corpus-size ladder and renders the
+`latency_plot.py` sweeps the **`eval`** benchmark across a corpus-size ladder and renders the
 combined **speed + quality** story: how trifle's p50/p90/p99, throughput, AND recall@k compare
 to the in-process SQLite baselines, and how they scale with `N`. It is the analysis half; the
-measurement half is the `perf` subcommand with `--format json`.
+measurement half is the `eval` subcommand with `--format json`.
 
 ```
 python3 benchmarks/tools/latency_plot.py --queries 100 --seed 42            # msmarco (paraphrase)
@@ -204,12 +204,12 @@ python3 benchmarks/tools/latency_plot.py --corpus geonames-all --edits 2    # ge
 python3 benchmarks/tools/latency_plot.py --reuse-raw                        # re-plot, no re-run
 ```
 
-## Why `perf`, not `latency`
+## Why `eval`, not `latency`
 
 The `latency` profile times in-corpus snippet queries against FTS5 **phrase**-MATCH — a fine
 *speed* comparison, but a recall number there would be a lie: phrase-MATCH scores ~0 on any
 typo'd query (the trigrams aren't contiguous), so it would only ever "find" the zero-typo
-queries. `perf` is the honest recall eval — it uses the recall-eval query regimes and scores
+queries. `eval` is the honest recall eval — it uses the recall-eval query regimes and scores
 FTS5 via the **OR-bag `MATCH`** (the fair fuzzy/relevance baseline), so every engine's recall
 is meaningful. Two regimes (`--corpus`):
 
@@ -235,19 +235,19 @@ candidates that aren't real alternatives:
   huge slice of *prose* (~seconds/query at millions of docs) but stays fast on *short entity
   names*, so the typo regimes run it at every `N`.
 
-`perf` itself still measures whatever you don't `--filter`; the selection lives in the plotter,
+`eval` itself still measures whatever you don't `--filter`; the selection lives in the plotter,
 so the underlying eval stays general.
 
-## The measurement seam (`perf --format json`)
+## The measurement seam (`eval --format json`)
 
-`perf` measures, for the *same* labeled queries, every engine — and trifle at every **effort**
+`eval` measures, for the *same* labeled queries, every engine — and trifle at every **effort**
 in `--effort-sweep` (e.g. `low,medium,high`) from a **single index build** (effort is a
 per-search pool-depth knob, not an index property). With `--format json` it emits one
 machine-readable object per invocation:
 
 ```jsonc
 {
-  "command": "perf", "corpus": "msmarco", "docs": 25000, "queries": 100,
+  "command": "eval", "corpus": "msmarco", "docs": 25000, "queries": 100,
   "scored_queries": 100, "k": 10, "seed": 42, "mode": "serial",
   "conditions": { "git_commit": "...", "rustc": "...", "arch": "...", "profile": "release", "cpus": 10 },
   "records": [
@@ -292,7 +292,7 @@ python3 benchmarks/tools/latency_plot.py [options]
   --warmup N    untimed warmup queries                                [100]
   --max-like-n  drop like-scan above this N (O(N) scan impractical)    [625000]
   --max-tri-n   drop fts5-trigram-bm25 above this N (OR-bag MATCH ~seconds/query)  [625000]
-  --out DIR     output directory                          [benchmarks/reports/perf-<corpus>]
+  --out DIR     output directory                          [benchmarks/reports/eval-<corpus>]
   --reuse-raw   re-plot from <out>/raw.json (skip the benchmark)
 ```
 
@@ -308,11 +308,11 @@ GeoNames regenerates daily, so the pinned sha may need re-pinning per the manife
 ## Profiling a run (`--instrument`)
 
 To see *where* a run spends its time (not just how much), both timed profiles (`latency` and
-`perf`) can re-exec themselves under a Rust-friendly **sampling profiler** — a hook modeled on
+`eval`) can re-exec themselves under a Rust-friendly **sampling profiler** — a hook modeled on
 shrike's benchmark driver, but with Rust-only instrumenters:
 
 ```
-cargo run -p trifle-benchmarks --release -- perf --corpus msmarco --docs 125000 \
+cargo run -p trifle-benchmarks --release -- eval --corpus msmarco --docs 125000 \
     --instrument xctrace          # Instruments' Time Profiler (macOS) → a .trace bundle
     # or: --instrument samply      # cross-platform → Firefox-profiler JSON (samply load …)
 ```

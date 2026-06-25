@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Sweep trifle's `perf` benchmark across a corpus-size ladder and plot speed + recall.
+"""Sweep trifle's `eval` benchmark across a corpus-size ladder and plot speed + recall.
 
-This is the analysis half of the speed+quality eval; the measurement half is the `perf`
+This is the analysis half of the speed+quality eval; the measurement half is the `eval`
 subcommand of `trifle-benchmarks` with `--format json` (which this script drives). For each
-index size `N` it runs one `perf` invocation that measures trifle at several rerank
+index size `N` it runs one `eval` invocation that measures trifle at several rerank
 **efforts** (Low/Medium/High) from a single index build, alongside the in-process SQLite
 baselines, on *labeled* queries — emitting per (engine, effort) the p50/p90/p99/max latency,
 throughput, **honest recall@k**, AND the raw per-query samples.
@@ -76,7 +76,7 @@ SERIES = {
 SERIES_ORDER = list(SERIES.keys())
 
 # Engines never shown: LIKE scan is unsuited to BOTH tasks — substring match can do neither
-# paraphrase nor typos (recall ~0.01–0.03), so it only adds noise. (`perf` can still measure
+# paraphrase nor typos (recall ~0.01–0.03), so it only adds noise. (`eval` can still measure
 # it; the plotter just never displays it.)
 DROP_ALWAYS = {"like-scan"}
 # Engines shown only for the paraphrase regime: FTS5-WORD BM25 is the canonical BM25 baseline
@@ -119,10 +119,10 @@ def recall_str(v, prec=2):
     return f"{v:.{prec}f}" if v is not None else "—"
 
 
-# ---- measurement: drive the perf subcommand ---------------------------------------------
+# ---- measurement: drive the eval subcommand ---------------------------------------------
 def run_one(corpus, n, queries, k, seed, efforts, edits, warmup, max_tri_n):
-    """Run one `perf --format json` invocation for index size `n`; return its parsed JSON
-    object. `perf` measures latency + throughput + honest recall@k on labeled queries (real
+    """Run one `eval --format json` invocation for index size `n`; return its parsed JSON
+    object. `eval` measures latency + throughput + honest recall@k on labeled queries (real
     MS MARCO dev queries for msmarco; entity/snippet + `edits` typos otherwise), scoring FTS5
     via the fair OR-bag MATCH.
 
@@ -139,7 +139,7 @@ def run_one(corpus, n, queries, k, seed, efforts, edits, warmup, max_tri_n):
     is_paraphrase = corpus == "msmarco"
     cmd = [
         "cargo", "run", "-q", "-p", "trifle-benchmarks", "--release", "--",
-        "perf", "--corpus", corpus, "--docs", str(n), "--queries", str(queries),
+        "eval", "--corpus", corpus, "--docs", str(n), "--queries", str(queries),
         "--k", str(k), "--seed", str(seed), "--effort-sweep", efforts,
         "--edits", str(edits), "--warmup", str(warmup), "--format", "json",
     ]
@@ -150,12 +150,12 @@ def run_one(corpus, n, queries, k, seed, efforts, edits, warmup, max_tri_n):
         filters.append("fts5-trigram-bm25")  # prose OR-bag explodes at scale
     for f in filters:
         cmd += ["--filter", f]
-    print(f"  perf N={n:,} (corpus={corpus}, efforts={efforts}) — filtered: {', '.join(filters)}",
+    print(f"  eval N={n:,} (corpus={corpus}, efforts={efforts}) — filtered: {', '.join(filters)}",
           file=sys.stderr, flush=True)
     cp = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
     if cp.returncode != 0:
         sys.stderr.write(cp.stderr[-4000:])
-        raise SystemExit(f"perf failed for N={n} (corpus={corpus})")
+        raise SystemExit(f"eval failed for N={n} (corpus={corpus})")
     # stdout is exactly one JSON object (the `#` human header is suppressed in json mode).
     out = cp.stdout.strip()
     try:
@@ -185,7 +185,7 @@ def run_sweep(args, out):
             print(f"  !! N={n:,} FAILED ({e}); skipping and continuing", file=sys.stderr)
             failed.append(n)
             continue
-        (raw_dir / f"perf-{args.corpus}-N{n}.json").write_text(json.dumps(obj, indent=2))
+        (raw_dir / f"eval-{args.corpus}-N{n}.json").write_text(json.dumps(obj, indent=2))
         raw[n] = obj
         # Rewrite the combined file after every N so a crash mid-sweep keeps what we have.
         (out / "raw.json").write_text(
@@ -401,12 +401,12 @@ def main():
                     help="msmarco only: drop fts5-trigram-bm25 above this N (prose OR-bag MATCH "
                          "~seconds/query). The typo regimes run it at every N (short names "
                          "stay fast). [625000]")
-    ap.add_argument("--out", default=None, help="output dir [benchmarks/reports/perf-<corpus>]")
+    ap.add_argument("--out", default=None, help="output dir [benchmarks/reports/eval-<corpus>]")
     ap.add_argument("--reuse-raw", action="store_true",
                     help="reuse <out>/raw.json (skip the benchmark, just re-plot)")
     args = ap.parse_args()
 
-    out = Path(args.out or REPO / "benchmarks" / "reports" / f"perf-{args.corpus}")
+    out = Path(args.out or REPO / "benchmarks" / "reports" / f"eval-{args.corpus}")
     out.mkdir(parents=True, exist_ok=True)
 
     if args.reuse_raw:

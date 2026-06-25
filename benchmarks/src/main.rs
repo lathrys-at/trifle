@@ -62,7 +62,7 @@ fn main() -> ExitCode {
     };
     let result = match command.as_str() {
         "latency" => cmd_latency(rest),
-        "perf" => cmd_perf(rest),
+        "eval" => cmd_eval(rest),
         "relevance" => cmd_relevance(rest),
         "fuzzy" => cmd_fuzzy(rest),
         "profile" => cmd_profile(rest),
@@ -92,7 +92,7 @@ USAGE:
 
 COMMANDS:
     latency    Search latency + throughput, trifle vs in-process baselines
-    perf       Latency + throughput + recall@k on labeled queries (fair FTS5 MATCH);
+    eval       Latency + throughput + recall@k on labeled queries (fair FTS5 MATCH);
                the plotting-harness backend (msmarco real queries or geonames typos)
     relevance  MS MARCO real dev queries+qrels: set-recall@k vs word BM25 (+trigram)
     fuzzy      Entity name+edit recall vs FTS5 trigram-MATCH / LIKE, per edit-count
@@ -173,18 +173,18 @@ EXAMPLES:
     trifle-bench latency --docs 100000 --queries 5000 --seed 42
     trifle-bench latency --docs 2000000 --filter like-scan
     trifle-bench latency --corpus msmarco --docs 25000 --instrument xctrace
-    trifle-bench perf --corpus msmarco --docs 25000 --queries 500 \\
+    trifle-bench eval --corpus msmarco --docs 25000 --queries 500 \\
         --effort-sweep low,medium,high --format json
-    trifle-bench perf --corpus geonames-all --docs 125000 --edits 2 --effort-sweep low,medium,high
+    trifle-bench eval --corpus geonames-all --docs 125000 --edits 2 --effort-sweep low,medium,high
     trifle-bench relevance --docs 100000 --queries 2000
     trifle-bench fuzzy --corpus geonames-cities --edits 1
     trifle-bench profile --docs 1000000
 
 POST-PROCESSING:
-    The `perf` JSON drives the matplotlib harness in tools/latency_plot.py, which sweeps the
+    The `eval` JSON drives the matplotlib harness in tools/latency_plot.py, which sweeps the
     corpus-size ladder and renders the grouped p50/p90/p99 chart (recall@k + *max annotated)
     + throughput-vs-N plot. `latency` is the pure-speed profile (trifle-only self-recall);
-    `perf` is the fair speed+recall eval. See benchmarks/tools/README.md.
+    `eval` is the fair speed+recall eval. See benchmarks/tools/README.md.
 ";
 
 // ----- argument parsing -------------------------------------------------------
@@ -381,7 +381,7 @@ fn skipped_engines(flags: &Flags) -> Result<HashSet<String>, String> {
     Ok(skip)
 }
 
-/// The instrumentation re-exec seam shared by the timed profiles (`latency`, `perf`).
+/// The instrumentation re-exec seam shared by the timed profiles (`latency`, `eval`).
 /// Returns `Ok(true)` if it re-exec'd the run under a profiler (the caller should stop),
 /// `Ok(false)` to run the benchmark normally. The env guard keeps the profiled child from
 /// re-instrumenting.
@@ -579,7 +579,7 @@ struct Bench<'a> {
 /// order (serial mode); it is empty in batched mode, which times the whole set as one call.
 /// `recall` is `None` when not computed for this engine (the `latency` profile reports it
 /// for trifle only — the snippet queries make the baselines' phrase-MATCH recall a lie;
-/// the `perf` profile computes it for every engine against a fair MATCH).
+/// the `eval` profile computes it for every engine against a fair MATCH).
 struct Record {
     engine: String,
     effort: Option<String>,
@@ -591,7 +591,7 @@ struct Record {
 /// Build, then measure, each non-filtered engine for the **`latency`** profile: trifle
 /// (effort sweep, with trifle-only recall) plus the FTS5-phrase and LIKE speed baselines
 /// (no recall — phrase-MATCH on the typo'd snippet queries scores ~0 by construction, so a
-/// recall number there would misrepresent FTS5; the `perf` profile is the fair recall eval).
+/// recall number there would misrepresent FTS5; the `eval` profile is the fair recall eval).
 fn measure_engines(
     corpus: &Corpus,
     bench: &Bench,
@@ -755,7 +755,7 @@ fn bench_concurrent(
 }
 
 /// The `# …`-prefixed header for the human (text) output of a timed profile (`latency` or
-/// `perf`). Only the metadata each profile actually carries is printed.
+/// `eval`). Only the metadata each profile actually carries is printed.
 fn print_run_header(meta: &RunMeta, skip: &HashSet<String>) {
     println!("# {} — {}", meta.command, meta.provenance);
     let mut line = format!("# docs={} queries={}", meta.docs, meta.queries);
@@ -815,8 +815,8 @@ fn render_run_text(bench: &Bench, records: &[Record]) {
 }
 
 /// Run metadata carried into the human header and the machine-readable JSON. Shared by the
-/// `latency` and `perf` profiles; the `Option` fields are those only one profile sets
-/// (`mix` = `latency`'s 0/1/2 typo split; `edits`/`scored_queries` = `perf`'s labeled regime).
+/// `latency` and `eval` profiles; the `Option` fields are those only one profile sets
+/// (`mix` = `latency`'s 0/1/2 typo split; `edits`/`scored_queries` = `eval`'s labeled regime).
 struct RunMeta<'a> {
     command: &'a str,
     corpus: &'a str,
@@ -903,7 +903,7 @@ struct RunJson<'a> {
 }
 
 /// Emit the whole run as one compact JSON object on stdout (no `#` lines), for the plotting
-/// harness to capture and persist. Shared by `latency` and `perf`.
+/// harness to capture and persist. Shared by `latency` and `eval`.
 fn render_run_json(meta: &RunMeta, records: &[Record]) {
     let records: Vec<RecordJson> = records
         .iter()
@@ -985,12 +985,12 @@ fn cmd_capture(prog: &str, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-// ----- perf (latency + throughput + recall on labeled queries) ----------------
+// ----- eval (latency + throughput + recall on labeled queries) ----------------
 
 /// The combined **speed + quality** profile: latency, throughput, AND honest recall@k on
 /// *labeled* queries, across the effort sweep, for the plotting harness. Unlike `latency`
 /// (in-corpus snippets, FTS5 phrase-MATCH — a speed comparison where a recall number would
-/// misrepresent FTS5), `perf` uses the recall-eval regimes and the **fair** FTS5 OR-bag
+/// misrepresent FTS5), `eval` uses the recall-eval regimes and the **fair** FTS5 OR-bag
 /// `MATCH`:
 ///
 /// - `--corpus msmarco` (default): real MS MARCO dev queries scored against qrels, no
@@ -999,7 +999,7 @@ fn cmd_capture(prog: &str, args: &[&str]) -> Option<String> {
 /// - `--corpus geonames-all | geonames-cities`: entity name + `--edits` typos — the *real*
 ///   typo regime. Baselines: FTS5-trigram OR-bag + LIKE floor.
 /// - `--corpus synthetic`: in-corpus snippet + `--edits` typos.
-fn cmd_perf(args: &[String]) -> Result<(), String> {
+fn cmd_eval(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args, &[])?;
     flags.reject_unknown(&[
         "corpus",
@@ -1020,7 +1020,7 @@ fn cmd_perf(args: &[String]) -> Result<(), String> {
         "instrument-out",
     ])?;
 
-    if maybe_instrument(&flags, args, "perf")? {
+    if maybe_instrument(&flags, args, "eval")? {
         return Ok(());
     }
 
@@ -1057,7 +1057,7 @@ fn cmd_perf(args: &[String]) -> Result<(), String> {
     let edits_meta = (which != "msmarco").then_some(edits);
 
     let meta = RunMeta {
-        command: "perf",
+        command: "eval",
         corpus: &which,
         provenance: &corpus.provenance,
         docs: corpus.docs.len(),
@@ -1081,7 +1081,7 @@ fn cmd_perf(args: &[String]) -> Result<(), String> {
         batched: false,
     };
 
-    let records = perf_measure_engines(&corpus, &bench, &efforts, &skip, tuning);
+    let records = eval_measure_engines(&corpus, &bench, &efforts, &skip, tuning);
 
     if json_mode {
         render_run_json(&meta, &records);
@@ -1095,10 +1095,10 @@ fn cmd_perf(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Build + measure each non-filtered engine for the `perf` profile — recall for *every*
+/// Build + measure each non-filtered engine for the `eval` profile — recall for *every*
 /// engine, against the fair MATCH: trifle (effort sweep) + FTS5-word BM25 + FTS5-trigram via
 /// the OR-bag `MATCH` ([`MatchMode::TrigramOr`], NOT phrase) + the LIKE floor.
-fn perf_measure_engines(
+fn eval_measure_engines(
     corpus: &Corpus,
     bench: &Bench,
     efforts: &[(String, Effort)],

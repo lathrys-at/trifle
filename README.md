@@ -5,7 +5,8 @@
 [![crates.io](https://img.shields.io/crates/v/trifle.svg)](https://crates.io/crates/trifle)
 [![docs.rs](https://img.shields.io/docsrs/trifle)](https://docs.rs/trifle)
 [![MSRV](https://img.shields.io/crates/msrv/trifle)](https://crates.io/crates/trifle)
-[![License](https://img.shields.io/crates/l/trifle)](#license)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE-APACHE)
 
 Trifle is an embedded, typo-tolerant fuzzy search engine for Rust, backed by SQLite
 and tuned for large corpora of mostly small document segments with read-often and

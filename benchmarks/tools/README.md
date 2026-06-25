@@ -214,10 +214,29 @@ FTS5 via the **OR-bag `MATCH`** (the fair fuzzy/relevance baseline), so every en
 is meaningful. Two regimes (`--corpus`):
 
 - **msmarco** — real MS MARCO dev queries + qrels, no typos (the paraphrase regime, where the
-  effort ladder genuinely moves recall). Baselines: FTS5-word BM25, FTS5-trigram OR-bag, LIKE.
+  effort ladder genuinely moves recall). Baselines: FTS5-word BM25 (canonical) + FTS5-trigram
+  OR-bag.
 - **geonames-all / geonames-cities** — entity name + `--edits` typos (the *real* typo regime,
-  where recall measures typo tolerance). Baselines: FTS5-trigram OR-bag, LIKE — and FTS5-word
-  BM25, which collapses on typos (a useful contrast).
+  where recall measures typo tolerance). Baseline: FTS5-trigram OR-bag.
+
+### Engine selection per regime (methodology)
+
+The plotter shows only the baselines *suited to the task* — it filters the rest from the run
+*and*, via `tidy`, from any `--reuse-raw` of older data — so the graphs aren't cluttered with
+candidates that aren't real alternatives:
+
+- **LIKE scan is dropped from both.** Substring match can do neither paraphrase nor typos
+  (recall ≈ 0.01–0.03); pure noise on these graphs.
+- **FTS5-word BM25 is shown for msmarco only.** On real prose queries it is *the* canonical
+  BM25 baseline; on the typo regimes exact word matching isn't typo-tolerant (it collapses to
+  ~0.2–0.3 recall), so it isn't a fair candidate — the harness's own `fuzzy` eval omits it for
+  the same reason.
+- **FTS5-trigram OR-bag is capped above `--max-tri-n` on msmarco only.** Its OR-bag matches a
+  huge slice of *prose* (~seconds/query at millions of docs) but stays fast on *short entity
+  names*, so the typo regimes run it at every `N`.
+
+`perf` itself still measures whatever you don't `--filter`; the selection lives in the plotter,
+so the underlying eval stays general.
 
 ## The measurement seam (`perf --format json`)
 

@@ -8,12 +8,14 @@ index size `N` it runs one `perf` invocation that measures trifle at several rer
 baselines, on *labeled* queries — emitting per (engine, effort) the p50/p90/p99/max latency,
 throughput, **honest recall@k**, AND the raw per-query samples.
 
-Two query regimes (`--corpus`):
+Two query regimes (`--corpus`), each with the SQLite baselines suited to the task:
   - **msmarco** (default): real MS MARCO dev queries scored against qrels (no typos) — the
-    paraphrase regime. Baselines: FTS5-word BM25, FTS5-trigram OR-bag, LIKE.
+    paraphrase regime. Baselines: FTS5-word BM25 (canonical) + FTS5-trigram OR-bag.
   - **geonames-all / geonames-cities**: entity name + `--edits` typos — the *real* typo
-    regime, where recall measures typo tolerance. Baselines: FTS5-trigram OR-bag, LIKE.
-FTS5 is scored via the OR-bag `MATCH` (not phrase), so the baseline recall is fair.
+    regime, where recall measures typo tolerance. Baseline: FTS5-trigram OR-bag (word-BM25 is
+    omitted — exact word matching isn't typo-tolerant, so it isn't a fair candidate).
+FTS5 is scored via the OR-bag `MATCH` (not phrase), so the baseline recall is fair. LIKE scan
+is omitted from both — substring match can do neither paraphrase nor typos (recall ≈ 0).
 
 It renders two figures:
 
@@ -61,20 +63,31 @@ DEFAULT_DOCS = "1000,5000,25000,125000,625000,3125000"
 
 # Series identity → (display label, color). A series key is `engine/effort` for trifle and
 # the bare engine name for the baselines (which have no effort knob). trifle's three efforts
-# get a green family (light→dark = Low→High); the baselines get distinct hues.
+# get a wide-spread green ramp (light→dark = Low→High, so the policies are easy to tell
+# apart); the SQLite baselines get red (word BM25) and yellow (trigram OR-bag).
 SERIES = {
-    "trifle/low": ("trifle (Low)", "#74c476"),
-    "trifle/medium": ("trifle (Medium)", "#31a354"),
-    "trifle/high": ("trifle (High)", "#006d2c"),
-    "fts5-word-bm25": ("FTS5 word (BM25)", "#756bb1"),
-    "fts5-trigram-bm25": ("FTS5 trigram (BM25)", "#e6550d"),
-    "like-scan": ("LIKE scan", "#3182bd"),
+    "trifle/low": ("trifle (Low)", "#addd8e"),
+    "trifle/medium": ("trifle (Medium)", "#41ab5d"),
+    "trifle/high": ("trifle (High)", "#005a32"),
+    "fts5-word-bm25": ("FTS5 word (BM25)", "#e31a1c"),
+    "fts5-trigram-bm25": ("FTS5 trigram (BM25)", "#f0c000"),
 }
 # A stable plotting order (left→right within a panel, top→bottom in legends).
 SERIES_ORDER = list(SERIES.keys())
 
-# Percentile bars within a group: (field-stem, alpha). Heights are monotone p50≤p90≤p99.
-PCTS = [("p50", 1.0), ("p90", 0.68), ("p99", 0.42)]
+# Engines never shown: LIKE scan is unsuited to BOTH tasks — substring match can do neither
+# paraphrase nor typos (recall ~0.01–0.03), so it only adds noise. (`perf` can still measure
+# it; the plotter just never displays it.)
+DROP_ALWAYS = {"like-scan"}
+# Engines shown only for the paraphrase regime: FTS5-WORD BM25 is the canonical BM25 baseline
+# on real prose queries, but on the typo regimes exact word matching isn't typo-tolerant (it
+# collapses to ~0.2–0.3 recall), so it's not a meaningful candidate there — mirroring the
+# harness's own `fuzzy` eval, which omits word-BM25.
+PARAPHRASE_ONLY = {"fts5-word-bm25"}
+
+# Percentile bars within a group: (field-stem, alpha). Heights are monotone p50≤p90≤p99;
+# the gentle alpha step (not a steep one) keeps even the light-green Low series legible.
+PCTS = [("p50", 1.0), ("p90", 0.8), ("p99", 0.6)]
 
 
 def series_key(rec):
@@ -100,36 +113,49 @@ def fmt_latency(ns):
     return f"{ns / 1_000_000:.2f}ms"
 
 
+def recall_str(v, prec=2):
+    """A recall value as text, or `—` when absent (a record with no recall, e.g. a `latency`
+    baseline that someone re-plots)."""
+    return f"{v:.{prec}f}" if v is not None else "—"
+
+
 # ---- measurement: drive the perf subcommand ---------------------------------------------
-def run_one(corpus, n, queries, k, seed, efforts, edits, warmup, max_like_n, max_tri_n):
+def run_one(corpus, n, queries, k, seed, efforts, edits, warmup, max_tri_n):
     """Run one `perf --format json` invocation for index size `n`; return its parsed JSON
     object. `perf` measures latency + throughput + honest recall@k on labeled queries (real
     MS MARCO dev queries for msmarco; entity/snippet + `edits` typos otherwise), scoring FTS5
     via the fair OR-bag MATCH.
 
-    The two genuinely-impractical-at-scale baselines are dropped above their thresholds
-    (logged, never silent): `like-scan` (an O(N) full scan/query) above `max_like_n`, and
-    `fts5-trigram-bm25` (the OR-bag MATCH explodes to ~seconds/query at millions of docs)
-    above `max_tri_n`. trifle and `fts5-word-bm25` run at every N."""
+    Engine selection (the plotter never displays these anyway — see `tidy` — but filtering
+    them here also saves the measurement):
+      - `like-scan` is always dropped: unsuited to both tasks (substring ≈ 0 recall).
+      - on the **typo** regimes (geonames/synthetic) `fts5-word-bm25` is dropped: exact word
+        matching isn't typo-tolerant, so it isn't a fair candidate (the `fuzzy` eval omits it
+        too). On **msmarco** it's the canonical BM25 baseline and runs at every N.
+      - `fts5-trigram-bm25` (OR-bag MATCH) is capped above `max_tri_n` on **msmarco only**:
+        on prose its OR-bag matches a huge slice of the corpus (~seconds/query at millions of
+        docs). On short entity names it stays fast, so the typo regimes run it at every N.
+    Every filter is logged, never silent."""
+    is_paraphrase = corpus == "msmarco"
     cmd = [
         "cargo", "run", "-q", "-p", "trifle-benchmarks", "--release", "--",
         "perf", "--corpus", corpus, "--docs", str(n), "--queries", str(queries),
         "--k", str(k), "--seed", str(seed), "--effort-sweep", efforts,
         "--edits", str(edits), "--warmup", str(warmup), "--format", "json",
     ]
-    if n > max_like_n:
-        cmd += ["--filter", "like-scan"]
-        print(f"  N={n:,}: like-scan filtered (N > --max-like-n {max_like_n:,}; O(N) scan)",
-              file=sys.stderr)
-    if n > max_tri_n:
-        cmd += ["--filter", "fts5-trigram-bm25"]
-        print(f"  N={n:,}: fts5-trigram-bm25 filtered (N > --max-tri-n {max_tri_n:,}; "
-              f"OR-bag MATCH ~seconds/query)", file=sys.stderr)
-    print(f"  perf N={n:,} (corpus={corpus}, efforts={efforts}) ...", file=sys.stderr, flush=True)
+    filters = ["like-scan"]  # always: unsuited to both tasks
+    if not is_paraphrase:
+        filters.append("fts5-word-bm25")  # word match isn't typo-tolerant
+    elif n > max_tri_n:
+        filters.append("fts5-trigram-bm25")  # prose OR-bag explodes at scale
+    for f in filters:
+        cmd += ["--filter", f]
+    print(f"  perf N={n:,} (corpus={corpus}, efforts={efforts}) — filtered: {', '.join(filters)}",
+          file=sys.stderr, flush=True)
     cp = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
     if cp.returncode != 0:
         sys.stderr.write(cp.stderr[-4000:])
-        raise SystemExit(f"latency failed for N={n} (corpus={corpus})")
+        raise SystemExit(f"perf failed for N={n} (corpus={corpus})")
     # stdout is exactly one JSON object (the `#` human header is suppressed in json mode).
     out = cp.stdout.strip()
     try:
@@ -154,7 +180,7 @@ def run_sweep(args, out):
     for n in docs:
         try:
             obj = run_one(args.corpus, n, args.queries, args.k, args.seed,
-                          args.efforts, args.edits, args.warmup, args.max_like_n, args.max_tri_n)
+                          args.efforts, args.edits, args.warmup, args.max_tri_n)
         except SystemExit as e:
             print(f"  !! N={n:,} FAILED ({e}); skipping and continuing", file=sys.stderr)
             failed.append(n)
@@ -182,17 +208,25 @@ def load_raw(out):
 
 
 # ---- shape the raw objects into {n: {series_key: metrics}} -------------------------------
-def tidy(raw):
-    """{n: {series_key: {p50_ns,p90_ns,p99_ns,max_ns,mean_ns,recall,throughput_qps,n}}}."""
+def tidy(raw, corpus):
+    """{n: {series_key: {p50_ns,p90_ns,p99_ns,max_ns,mean_ns,recall,throughput_qps,n}}}.
+
+    Engines unsuited to the task are dropped here so they never reach a plot (even from old
+    raw via --reuse-raw): LIKE scan always (`DROP_ALWAYS`), and FTS5-word BM25 on the typo
+    regimes (`PARAPHRASE_ONLY` — exact word match isn't typo-tolerant)."""
+    is_paraphrase = corpus == "msmarco"
     data = {}
     for n, obj in raw.items():
         row = {}
         for rec in obj["records"]:
+            key = series_key(rec)
+            if key in DROP_ALWAYS or (not is_paraphrase and key in PARAPHRASE_ONLY):
+                continue
             ln = rec["latency_ns"]
-            row[series_key(rec)] = {
+            row[key] = {
                 "p50_ns": ln["p50"], "p90_ns": ln["p90"], "p99_ns": ln["p99"],
                 "max_ns": ln["max"], "mean_ns": ln["mean"], "n": ln["n"],
-                "recall": rec["recall_at_k"], "recall_k": rec["recall_k"],
+                "recall": rec.get("recall_at_k"), "recall_k": rec["recall_k"],
                 "throughput_qps": rec["throughput_qps"],
             }
         data[n] = row
@@ -200,10 +234,8 @@ def tidy(raw):
 
 
 def present_series(row):
-    """Series keys present in a row, in the canonical order (unknowns appended)."""
-    known = [k for k in SERIES_ORDER if k in row]
-    extra = [k for k in row if k not in SERIES]
-    return known + extra
+    """Series keys present in a row, in the canonical order (unknown keys are skipped)."""
+    return [k for k in SERIES_ORDER if k in row]
 
 
 def write_csv(data, path):
@@ -219,7 +251,7 @@ def write_csv(data, path):
                 engine, _, effort = key.partition("/")
                 w.writerow([n, engine, effort or "", key, m["p50_ns"], m["p90_ns"],
                             m["p99_ns"], m["max_ns"], f"{m['mean_ns']:.1f}",
-                            f"{m['throughput_qps']:.2f}", f"{m['recall']:.4f}",
+                            f"{m['throughput_qps']:.2f}", recall_str(m["recall"], 4),
                             m["recall_k"], m["n"]])
 
 
@@ -248,7 +280,7 @@ def plot_latency_grouped(data, ns, corpus, k, path):
                 lo, hi = min(lo, max(val_us, 1e-3)), max(hi, val_us)
             # recall@k and *max annotated above the group (the p99 bar is the tallest).
             top_us = m["p99_ns"] / 1_000.0
-            ax.annotate(f"r {m['recall']:.2f}\n*{fmt_latency(m['max_ns'])}",
+            ax.annotate(f"r {recall_str(m['recall'])}\n*{fmt_latency(m['max_ns'])}",
                         (xs[gi], top_us), textcoords="offset points", xytext=(0, 4),
                         ha="center", va="bottom", fontsize=7, linespacing=1.05)
         ax.set_yscale("log")
@@ -296,7 +328,7 @@ def plot_throughput(data, ns, corpus, k, path):
             continue
         ax.plot(xs, ys, marker="o", ms=5, color=color_of(key), label=label_of(key), zorder=3)
         for x, y, r in zip(xs, ys, recs):
-            ax.annotate(f"{r:.2f}", (x, y), textcoords="offset points", xytext=(0, dy),
+            ax.annotate(recall_str(r), (x, y), textcoords="offset points", xytext=(0, dy),
                         ha="center", fontsize=6.5, color=color_of(key), zorder=4)
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -353,10 +385,10 @@ def main():
     ap.add_argument("--edits", type=int, default=2,
                     help="typos/query for the geonames/synthetic regimes (ignored for msmarco) [2]")
     ap.add_argument("--warmup", type=int, default=100, help="untimed warmup queries [100]")
-    ap.add_argument("--max-like-n", type=int, default=625000,
-                    help="drop like-scan above this N (O(N) scan impractical) [625000]")
     ap.add_argument("--max-tri-n", type=int, default=625000,
-                    help="drop fts5-trigram-bm25 above this N (OR-bag MATCH ~seconds/query) [625000]")
+                    help="msmarco only: drop fts5-trigram-bm25 above this N (prose OR-bag MATCH "
+                         "~seconds/query). The typo regimes run it at every N (short names "
+                         "stay fast). [625000]")
     ap.add_argument("--out", default=None, help="output dir [benchmarks/reports/perf-<corpus>]")
     ap.add_argument("--reuse-raw", action="store_true",
                     help="reuse <out>/raw.json (skip the benchmark, just re-plot)")
@@ -373,7 +405,7 @@ def main():
               f"N={args.docs} efforts={args.efforts}", file=sys.stderr)
         raw = run_sweep(args, out)
 
-    data = tidy(raw)
+    data = tidy(raw, args.corpus)
     ns = sorted(data)
     print(f"loaded N={ns}", file=sys.stderr)
 

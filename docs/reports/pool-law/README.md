@@ -63,7 +63,7 @@ distractors counted above `θ` — gives `p* ≈ N · P(S ≥ θ)`, linear in `N
 trigrams co-occur within documents rather than landing independently, which cuts the effective
 number of independent distractors and pulls the growth below that line. The fitted exponent on
 `N` (next sections) is sub-linear, climbs with the recall target, and passes through ≈ ½ across
-the 90–99% band production targets. The symmetric `√(k·N)` (`a = b = ½`) is the form adopted,
+the 90–99% targets that matter in production. The symmetric `√(k·N)` (`a = b = ½`) is the form adopted,
 on this mechanism rather than on the fit: it is the geometric mean of the pool's two pressures —
 a floor of `k` results to return, and the `N`-driven burial above it. The fitted exponents are
 consistent with `½` but do not establish it; they are individually noisy and anti-correlated,
@@ -138,18 +138,18 @@ over-provisions the pool — a safe error, costing latency but never recall. Whe
 them diverging on `N`-dependence; in both cases a universal knob sized to the harder regime is
 correct.
 
-The mechanism behind that split is independently confirmed. The Zipf argument predicts that
-prose's thick common-trigram body buries relevant documents deeper as `N` grows; the
-[`t_max` sweep](../tmax-sweep) measures exactly that, as a per-query drop-out "hump" that climbs
-with `N` on prose (`0.018 → 0.148`) and stays flat on structured names (`0.000 → 0.022`) — a
-different statistic, a different sweep, the same physical story. The two-regime model rests on
-that cross-confirmation more than on any single fit.
+The split is confirmed independently. The Zipf argument predicts that prose's thick body of
+common trigrams buries relevant documents deeper as `N` grows; the [`t_max` sweep](../tmax-sweep)
+finds exactly that, as a per-query drop-out "hump" that climbs with `N` on prose
+(`0.018 → 0.148`) and stays flat on structured names (`0.000 → 0.022`). Because that is a
+different statistic on a different sweep, the two-regime split holds across two measurements, not
+one fit.
 
 ## Effort ladder
 
-The `Effort` knob sets `c` in `p = max(limit, round(c·√(limit·N)))`. Against the MS MARCO
-calibration — the regime where the `√(kN)` form is load-bearing — each level targets a band of
-the recall ceiling (calibrated `c`):
+The `Effort` knob sets `c` in `p = max(limit, round(c·√(limit·N)))`. Calibrated against MS
+MARCO — the regime where the `√(kN)` law actually holds — each level reaches a set fraction of
+the recall ceiling:
 
 | Effort | c | ≈ recall ceiling (prose) |
 |---|---|---|
@@ -158,28 +158,26 @@ the recall ceiling (calibrated `c`):
 | High | 0.10 | ~95% |
 | Max | 0.45 | ~99% |
 
-Low, Medium, and High are the shipped constants and validate as-is — order-right and mapped
-sensibly onto the 50/90/95% targets. Max is the one rung the calibration revises. As shipped it
-is `c = 0.30`, which reaches only ~95–97% — within a point or two of High at three times the
-pool, so the top rung duplicates High instead of extending past it. The measured 99% constant is
-`c ≈ 0.48` (noisy, 0.27..0.75); setting Max ≈ 0.45 makes it a genuine ~99%-of-ceiling tier,
-distinct from High, at the cost of the deepest, least efficient pool — which is what the
-latency-insensitive caller the tier exists for is asking for. On GeoNames every level
-over-provisions (the law is `N`-independent there), so the change is safe across both regimes.
+Low, Medium, and High fall in order at 0.03, 0.05, and 0.10 and reach the 50, 90, and 95%
+targets. The top rung is the only one with a real choice. A coefficient near 0.30 reaches just
+~95–97% — within a point or two of High at three times the pool — so it would repeat High rather
+than go past it. The measured 99% constant is `c ≈ 0.48` (noisy, 0.27..0.75), so `c ≈ 0.45`
+gives Max a distinct ~99% tier at the cost of the deepest pool: the trade a caller who has turned
+recall up to its maximum is asking for. On GeoNames every level over-provisions (the law is
+`N`-independent there), so the ladder is safe in both regimes.
 
 ![MS MARCO manifold](images/msmarco_manifold.png)
 ![GeoNames manifold](images/geonames_manifold.png)
 
 ## Conclusion
 
-The pool depth needed for a recall target scales as `√(k·N)` on prose/sparse corpora and as
-`k` alone on structured/dense ones. A single `√(k·N)` knob is therefore correctly shaped: it
-is doing real work where the law is `√(k·N)`, and over-provisions safely where the law is `k`.
-The `Effort` constants Low 0.03, Medium 0.05, and High 0.10 track the 50/90/95% recall-of-ceiling
-targets and validate as-is. The calibration calls for one adjustment: Max, at the shipped 0.30,
-reaches only ~95–97% and nearly duplicates High at three times the pool; raising it to
-`c ≈ 0.45` makes it a genuine ~99% tier (the measured 99% constant is ~0.48), distinct from High
-and matched to the latency-insensitive caller it exists for.
+The pool depth a recall target needs scales as `√(k·N)` on prose/sparse corpora and as `k` alone
+on structured/dense ones. A single `√(k·N)` knob is therefore the right shape: it is correctly
+sized where the law is `√(k·N)` and over-provisions safely where the law is `k`. The calibration
+sets the `Effort` ladder at Low 0.03, Medium 0.05, High 0.10, and Max 0.45 — the 50, 90, 95, and
+99% recall targets. Only Max is non-obvious: a top rung near 0.30 reaches ~95–97% and barely
+separates from High, while `c ≈ 0.45` (the measured 99% constant is ~0.48) buys a distinct ~99%
+tier.
 
 ## Reproduce
 

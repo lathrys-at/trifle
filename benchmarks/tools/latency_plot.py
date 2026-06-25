@@ -1,32 +1,41 @@
 #!/usr/bin/env python3
-"""Sweep trifle's `latency` benchmark across a corpus-size ladder and plot it.
+"""Sweep trifle's `perf` benchmark across a corpus-size ladder and plot speed + recall.
 
-This is the analysis half of the latency/throughput eval; the measurement half is the
-`latency` subcommand of `trifle-benchmarks` with `--format json` (which this script
-drives). For each index size `N` it runs one `latency` invocation that measures trifle at
-several rerank **efforts** (Low/Medium/High) from a single index build, alongside the
-in-process SQLite baselines (FTS5-trigram phrase BM25, LIKE scan), and emits a
-machine-readable JSON object carrying — per (engine, effort) — the p50/p90/p99/max latency,
-throughput, in-corpus recall@k, AND the raw per-query samples.
+This is the analysis half of the speed+quality eval; the measurement half is the `perf`
+subcommand of `trifle-benchmarks` with `--format json` (which this script drives). For each
+index size `N` it runs one `perf` invocation that measures trifle at several rerank
+**efforts** (Low/Medium/High) from a single index build, alongside the in-process SQLite
+baselines, on *labeled* queries — emitting per (engine, effort) the p50/p90/p99/max latency,
+throughput, **honest recall@k**, AND the raw per-query samples.
 
-It then renders two figures:
+Two query regimes (`--corpus`):
+  - **msmarco** (default): real MS MARCO dev queries scored against qrels (no typos) — the
+    paraphrase regime. Baselines: FTS5-word BM25, FTS5-trigram OR-bag, LIKE.
+  - **geonames-all / geonames-cities**: entity name + `--edits` typos — the *real* typo
+    regime, where recall measures typo tolerance. Baselines: FTS5-trigram OR-bag, LIKE.
+FTS5 is scored via the OR-bag `MATCH` (not phrase), so the baseline recall is fair.
+
+It renders two figures:
 
   1. **latency_grouped.png** — one panel per `N`; within a panel, one bar *group* per
      alternative (trifle Low/Medium/High + each baseline), each group a p50/p90/p99 triple.
      Effort/engine is the color; percentile is the position (left→right) and the alpha. The
-     in-corpus **recall@k** and the **\\*max** latency are annotated above each group.
+     **recall@k** and the **\\*max** latency are annotated above each group.
   2. **throughput_vs_N.png** — throughput (q/s) vs `N`, one line per alternative, with
      recall@k annotated above each point.
 
-Plus a supplementary **latency_vs_N.png** (p50/p99 vs N, the flat-latency story).
+Plus a supplementary **latency_vs_N.png** (p50/p99 vs N, the latency-scaling story).
 
 The raw JSON for every `N` is persisted (under `<out>/raw/`), together with a combined
 `raw.json` and a tidy `summary.csv`, so the plots can be regenerated — or the analysis
 changed entirely — WITHOUT re-running the benchmark (`--reuse-raw`).
 
 Usage:
-    # full sweep (downloads ~1 GiB msmarco collection on first use) + plots
+    # msmarco sweep (real dev queries; downloads ~1 GiB collection on first use) + plots
     python3 benchmarks/tools/latency_plot.py --queries 100 --seed 42
+
+    # geonames typo regime (full gazetteer; downloads ~400 MB on first use)
+    python3 benchmarks/tools/latency_plot.py --corpus geonames-all --edits 2
 
     # re-plot from previously captured raw data, no benchmark run
     python3 benchmarks/tools/latency_plot.py --reuse-raw
@@ -57,6 +66,7 @@ SERIES = {
     "trifle/low": ("trifle (Low)", "#74c476"),
     "trifle/medium": ("trifle (Medium)", "#31a354"),
     "trifle/high": ("trifle (High)", "#006d2c"),
+    "fts5-word-bm25": ("FTS5 word (BM25)", "#756bb1"),
     "fts5-trigram-bm25": ("FTS5 trigram (BM25)", "#e6550d"),
     "like-scan": ("LIKE scan", "#3182bd"),
 }
@@ -90,23 +100,32 @@ def fmt_latency(ns):
     return f"{ns / 1_000_000:.2f}ms"
 
 
-# ---- measurement: drive the latency subcommand ------------------------------------------
-def run_one(corpus, n, queries, k, seed, efforts, warmup, max_like_n):
-    """Run one `latency --format json` invocation for index size `n`; return its parsed
-    JSON object. `like-scan` is filtered out above `max_like_n` (an O(N) full scan per
-    query is impractical at the top of the ladder) — and that omission is logged, never
-    silent."""
+# ---- measurement: drive the perf subcommand ---------------------------------------------
+def run_one(corpus, n, queries, k, seed, efforts, edits, warmup, max_like_n, max_tri_n):
+    """Run one `perf --format json` invocation for index size `n`; return its parsed JSON
+    object. `perf` measures latency + throughput + honest recall@k on labeled queries (real
+    MS MARCO dev queries for msmarco; entity/snippet + `edits` typos otherwise), scoring FTS5
+    via the fair OR-bag MATCH.
+
+    The two genuinely-impractical-at-scale baselines are dropped above their thresholds
+    (logged, never silent): `like-scan` (an O(N) full scan/query) above `max_like_n`, and
+    `fts5-trigram-bm25` (the OR-bag MATCH explodes to ~seconds/query at millions of docs)
+    above `max_tri_n`. trifle and `fts5-word-bm25` run at every N."""
     cmd = [
         "cargo", "run", "-q", "-p", "trifle-benchmarks", "--release", "--",
-        "latency", "--corpus", corpus, "--docs", str(n), "--queries", str(queries),
+        "perf", "--corpus", corpus, "--docs", str(n), "--queries", str(queries),
         "--k", str(k), "--seed", str(seed), "--effort-sweep", efforts,
-        "--warmup", str(warmup), "--format", "json",
+        "--edits", str(edits), "--warmup", str(warmup), "--format", "json",
     ]
     if n > max_like_n:
         cmd += ["--filter", "like-scan"]
         print(f"  N={n:,}: like-scan filtered (N > --max-like-n {max_like_n:,}; O(N) scan)",
               file=sys.stderr)
-    print(f"  latency N={n:,} (corpus={corpus}, efforts={efforts}) ...", file=sys.stderr, flush=True)
+    if n > max_tri_n:
+        cmd += ["--filter", "fts5-trigram-bm25"]
+        print(f"  N={n:,}: fts5-trigram-bm25 filtered (N > --max-tri-n {max_tri_n:,}; "
+              f"OR-bag MATCH ~seconds/query)", file=sys.stderr)
+    print(f"  perf N={n:,} (corpus={corpus}, efforts={efforts}) ...", file=sys.stderr, flush=True)
     cp = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
     if cp.returncode != 0:
         sys.stderr.write(cp.stderr[-4000:])
@@ -135,12 +154,12 @@ def run_sweep(args, out):
     for n in docs:
         try:
             obj = run_one(args.corpus, n, args.queries, args.k, args.seed,
-                          args.efforts, args.warmup, args.max_like_n)
+                          args.efforts, args.edits, args.warmup, args.max_like_n, args.max_tri_n)
         except SystemExit as e:
             print(f"  !! N={n:,} FAILED ({e}); skipping and continuing", file=sys.stderr)
             failed.append(n)
             continue
-        (raw_dir / f"latency-{args.corpus}-N{n}.json").write_text(json.dumps(obj, indent=2))
+        (raw_dir / f"perf-{args.corpus}-N{n}.json").write_text(json.dumps(obj, indent=2))
         raw[n] = obj
         # Rewrite the combined file after every N so a crash mid-sweep keeps what we have.
         (out / "raw.json").write_text(
@@ -322,22 +341,28 @@ def plot_latency_vs_n(data, ns, corpus, path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--corpus", default="msmarco", help="latency corpus [msmarco]")
+    ap.add_argument("--corpus", default="msmarco",
+                    help="query regime: msmarco (real dev queries) | geonames-all | "
+                         "geonames-cities | synthetic (entity/snippet + typos) [msmarco]")
     ap.add_argument("--docs", default=DEFAULT_DOCS, help="comma-separated index sizes N")
     ap.add_argument("--queries", type=int, default=100, help="query samples per N [100]")
     ap.add_argument("--k", type=int, default=10, help="top-k cutoff (and recall@k) [10]")
     ap.add_argument("--seed", type=int, default=42, help="master seed [42]")
     ap.add_argument("--efforts", default="low,medium,high",
                     help="trifle efforts to sweep [low,medium,high]")
+    ap.add_argument("--edits", type=int, default=2,
+                    help="typos/query for the geonames/synthetic regimes (ignored for msmarco) [2]")
     ap.add_argument("--warmup", type=int, default=100, help="untimed warmup queries [100]")
     ap.add_argument("--max-like-n", type=int, default=625000,
                     help="drop like-scan above this N (O(N) scan impractical) [625000]")
-    ap.add_argument("--out", default=None, help="output dir [benchmarks/reports/latency-<corpus>]")
+    ap.add_argument("--max-tri-n", type=int, default=625000,
+                    help="drop fts5-trigram-bm25 above this N (OR-bag MATCH ~seconds/query) [625000]")
+    ap.add_argument("--out", default=None, help="output dir [benchmarks/reports/perf-<corpus>]")
     ap.add_argument("--reuse-raw", action="store_true",
                     help="reuse <out>/raw.json (skip the benchmark, just re-plot)")
     args = ap.parse_args()
 
-    out = Path(args.out or REPO / "benchmarks" / "reports" / f"latency-{args.corpus}")
+    out = Path(args.out or REPO / "benchmarks" / "reports" / f"perf-{args.corpus}")
     out.mkdir(parents=True, exist_ok=True)
 
     if args.reuse_raw:

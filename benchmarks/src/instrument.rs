@@ -65,12 +65,17 @@ pub fn is_inner() -> bool {
     std::env::var_os(GUARD_ENV).is_some()
 }
 
-/// Re-exec the current binary under `profiler`, profiling `trifle-bench latency
-/// <passthru…>`. `passthru` is the original `latency` argument list with the
+/// Re-exec the current binary under `profiler`, profiling `trifle-bench <subcommand>
+/// <passthru…>`. `passthru` is the original argument list (after the subcommand) with the
 /// `--instrument*` flags already stripped (see [`strip_self_flags`]). Writes the trace
 /// artifact under `out_dir` (named for the run, suffixed with the pid to avoid clobbering a
 /// prior `.trace`) and returns the profiler's exit code.
-pub fn run(profiler: Profiler, out_dir: &Path, passthru: &[String]) -> Result<i32, String> {
+pub fn run(
+    profiler: Profiler,
+    out_dir: &Path,
+    subcommand: &str,
+    passthru: &[String],
+) -> Result<i32, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot resolve current executable: {e}"))?;
     std::fs::create_dir_all(out_dir).map_err(|e| {
@@ -79,7 +84,7 @@ pub fn run(profiler: Profiler, out_dir: &Path, passthru: &[String]) -> Result<i3
             out_dir.display()
         )
     })?;
-    let stem = artifact_stem(passthru);
+    let stem = artifact_stem(subcommand, passthru);
     let artifact = out_dir.join(format!(
         "{stem}-{}.{}",
         std::process::id(),
@@ -103,7 +108,7 @@ pub fn run(profiler: Profiler, out_dir: &Path, passthru: &[String]) -> Result<i3
                 .arg("--launch")
                 .arg("--")
                 .arg(&exe)
-                .arg("latency")
+                .arg(subcommand)
                 .args(passthru);
             c
         }
@@ -116,7 +121,7 @@ pub fn run(profiler: Profiler, out_dir: &Path, passthru: &[String]) -> Result<i3
                 .arg(&artifact)
                 .arg("--")
                 .arg(&exe)
-                .arg("latency")
+                .arg(subcommand)
                 .args(passthru);
             // samply runs the command as a direct child, inheriting our env.
             c.env(GUARD_ENV, "1");
@@ -125,7 +130,7 @@ pub fn run(profiler: Profiler, out_dir: &Path, passthru: &[String]) -> Result<i3
     };
 
     eprintln!(
-        "instrument: profiling `latency {}` under {} -> {}",
+        "instrument: profiling `{subcommand} {}` under {} -> {}",
         passthru.join(" "),
         profiler.display(),
         artifact.display()
@@ -179,11 +184,12 @@ pub fn strip_self_flags(args: &[String]) -> Vec<String> {
     out
 }
 
-/// A filename stem describing the run: `latency` plus the `--docs`/`--effort`/`--effort-sweep`
-/// values if present, so concurrent traces are distinguishable at a glance.
-fn artifact_stem(passthru: &[String]) -> String {
-    let mut parts = vec!["latency".to_string()];
-    for key in ["docs", "effort", "effort-sweep"] {
+/// A filename stem describing the run: the subcommand plus the
+/// `--corpus`/`--docs`/`--effort`/`--effort-sweep` values if present, so concurrent traces
+/// are distinguishable at a glance.
+fn artifact_stem(subcommand: &str, passthru: &[String]) -> String {
+    let mut parts = vec![subcommand.to_string()];
+    for key in ["corpus", "docs", "effort", "effort-sweep"] {
         if let Some(v) = flag_value(passthru, key) {
             parts.push(format!("{key}{}", sanitize(&v)));
         }
@@ -258,16 +264,18 @@ mod tests {
     }
 
     #[test]
-    fn stem_encodes_docs_and_effort() {
+    fn stem_encodes_subcommand_docs_and_effort() {
         let args = vec![
+            "--corpus".to_string(),
+            "msmarco".to_string(),
             "--docs".to_string(),
             "5000".to_string(),
             "--effort-sweep".to_string(),
             "low,medium,high".to_string(),
         ];
         assert_eq!(
-            artifact_stem(&args),
-            "latency-docs5000-effort-sweeplow_medium_high"
+            artifact_stem("perf", &args),
+            "perf-corpusmsmarco-docs5000-effort-sweeplow_medium_high"
         );
     }
 

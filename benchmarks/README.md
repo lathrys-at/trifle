@@ -91,10 +91,17 @@ for n in 10000 50000 100000 500000 1000000; do
 done
 ```
 
-### Latency JSON, plots & profiling
+### Speed + recall (`perf`), JSON, plots & profiling
 
-The `latency` command also reports **in-corpus recall@k** for the sampled queries (each
-query is a snippet of a real document; that document is the relevant answer), and can:
+The **`perf`** command is the combined **speed + quality** profile: latency, throughput, AND
+honest recall@k on *labeled* queries, across the effort sweep. Unlike `latency` (in-corpus
+snippets, FTS5 phrase-MATCH — a speed comparison where a recall number would misrepresent
+FTS5), `perf` uses the recall-eval regimes and scores FTS5 via the **fair OR-bag `MATCH`**:
+
+- `--corpus msmarco` — real dev queries + qrels (paraphrase; the effort ladder moves recall);
+- `--corpus geonames-all` — entity name + `--edits` typos (the *real* typo regime).
+
+Both profiles also:
 
 - **measure several efforts from one index build** — `--effort-sweep low,medium,high`;
 - **emit machine-readable JSON** — `--format json` writes one object carrying, per
@@ -105,14 +112,17 @@ query is a snippet of a real document; that document is the relevant answer), an
   writes a trace artifact. A hook for *where* the time goes, separate from the JSON's
   *how much*.
 
-`tools/latency_plot.py` drives all of this: it sweeps the corpus-size ladder, persists the
-raw JSON, and renders the grouped p50/p90/p99 chart (recall@k + `*`max annotated) plus the
+(`latency` keeps a trifle-only self-recall figure; `perf` is the fair cross-engine recall.)
+
+`tools/latency_plot.py` drives `perf`: it sweeps the corpus-size ladder, persists the raw
+JSON, and renders the grouped p50/p90/p99 chart (recall@k + `*`max annotated) plus the
 throughput-vs-`N` plot. See [`tools/README.md`](tools/README.md).
 
 ```bash
-cargo run -p trifle-benchmarks --release -- fetch --corpus msmarco   # ~1 GiB, once
-python3 benchmarks/tools/latency_plot.py --queries 100 --seed 42     # sweep + plots
-python3 benchmarks/tools/latency_plot.py --reuse-raw                 # re-plot, no re-run
+cargo run -p trifle-benchmarks --release -- fetch --corpus relevance      # ~1 GiB, once
+python3 benchmarks/tools/latency_plot.py --queries 100 --seed 42          # msmarco sweep
+python3 benchmarks/tools/latency_plot.py --corpus geonames-all --edits 2  # typo regime
+python3 benchmarks/tools/latency_plot.py --reuse-raw                      # re-plot, no re-run
 ```
 
 ## Caveats

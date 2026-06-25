@@ -191,50 +191,63 @@ cached (`cargo run -p trifle-benchmarks --release -- fetch --corpus relevance`).
 
 ---
 
-# Latency & throughput plots
+# Latency + recall plots (the `perf` profile)
 
-`latency_plot.py` sweeps the `latency` benchmark across a **corpus-size ladder** and renders
-the speed story: how trifle's p50/p90/p99 and throughput compare to the in-process SQLite
-baselines, and how they scale with `N`. It is the analysis half; the measurement half is the
-`latency` subcommand with `--format json`.
+`latency_plot.py` sweeps the **`perf`** benchmark across a corpus-size ladder and renders the
+combined **speed + quality** story: how trifle's p50/p90/p99, throughput, AND recall@k compare
+to the in-process SQLite baselines, and how they scale with `N`. It is the analysis half; the
+measurement half is the `perf` subcommand with `--format json`.
 
 ```
-python3 benchmarks/tools/latency_plot.py --queries 100 --seed 42      # full msmarco sweep
-python3 benchmarks/tools/latency_plot.py --reuse-raw                  # re-plot, no re-run
+python3 benchmarks/tools/latency_plot.py --queries 100 --seed 42            # msmarco (paraphrase)
+python3 benchmarks/tools/latency_plot.py --corpus geonames-all --edits 2    # geonames (typos)
+python3 benchmarks/tools/latency_plot.py --reuse-raw                        # re-plot, no re-run
 ```
 
-## The measurement seam (`latency --format json`)
+## Why `perf`, not `latency`
 
-`latency` measures, for the *same* sampled queries, every engine — and trifle at every
-**effort** in `--effort-sweep` (e.g. `low,medium,high`) from a **single index build**
-(effort is a per-search pool-depth knob, not an index property). With `--format json` it
-emits one machine-readable object per invocation:
+The `latency` profile times in-corpus snippet queries against FTS5 **phrase**-MATCH — a fine
+*speed* comparison, but a recall number there would be a lie: phrase-MATCH scores ~0 on any
+typo'd query (the trigrams aren't contiguous), so it would only ever "find" the zero-typo
+queries. `perf` is the honest recall eval — it uses the recall-eval query regimes and scores
+FTS5 via the **OR-bag `MATCH`** (the fair fuzzy/relevance baseline), so every engine's recall
+is meaningful. Two regimes (`--corpus`):
+
+- **msmarco** — real MS MARCO dev queries + qrels, no typos (the paraphrase regime, where the
+  effort ladder genuinely moves recall). Baselines: FTS5-word BM25, FTS5-trigram OR-bag, LIKE.
+- **geonames-all / geonames-cities** — entity name + `--edits` typos (the *real* typo regime,
+  where recall measures typo tolerance). Baselines: FTS5-trigram OR-bag, LIKE — and FTS5-word
+  BM25, which collapses on typos (a useful contrast).
+
+## The measurement seam (`perf --format json`)
+
+`perf` measures, for the *same* labeled queries, every engine — and trifle at every **effort**
+in `--effort-sweep` (e.g. `low,medium,high`) from a **single index build** (effort is a
+per-search pool-depth knob, not an index property). With `--format json` it emits one
+machine-readable object per invocation:
 
 ```jsonc
 {
-  "corpus": "msmarco", "docs": 25000, "queries": 100, "k": 10, "seed": 42,
-  "mode": "serial", "typo_mix": {"e0":..,"e1":..,"e2":..},
+  "command": "perf", "corpus": "msmarco", "docs": 25000, "queries": 100,
+  "scored_queries": 100, "k": 10, "seed": 42, "mode": "serial",
   "conditions": { "git_commit": "...", "rustc": "...", "arch": "...", "profile": "release", "cpus": 10 },
   "records": [
     { "engine": "trifle", "effort": "low",
-      "recall_at_k": 0.83, "recall_k": 10, "throughput_qps": 12345.6,
+      "recall_at_k": 0.76, "recall_k": 10, "throughput_qps": 2467.0,
       "latency_ns": { "p50":.., "p90":.., "p99":.., "max":.., "mean":.., "n":100 },
       "samples_ns": [ /* raw per-query ns, in call order */ ] },
-    { "engine": "fts5-trigram-bm25", "effort": null, ... },
-    { "engine": "like-scan", "effort": null, ... }
+    { "engine": "fts5-word-bm25", "effort": null, "recall_at_k": 0.89, ... },
+    { "engine": "fts5-trigram-bm25", "effort": null, "recall_at_k": 0.91, ... }
   ]
 }
 ```
 
 Every record carries the **raw per-query samples**, not just the summary — so the
-post-processor (or a future one) can recompute any statistic, or change the plotting
-entirely, **without re-running the benchmark**. The driver persists each `N`'s object under
-`<out>/raw/`, a combined `<out>/raw.json`, and a tidy `<out>/summary.csv`; `--reuse-raw`
-re-plots from those.
-
-Recall is **in-corpus recall@k**: each latency query is a snippet (± typos) of a real
-document, and that document is the relevant answer — so the speed numbers carry a quality
-figure for the identical queries. `--k` sets both the result cutoff and the recall `k`.
+post-processor (or a future one) can recompute any statistic, or change the plotting entirely,
+**without re-running the benchmark**. The driver persists each `N`'s object under `<out>/raw/`,
+a combined `<out>/raw.json`, and a tidy `<out>/summary.csv`; `--reuse-raw` re-plots from those.
+`--k` sets both the result cutoff and the recall `k`. (The `latency` profile shares this exact
+JSON schema — it just reports recall for trifle only.)
 
 ## What it renders
 
@@ -242,7 +255,7 @@ figure for the identical queries. `--k` sets both the result cutoff and the reca
 |------|------|
 | `latency_grouped.png` | one panel per `N`; a bar **group per alternative** (trifle Low/Medium/High + each baseline), each group a p50/p90/p99 triple. Color = effort/engine; percentile = position + alpha. **recall@k** and the **`*`max** latency are annotated above each group. |
 | `throughput_vs_N.png` | throughput (q/s) vs `N`, one line per alternative, **recall@k annotated above each point**. |
-| `latency_vs_N.png` | supplementary: p50 and p99 vs `N` — the flat-latency-as-`N`-grows story. |
+| `latency_vs_N.png` | supplementary: p50 and p99 vs `N` — the latency-scaling story. |
 | `summary.csv`, `raw.json`, `raw/*.json` | the captured data, for re-plotting (`--reuse-raw`). |
 
 ## Usage
@@ -250,31 +263,37 @@ figure for the identical queries. `--k` sets both the result cutoff and the reca
 ```
 python3 benchmarks/tools/latency_plot.py [options]
 
-  --corpus      latency corpus (msmarco | synthetic)                  [msmarco]
+  --corpus      query regime (msmarco | geonames-all | geonames-cities | synthetic)  [msmarco]
   --docs        comma-separated index sizes N      [1000,5000,25000,125000,625000,3125000]
   --queries N   query samples per N                                   [100]
   --k N         top-k cutoff (and recall@k)                           [10]
   --seed N      master seed                                           [42]
   --efforts     trifle efforts to sweep                              [low,medium,high]
+  --edits N     typos/query for geonames/synthetic (ignored for msmarco)   [2]
   --warmup N    untimed warmup queries                                [100]
-  --max-like-n  drop like-scan above this N (its O(N) scan is impractical at the top of
-                the ladder; the omission is logged, never silent)     [625000]
-  --out DIR     output directory                       [benchmarks/reports/latency-<corpus>]
+  --max-like-n  drop like-scan above this N (O(N) scan impractical)    [625000]
+  --max-tri-n   drop fts5-trigram-bm25 above this N (OR-bag MATCH ~seconds/query)  [625000]
+  --out DIR     output directory                          [benchmarks/reports/perf-<corpus>]
   --reuse-raw   re-plot from <out>/raw.json (skip the benchmark)
 ```
 
-Requirements: a release build of `trifle-benchmarks` (built on first run), Python with
-`numpy` + `matplotlib`, and — for `--corpus msmarco` — the ~1 GiB passage collection cached
-(`cargo run -p trifle-benchmarks --release -- fetch --corpus msmarco`).
+The two genuinely-impractical-at-scale baselines are dropped above their thresholds (logged,
+never silent): `like-scan`'s O(N) scan, and `fts5-trigram-bm25`'s OR-bag MATCH which explodes
+to ~seconds/query at millions of docs. trifle and `fts5-word-bm25` run at every `N`.
+
+Requirements: a release build of `trifle-benchmarks` (built on first run), Python with `numpy`
++ `matplotlib`, and the corpus cached — `fetch --corpus msmarco` (~1 GiB, also pulls the
+queries+qrels via `fetch --corpus relevance`) or `fetch --corpus geonames-all` (~400 MB; note
+GeoNames regenerates daily, so the pinned sha may need re-pinning per the manifest).
 
 ## Profiling a run (`--instrument`)
 
-To see *where* a latency run spends its time (not just how much), `latency` can re-exec
-itself under a Rust-friendly **sampling profiler** — a hook modeled on shrike's benchmark
-driver, but with Rust-only instrumenters:
+To see *where* a run spends its time (not just how much), both timed profiles (`latency` and
+`perf`) can re-exec themselves under a Rust-friendly **sampling profiler** — a hook modeled on
+shrike's benchmark driver, but with Rust-only instrumenters:
 
 ```
-cargo run -p trifle-benchmarks --release -- latency --corpus msmarco --docs 125000 \
+cargo run -p trifle-benchmarks --release -- perf --corpus msmarco --docs 125000 \
     --instrument xctrace          # Instruments' Time Profiler (macOS) → a .trace bundle
     # or: --instrument samply      # cross-platform → Firefox-profiler JSON (samply load …)
 ```

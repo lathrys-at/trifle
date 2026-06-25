@@ -62,6 +62,7 @@ fn main() -> ExitCode {
     };
     let result = match command.as_str() {
         "latency" => cmd_latency(rest),
+        "perf" => cmd_perf(rest),
         "relevance" => cmd_relevance(rest),
         "fuzzy" => cmd_fuzzy(rest),
         "profile" => cmd_profile(rest),
@@ -91,6 +92,8 @@ USAGE:
 
 COMMANDS:
     latency    Search latency + throughput, trifle vs in-process baselines
+    perf       Latency + throughput + recall@k on labeled queries (fair FTS5 MATCH);
+               the plotting-harness backend (msmarco real queries or geonames typos)
     relevance  MS MARCO real dev queries+qrels: set-recall@k vs word BM25 (+trigram)
     fuzzy      Entity name+edit recall vs FTS5 trigram-MATCH / LIKE, per edit-count
     profile    Σ(kept-posting cardinality) distribution — the work-done curve
@@ -143,6 +146,21 @@ INSTRUMENTATION (latency):
                                   (macOS); samply = cross-platform (Firefox-profiler JSON).
     --instrument-out <dir>        Where to write the trace artifact [.cache/bench/instruments]
 
+PERF (latency + throughput + recall@k on labeled queries; the plotting-harness backend):
+    --corpus <msmarco|geonames-all|geonames-cities|synthetic>   Query regime [default: msmarco]
+                                  msmarco = real dev queries + qrels (no typos); geonames/
+                                  synthetic = entity/snippet + --edits typos (the typo regime)
+    --edits <N>                   Typos per query for geonames/synthetic [default: 2]
+    --queries <N>                 Labeled queries sampled [default: 500]
+    --warmup <N>                  Untimed warmup queries [default: 100]
+    --repeat <N>                  Measured passes [default: 1]
+    --effort-sweep <a,b,c>        Measure trifle at several efforts from one index build
+    --format <text|json>          Output format (json for the plotter) [default: text]
+    --filter <engine>             Skip an engine; engines also include fts5-word-bm25.
+    --instrument <xctrace|samply> Profile the run (as in `latency`).
+    Recall is set-recall@k against the labels, with FTS5 scored via the OR-bag MATCH
+    (NOT phrase, which scores ~0 on typos/paraphrase) — the fair recall comparison.
+
 FUZZY:
     --corpus <geonames-cities|geonames-all>   Entity corpus [default: geonames-cities]
     --edits <N>                   Typos per query. Omit to run {1, 2} separately.
@@ -154,17 +172,19 @@ EXAMPLES:
     trifle-bench fetch --corpus geonames-cities
     trifle-bench latency --docs 100000 --queries 5000 --seed 42
     trifle-bench latency --docs 2000000 --filter like-scan
-    trifle-bench latency --corpus msmarco --docs 25000 --queries 100 \\
-        --effort-sweep low,medium,high --format json
     trifle-bench latency --corpus msmarco --docs 25000 --instrument xctrace
+    trifle-bench perf --corpus msmarco --docs 25000 --queries 500 \\
+        --effort-sweep low,medium,high --format json
+    trifle-bench perf --corpus geonames-all --docs 125000 --edits 2 --effort-sweep low,medium,high
     trifle-bench relevance --docs 100000 --queries 2000
     trifle-bench fuzzy --corpus geonames-cities --edits 1
     trifle-bench profile --docs 1000000
 
 POST-PROCESSING:
-    The latency JSON drives the matplotlib harness in tools/latency_plot.py, which sweeps
-    the corpus-size ladder and renders the grouped p50/p90/p99 chart + throughput-vs-N plot
-    (see benchmarks/tools/README.md).
+    The `perf` JSON drives the matplotlib harness in tools/latency_plot.py, which sweeps the
+    corpus-size ladder and renders the grouped p50/p90/p99 chart (recall@k + *max annotated)
+    + throughput-vs-N plot. `latency` is the pure-speed profile (trifle-only self-recall);
+    `perf` is the fair speed+recall eval. See benchmarks/tools/README.md.
 ";
 
 // ----- argument parsing -------------------------------------------------------
@@ -361,6 +381,26 @@ fn skipped_engines(flags: &Flags) -> Result<HashSet<String>, String> {
     Ok(skip)
 }
 
+/// The instrumentation re-exec seam shared by the timed profiles (`latency`, `perf`).
+/// Returns `Ok(true)` if it re-exec'd the run under a profiler (the caller should stop),
+/// `Ok(false)` to run the benchmark normally. The env guard keeps the profiled child from
+/// re-instrumenting.
+fn maybe_instrument(flags: &Flags, args: &[String], subcommand: &str) -> Result<bool, String> {
+    if let Some(name) = flags.last("instrument")
+        && !instrument::is_inner()
+    {
+        let profiler = instrument::Profiler::parse(name)?;
+        let out = flags.str("instrument-out", ".cache/bench/instruments");
+        let passthru = instrument::strip_self_flags(args);
+        let code = instrument::run(profiler, Path::new(&out), subcommand, &passthru)?;
+        if code != 0 {
+            return Err(format!("profiler exited with code {code}"));
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 // ----- latency ----------------------------------------------------------------
 
 fn cmd_latency(args: &[String]) -> Result<(), String> {
@@ -381,21 +421,10 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
     ]);
     flags.reject_unknown(&allowed)?;
 
-    // Instrumentation seam: if asked to profile and we are NOT already the profiled
-    // child, re-exec the whole `latency` run under the chosen sampler and stop here. The
-    // env guard in `instrument` keeps the inner (profiled) process from re-instrumenting.
-    if let Some(name) = flags.last("instrument")
-        && !instrument::is_inner()
-    {
-        let profiler = instrument::Profiler::parse(name)?;
-        let out = flags.str("instrument-out", ".cache/bench/instruments");
-        let passthru = instrument::strip_self_flags(args);
-        let code = instrument::run(profiler, Path::new(&out), &passthru)?;
-        return if code == 0 {
-            Ok(())
-        } else {
-            Err(format!("profiler exited with code {code}"))
-        };
+    // Instrumentation seam: if asked to profile and we are NOT already the profiled child,
+    // re-exec the whole run under the chosen sampler and stop here.
+    if maybe_instrument(&flags, args, "latency")? {
+        return Ok(());
     }
 
     let skip = skipped_engines(&flags)?;
@@ -447,14 +476,17 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
             *slot += 1;
         }
     }
-    let meta = LatencyMeta {
+    let meta = RunMeta {
+        command: "latency",
         corpus: &corpus_name,
         provenance: &corpus.provenance,
         docs: corpus.docs.len(),
         queries: qtexts.len(),
+        scored_queries: None,
         k,
         seed,
-        mix,
+        edits: None,
+        mix: Some(mix),
         warmup: warmup.min(qtexts.len()),
         repeat,
         min_shared: tuning.min_shared,
@@ -474,7 +506,7 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
         if skip.contains(ENGINE_TRIFLE) {
             return Err("concurrent mode runs trifle only, but it is filtered out".into());
         }
-        print_latency_header(&meta, &skip);
+        print_run_header(&meta, &skip);
         println!("# mode=concurrent threads={concurrent} (trifle only — the read-pool axis)");
         let trifle = Trifle::build(&corpus, tuning);
         for (label, effort) in &efforts {
@@ -492,11 +524,11 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
     let records = measure_engines(&corpus, &bench, &efforts, &skip, tuning);
 
     if json_mode {
-        render_latency_json(&meta, &records);
+        render_run_json(&meta, &records);
     } else {
-        print_latency_header(&meta, &skip);
+        print_run_header(&meta, &skip);
         println!("# mode={}", if batched { "batched" } else { "serial" });
-        render_latency_text(&bench, &records);
+        render_run_text(&bench, &records);
         println!(
             "# (latency is one axis; durability, footprint, update cost, and semantics differ \
              per engine — see the comparison table in the project README)"
@@ -545,17 +577,21 @@ struct Bench<'a> {
 
 /// One measured (engine, effort) row. `samples_ns` is the raw per-query latency in call
 /// order (serial mode); it is empty in batched mode, which times the whole set as one call.
+/// `recall` is `None` when not computed for this engine (the `latency` profile reports it
+/// for trifle only — the snippet queries make the baselines' phrase-MATCH recall a lie;
+/// the `perf` profile computes it for every engine against a fair MATCH).
 struct Record {
     engine: String,
     effort: Option<String>,
     samples_ns: Vec<u64>,
     throughput_qps: f64,
-    recall: f64,
+    recall: Option<f64>,
 }
 
-/// Build, then measure, each non-filtered engine. trifle is built once and measured at
-/// every swept effort (effort is a per-search pool knob, not an index property); the
-/// baselines are measured once each (no effort analogue).
+/// Build, then measure, each non-filtered engine for the **`latency`** profile: trifle
+/// (effort sweep, with trifle-only recall) plus the FTS5-phrase and LIKE speed baselines
+/// (no recall — phrase-MATCH on the typo'd snippet queries scores ~0 by construction, so a
+/// recall number there would misrepresent FTS5; the `perf` profile is the fair recall eval).
 fn measure_engines(
     corpus: &Corpus,
     bench: &Bench,
@@ -565,39 +601,55 @@ fn measure_engines(
 ) -> Vec<Record> {
     let mut records = Vec::new();
     if !skip.contains(ENGINE_TRIFLE) {
-        let trifle = Trifle::build(corpus, tuning);
-        for (label, effort) in efforts {
-            let e = *effort;
-            let mut rec = measure_one(
-                bench,
-                |q| trifle.search_effort(q, bench.k, e),
-                |qs| trifle.search_batch_effort(qs, bench.k, e),
-            );
-            rec.engine = ENGINE_TRIFLE.to_string();
-            rec.effort = Some(label.clone());
-            records.push(rec);
-        }
+        push_trifle(&mut records, corpus, bench, efforts, tuning, true);
     }
     if !skip.contains(ENGINE_FTS5) {
-        // Phrase mode: the latency baseline is unchanged by the recall realignment.
+        // Phrase mode: the latency *speed* baseline. No recall (see the doc above).
         match Fts5::build(corpus, MatchMode::Phrase) {
-            Some(fts5) => push_baseline(&mut records, bench, &fts5),
+            Some(fts5) => push_baseline(&mut records, bench, false, &fts5),
             None => eprintln!("note: FTS5 trigram unavailable in the linked SQLite — skipping"),
         }
     }
     if !skip.contains(ENGINE_LIKE) {
         let like = Like::build(corpus);
-        push_baseline(&mut records, bench, &like);
+        push_baseline(&mut records, bench, false, &like);
     }
     records
+}
+
+/// Build + measure trifle once at every swept effort (effort is a per-search pool knob, not
+/// an index property), labeling each record and pushing it. `want_recall` runs the (untimed)
+/// recall pass at each effort.
+fn push_trifle(
+    records: &mut Vec<Record>,
+    corpus: &Corpus,
+    bench: &Bench,
+    efforts: &[(String, Effort)],
+    tuning: Tuning,
+    want_recall: bool,
+) {
+    let trifle = Trifle::build(corpus, tuning);
+    for (label, effort) in efforts {
+        let e = *effort;
+        let mut rec = measure_one(
+            bench,
+            want_recall,
+            |q| trifle.search_effort(q, bench.k, e),
+            |qs| trifle.search_batch_effort(qs, bench.k, e),
+        );
+        rec.engine = ENGINE_TRIFLE.to_string();
+        rec.effort = Some(label.clone());
+        records.push(rec);
+    }
 }
 
 /// Measure a baseline engine (no effort) via its [`Engine`] trait and push the record. The
 /// engine's `name()` must equal its `--filter` id (the [`ENGINE_FTS5`]/[`ENGINE_LIKE`]
 /// constants) — that contract is what lets the plotting harness key records by engine.
-fn push_baseline(records: &mut Vec<Record>, bench: &Bench, engine: &dyn Engine) {
+fn push_baseline(records: &mut Vec<Record>, bench: &Bench, want_recall: bool, engine: &dyn Engine) {
     let mut rec = measure_one(
         bench,
+        want_recall,
         |q| engine.search(q, bench.k),
         |qs| engine.search_batch(qs, bench.k),
     );
@@ -606,10 +658,12 @@ fn push_baseline(records: &mut Vec<Record>, bench: &Bench, engine: &dyn Engine) 
 }
 
 /// Run one measurement: untimed warmup, then the timed loop (per-query serial samples, or a
-/// whole-set batched best-of-`repeat`), then an untimed recall@k pass over the *same*
-/// queries. `engine`/`effort` on the returned record are placeholders for the caller to set.
+/// whole-set batched best-of-`repeat`), then — if `want_recall` — an untimed recall@k pass
+/// over the *same* queries (`batch == serial`, so it matches the timed results). The
+/// returned record's `engine`/`effort` are placeholders for the caller to set.
 fn measure_one(
     bench: &Bench,
+    want_recall: bool,
     search: impl Fn(&str) -> Vec<i64>,
     batch: impl Fn(&[&str]) -> Vec<Vec<i64>>,
 ) -> Record {
@@ -638,9 +692,7 @@ fn measure_one(
         }
         (samples, throughput(qs.len() * bench.repeat, wall.elapsed()))
     };
-    // Recall over the same sampled queries (untimed; `batch == serial` so this matches the
-    // serial results). The snippet's source document is its singleton relevant set.
-    let recall = set_recall_at_k(&batch(qs), bench.relevant, bench.k);
+    let recall = want_recall.then(|| set_recall_at_k(&batch(qs), bench.relevant, bench.k));
     Record {
         engine: String::new(),
         effort: None,
@@ -702,36 +754,45 @@ fn bench_concurrent(
     );
 }
 
-/// The `# …`-prefixed header for the human (text) latency output.
-fn print_latency_header(meta: &LatencyMeta, skip: &HashSet<String>) {
-    println!("# latency — {}", meta.provenance);
-    println!(
-        "# docs={} queries={} (0-edit={} 1-edit={} 2-edit={}) k={} warmup={} repeat={}",
-        meta.docs,
-        meta.queries,
-        meta.mix[0],
-        meta.mix[1],
-        meta.mix[2],
-        meta.k,
-        meta.warmup,
-        meta.repeat,
+/// The `# …`-prefixed header for the human (text) output of a timed profile (`latency` or
+/// `perf`). Only the metadata each profile actually carries is printed.
+fn print_run_header(meta: &RunMeta, skip: &HashSet<String>) {
+    println!("# {} — {}", meta.command, meta.provenance);
+    let mut line = format!("# docs={} queries={}", meta.docs, meta.queries);
+    if let Some(s) = meta.scored_queries {
+        line += &format!(" scored={s}");
+    }
+    if let Some(m) = meta.mix {
+        line += &format!(" (0-edit={} 1-edit={} 2-edit={})", m[0], m[1], m[2]);
+    }
+    if let Some(e) = meta.edits {
+        line += &format!(" edits={e}");
+    }
+    line += &format!(
+        " k={} warmup={} repeat={}",
+        meta.k, meta.warmup, meta.repeat
     );
+    println!("{line}");
     print_filter(skip);
 }
 
 /// Render the measured records as aligned human-readable lines (one per engine/effort).
-fn render_latency_text(bench: &Bench, records: &[Record]) {
+/// Records with no recall (a `latency` baseline) print a `—` in the recall column.
+fn render_run_text(bench: &Bench, records: &[Record]) {
     let k = bench.k;
     for r in records {
         let label = match &r.effort {
             Some(e) => format!("{}/{}", r.engine, e),
             None => r.engine.clone(),
         };
+        let recall = match r.recall {
+            Some(v) => format!("recall@{k} {v:.3}"),
+            None => format!("recall@{k}     —"),
+        };
         if bench.batched {
             println!(
-                "{label:>22}  batched  {} queries  recall@{k} {:.3}  ({:.0} q/s)",
+                "{label:>22}  batched  {} queries  {recall}  ({:.0} q/s)",
                 bench.qtexts.len(),
-                r.recall,
                 r.throughput_qps,
             );
         } else {
@@ -742,27 +803,31 @@ fn render_latency_text(bench: &Bench, records: &[Record]) {
                     .collect(),
             );
             println!(
-                "{label:>22}  serial   p50 {:>8} p90 {:>8} p99 {:>8} max {:>8}  recall@{k} {:.3}  ({:.0} q/s)",
+                "{label:>22}  serial   p50 {:>8} p90 {:>8} p99 {:>8} max {:>8}  {recall}  ({:.0} q/s)",
                 fmt_dur(lat.p50()),
                 fmt_dur(lat.p90()),
                 fmt_dur(lat.p99()),
                 fmt_dur(lat.max()),
-                r.recall,
                 r.throughput_qps,
             );
         }
     }
 }
 
-/// Run metadata carried into the human header and the machine-readable JSON.
-struct LatencyMeta<'a> {
+/// Run metadata carried into the human header and the machine-readable JSON. Shared by the
+/// `latency` and `perf` profiles; the `Option` fields are those only one profile sets
+/// (`mix` = `latency`'s 0/1/2 typo split; `edits`/`scored_queries` = `perf`'s labeled regime).
+struct RunMeta<'a> {
+    command: &'a str,
     corpus: &'a str,
     provenance: &'a str,
     docs: usize,
     queries: usize,
+    scored_queries: Option<usize>,
     k: usize,
     seed: u64,
-    mix: [usize; 3],
+    edits: Option<usize>,
+    mix: Option<[usize; 3]>,
     warmup: usize,
     repeat: usize,
     min_shared: Option<u32>,
@@ -805,7 +870,8 @@ struct LatencyNs {
 struct RecordJson<'a> {
     engine: &'a str,
     effort: Option<&'a str>,
-    recall_at_k: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recall_at_k: Option<f64>,
     recall_k: usize,
     throughput_qps: f64,
     latency_ns: LatencyNs,
@@ -813,15 +879,20 @@ struct RecordJson<'a> {
 }
 
 #[derive(Serialize)]
-struct LatencyJson<'a> {
+struct RunJson<'a> {
     command: &'a str,
     corpus: &'a str,
     provenance: &'a str,
     docs: usize,
     queries: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scored_queries: Option<usize>,
     k: usize,
     seed: u64,
-    typo_mix: TypoMix,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edits: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    typo_mix: Option<TypoMix>,
     warmup: usize,
     repeat: usize,
     mode: &'a str,
@@ -832,8 +903,8 @@ struct LatencyJson<'a> {
 }
 
 /// Emit the whole run as one compact JSON object on stdout (no `#` lines), for the plotting
-/// harness to capture and persist.
-fn render_latency_json(meta: &LatencyMeta, records: &[Record]) {
+/// harness to capture and persist. Shared by `latency` and `perf`.
+fn render_run_json(meta: &RunMeta, records: &[Record]) {
     let records: Vec<RecordJson> = records
         .iter()
         .map(|r| {
@@ -856,19 +927,21 @@ fn render_latency_json(meta: &LatencyMeta, records: &[Record]) {
             }
         })
         .collect();
-    let obj = LatencyJson {
-        command: "latency",
+    let obj = RunJson {
+        command: meta.command,
         corpus: meta.corpus,
         provenance: meta.provenance,
         docs: meta.docs,
         queries: meta.queries,
+        scored_queries: meta.scored_queries,
         k: meta.k,
         seed: meta.seed,
-        typo_mix: TypoMix {
-            e0: meta.mix[0],
-            e1: meta.mix[1],
-            e2: meta.mix[2],
-        },
+        edits: meta.edits,
+        typo_mix: meta.mix.map(|m| TypoMix {
+            e0: m[0],
+            e1: m[1],
+            e2: m[2],
+        }),
         warmup: meta.warmup,
         repeat: meta.repeat,
         mode: "serial",
@@ -879,7 +952,7 @@ fn render_latency_json(meta: &LatencyMeta, records: &[Record]) {
     };
     println!(
         "{}",
-        serde_json::to_string(&obj).expect("serialize latency json")
+        serde_json::to_string(&obj).expect("serialize run json")
     );
 }
 
@@ -910,6 +983,149 @@ fn cmd_capture(prog: &str, args: &[&str]) -> Option<String> {
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!s.is_empty()).then_some(s)
+}
+
+// ----- perf (latency + throughput + recall on labeled queries) ----------------
+
+/// The combined **speed + quality** profile: latency, throughput, AND honest recall@k on
+/// *labeled* queries, across the effort sweep, for the plotting harness. Unlike `latency`
+/// (in-corpus snippets, FTS5 phrase-MATCH — a speed comparison where a recall number would
+/// misrepresent FTS5), `perf` uses the recall-eval regimes and the **fair** FTS5 OR-bag
+/// `MATCH`:
+///
+/// - `--corpus msmarco` (default): real MS MARCO dev queries scored against qrels, no
+///   injected typos — the paraphrase regime, where the effort ladder genuinely moves recall.
+///   Baselines: FTS5-word BM25 (canonical) + FTS5-trigram OR-bag.
+/// - `--corpus geonames-all | geonames-cities`: entity name + `--edits` typos — the *real*
+///   typo regime. Baselines: FTS5-trigram OR-bag + LIKE floor.
+/// - `--corpus synthetic`: in-corpus snippet + `--edits` typos.
+fn cmd_perf(args: &[String]) -> Result<(), String> {
+    let flags = Flags::parse(args, &[])?;
+    flags.reject_unknown(&[
+        "corpus",
+        "docs",
+        "queries",
+        "k",
+        "seed",
+        "edits",
+        "min-shared",
+        "t-max",
+        "effort",
+        "effort-sweep",
+        "filter",
+        "format",
+        "warmup",
+        "repeat",
+        "instrument",
+        "instrument-out",
+    ])?;
+
+    if maybe_instrument(&flags, args, "perf")? {
+        return Ok(());
+    }
+
+    let skip = skipped_engines(&flags)?;
+    let which = flags.str("corpus", "msmarco");
+    let docs = flags.usize("docs", 50_000)?;
+    if docs == 0 {
+        return Err("--docs must be >= 1".into());
+    }
+    let n_queries = flags.usize("queries", 500)?;
+    let k = flags.usize("k", 10)?;
+    let seed = flags.u64("seed", DEFAULT_SEED)?;
+    let edits = flags.usize("edits", 2)?;
+    let warmup = flags.usize("warmup", 100)?;
+    let repeat = flags.usize("repeat", 1)?.max(1);
+    let tuning = tuning(&flags)?;
+    let efforts = resolve_efforts(&flags)?;
+
+    let json_mode = match flags.str("format", "text").as_str() {
+        "text" => false,
+        "json" => true,
+        other => return Err(format!("--format {other} (text|json)")),
+    };
+
+    // Labeled queries via the shared regime builder: msmarco = real dev queries + qrels (no
+    // typos); geonames/synthetic = entity/snippet + `edits` typos.
+    let (corpus, labeled) = labeled_corpus(&which, docs, n_queries, edits, seed)?;
+    if labeled.is_empty() {
+        return Err("no labeled queries generated".into());
+    }
+    let qtexts: Vec<&str> = labeled.iter().map(|(t, _)| t.as_str()).collect();
+    let relevant: Vec<Vec<i64>> = labeled.iter().map(|(_, r)| r.clone()).collect();
+    // `edits` only applies to the typo regimes; msmarco's real queries carry none.
+    let edits_meta = (which != "msmarco").then_some(edits);
+
+    let meta = RunMeta {
+        command: "perf",
+        corpus: &which,
+        provenance: &corpus.provenance,
+        docs: corpus.docs.len(),
+        queries: qtexts.len(),
+        scored_queries: Some(scored_queries(&relevant)),
+        k,
+        seed,
+        edits: edits_meta,
+        mix: None,
+        warmup: warmup.min(qtexts.len()),
+        repeat,
+        min_shared: tuning.min_shared,
+        t_max: tuning.t_max,
+    };
+    let bench = Bench {
+        qtexts: &qtexts,
+        relevant: &relevant,
+        k,
+        warmup,
+        repeat,
+        batched: false,
+    };
+
+    let records = perf_measure_engines(&corpus, &bench, &efforts, &skip, tuning);
+
+    if json_mode {
+        render_run_json(&meta, &records);
+    } else {
+        print_run_header(&meta, &skip);
+        println!(
+            "# mode=serial · recall = set-recall@{k} vs labels (FTS5 via OR-bag MATCH, not phrase)"
+        );
+        render_run_text(&bench, &records);
+    }
+    Ok(())
+}
+
+/// Build + measure each non-filtered engine for the `perf` profile — recall for *every*
+/// engine, against the fair MATCH: trifle (effort sweep) + FTS5-word BM25 + FTS5-trigram via
+/// the OR-bag `MATCH` ([`MatchMode::TrigramOr`], NOT phrase) + the LIKE floor.
+fn perf_measure_engines(
+    corpus: &Corpus,
+    bench: &Bench,
+    efforts: &[(String, Effort)],
+    skip: &HashSet<String>,
+    tuning: Tuning,
+) -> Vec<Record> {
+    let mut records = Vec::new();
+    if !skip.contains(ENGINE_TRIFLE) {
+        push_trifle(&mut records, corpus, bench, efforts, tuning, true);
+    }
+    if !skip.contains(ENGINE_FTS5_WORD) {
+        match Fts5Word::build(corpus) {
+            Some(e) => push_baseline(&mut records, bench, true, &e),
+            None => eprintln!("note: FTS5 (word) unavailable in the linked SQLite — skipping"),
+        }
+    }
+    if !skip.contains(ENGINE_FTS5) {
+        match Fts5::build(corpus, MatchMode::TrigramOr) {
+            Some(e) => push_baseline(&mut records, bench, true, &e),
+            None => eprintln!("note: FTS5 (trigram) unavailable in the linked SQLite — skipping"),
+        }
+    }
+    if !skip.contains(ENGINE_LIKE) {
+        let like = Like::build(corpus);
+        push_baseline(&mut records, bench, true, &like);
+    }
+    records
 }
 
 // ----- recall evals (shared) --------------------------------------------------

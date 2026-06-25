@@ -1044,12 +1044,12 @@ fn cmd_ranksweep(args: &[String]) -> Result<(), String> {
 
 // ----- tmaxsweep (selection-cap knee sweep) -----------------------------------
 
-/// Selection-cap grid for the t_max sweep: dense through the floor and the knee/hump region
-/// (4–24), then two sparse anchors (32, 40) to confirm the post-knee decline stays monotone.
-/// Points past 40 are the falling tail — the most expensive cells for graph-tail only — and are
-/// dropped. Values below the typo floor clamp to it at run time. Capped at `max`.
+/// Selection-cap grid for the t_max sweep: dense from the typo floor through the optimum and
+/// near hump (6–16), then two sparse anchors (20, 28) to confirm the post-optimum decline.
+/// The recall optimum sits at ~10–14 across regimes, so resolution is concentrated there;
+/// values below 6 clamp to the floor and points past 28 are graph-tail. Capped at `max`.
 fn tmax_grid(max: usize) -> Vec<usize> {
-    const G: &[usize] = &[4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 32, 40];
+    const G: &[usize] = &[6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20, 28];
     let mut v: Vec<usize> = G.iter().copied().filter(|&t| t <= max).collect();
     if v.last() != Some(&max) {
         v.push(max);

@@ -50,11 +50,12 @@ MIN_BUCKET_Q = 12            # drop length buckets with fewer than this many que
 
 
 # ---- generous pool that scales with N (so pool is not the bottleneck) -------
-def generous_pool(n, cap):
-    # The relevant doc's overlap-rank grows ~√(k·N) (the pool law). Use a multiple of that
-    # at k = max KS so the rerank pool comfortably contains it, capped to bound rerank cost.
-    p = round(2.0 * math.sqrt(max(KS) * n))
-    return int(min(n, min(cap, max(1500, p))))
+def scaled_pool(n, coef, cap, floor):
+    # Pool scaled with N: coef·√(max_k·N). The generous pass uses coef=2 (so the rerank pool
+    # comfortably contains the relevant doc, whose overlap-rank grows ~√(kN)); the realistic
+    # pass uses coef≈0.05 (the Effort::Medium production pool). Capped/floored to bound cost.
+    p = round(coef * math.sqrt(max(KS) * n))
+    return int(min(n, min(cap, max(floor, p))))
 
 
 # ---- driving the sweep ------------------------------------------------------
@@ -81,7 +82,7 @@ def collect(args, out):
         return pd.read_csv(csv)
     frames = []
     for n in args.docs:
-        pool = args.pool if args.pool > 0 else generous_pool(n, args.pool_cap)
+        pool = args.pool if args.pool > 0 else scaled_pool(n, args.pool_coef, args.pool_cap, args.pool_floor)
         frames.append(run_sweep(args.corpus, n, args.queries, args.seed, args.edits,
                                 args.max_tmax, pool))
         # Checkpoint after each N, so a failure at a large N keeps the smaller-N data.
@@ -265,6 +266,10 @@ def main():
                     help="fixed generous pool; 0 = scale with N (the default)")
     ap.add_argument("--pool-cap", type=int, default=12000,
                     help="cap on the per-N scaled pool, to bound rerank cost")
+    ap.add_argument("--pool-coef", type=float, default=2.0,
+                    help="pool = coef*sqrt(max_k*N): 2.0 generous (default), ~0.05 realistic")
+    ap.add_argument("--pool-floor", type=int, default=1500,
+                    help="lower bound on the scaled pool")
     ap.add_argument("--out", default=None)
     ap.add_argument("--reuse-csv", action="store_true")
     args = ap.parse_args()

@@ -1,7 +1,11 @@
 # trifle
 
 [![CI](https://github.com/lathrys-at/trifle/actions/workflows/test.yaml/badge.svg)](https://github.com/lathrys-at/trifle/actions/workflows/test.yaml)
+[![Coverage](https://codecov.io/gh/lathrys-at/trifle/branch/main/graph/badge.svg)](https://codecov.io/gh/lathrys-at/trifle)
 [![crates.io](https://img.shields.io/crates/v/trifle.svg)](https://crates.io/crates/trifle)
+[![docs.rs](https://img.shields.io/docsrs/trifle)](https://docs.rs/trifle)
+[![MSRV](https://img.shields.io/crates/msrv/trifle)](https://crates.io/crates/trifle)
+[![License](https://img.shields.io/crates/l/trifle)](#license)
 
 Trifle is an embedded, typo-tolerant fuzzy search engine for Rust, backed by SQLite
 and tuned for large corpora of mostly small document segments with read-often and

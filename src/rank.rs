@@ -19,14 +19,17 @@ use rusqlite::types::Value;
 
 use crate::error::Result;
 use crate::instrument::trace_debug;
+use crate::model::{Key, KeyShape};
 use crate::store::Namespace;
 
-/// One ranked segment that survived candidate generation: its provenance, the id
-/// used internally for hydration, its overlap count, and (once hydrated) its text.
+/// One ranked segment that survived candidate generation: its provenance (the caller
+/// key and the segment label), the internal doc id it dedups on, the segment id used for
+/// hydration, its overlap count, and (once hydrated) its text.
 pub(crate) struct Survivor {
-    pub doc_id: i64,
-    pub source: String,
-    pub ref_: String,
+    pub key: Key,
+    pub label: String,
+    /// Internal document id — the dedup unit (one survivor per document).
+    pub doc: u32,
     pub seg_id: u32,
     pub overlap: u32,
     pub text: Option<String>,
@@ -91,12 +94,14 @@ fn count_eq(acc: &[RoaringBitmap], c: u32) -> RoaringBitmap {
 /// hydration to the high-overlap head. An id present in a posting but with no `seg`
 /// row (a monotonic-id segment deleted since the last fold) simply does not hydrate,
 /// so it never ranks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn overlap_search(
     conn: &Connection,
     ns: &Namespace,
     present: &[(&str, &RoaringBitmap)],
     limit: usize,
     min_shared: u32,
+    key_shape: KeyShape,
     scope: Option<&crate::ScopeFn<'_>>,
 ) -> Result<Vec<Survivor>> {
     let bitmaps: Vec<&RoaringBitmap> = present.iter().map(|(_, b)| *b).collect();
@@ -122,28 +127,28 @@ pub(crate) fn overlap_search(
 
     let acc = bitsliced_overlap(&bitmaps);
 
-    // doc_id -> its best (highest-count, lowest-id) segment.
-    let mut best: HashMap<i64, Survivor> = HashMap::new();
+    // internal doc id -> its best (highest-count, lowest-seg-id) segment.
+    let mut best: HashMap<u32, Survivor> = HashMap::new();
     for c in (floor..=max_count).rev() {
         let bucket = count_eq(&acc, c);
         if !bucket.is_empty() {
             let ids: Vec<u32> = bucket.iter().collect();
-            let provenance = hydrate_provenance(conn, ns, &ids)?;
+            let provenance = hydrate_provenance(conn, ns, &ids, key_shape)?;
             // `ids` is ascending (bitmap order), so the first segment recorded for a
             // doc is its lowest id at this — its highest — count.
             for id in ids {
-                let Some((doc_id, source, ref_)) = provenance.get(&id) else {
+                let Some((doc, key, label)) = provenance.get(&id) else {
                     continue; // posting id with no live segment row — skip
                 };
                 if let Some(scope) = scope {
-                    if !scope(*doc_id, source, ref_) {
+                    if !scope(key, label) {
                         continue;
                     }
                 }
-                best.entry(*doc_id).or_insert_with(|| Survivor {
-                    doc_id: *doc_id,
-                    source: source.clone(),
-                    ref_: ref_.clone(),
+                best.entry(*doc).or_insert_with(|| Survivor {
+                    key: key.clone(),
+                    label: label.clone(),
+                    doc: *doc,
                     seg_id: id,
                     overlap: c,
                     text: None,
@@ -156,8 +161,8 @@ pub(crate) fn overlap_search(
     }
 
     let mut survivors: Vec<Survivor> = best.into_values().collect();
-    // Overlap descending, then doc_id ascending — a stable, deterministic order.
-    survivors.sort_by(|a, b| b.overlap.cmp(&a.overlap).then(a.doc_id.cmp(&b.doc_id)));
+    // Overlap descending, then internal doc id ascending — stable, deterministic.
+    survivors.sort_by(|a, b| b.overlap.cmp(&a.overlap).then(a.doc.cmp(&b.doc)));
     survivors.truncate(limit);
     trace_debug!(
         survivors = survivors.len(),
@@ -166,27 +171,34 @@ pub(crate) fn overlap_search(
     Ok(survivors)
 }
 
-/// Provenance `(doc_id, source, ref)` per segment id, for a set of ids, in one
-/// batched `WHERE id IN rarray(?1)` read — no temp btree, one prepared statement.
+/// Provenance `(internal doc id, caller key, label)` per segment id, for a set of ids,
+/// in one batched `WHERE s.id IN rarray(?1)` read joining `seg` to `doc` — no temp btree,
+/// one prepared statement.
 fn hydrate_provenance(
     conn: &Connection,
     ns: &Namespace,
     ids: &[u32],
-) -> Result<HashMap<u32, (i64, String, String)>> {
+    key_shape: KeyShape,
+) -> Result<HashMap<u32, (u32, Key, String)>> {
     let mut out = HashMap::with_capacity(ids.len());
     if ids.is_empty() {
         return Ok(out);
     }
     let arr: Rc<Vec<Value>> = Rc::new(ids.iter().map(|&i| Value::Integer(i as i64)).collect());
     let sql = format!(
-        "SELECT id, doc_id, source, ref FROM {} WHERE id IN rarray(?1)",
-        ns.seg()
+        "SELECT s.id, s.doc_id, s.label, d.key FROM {seg} s \
+         JOIN {doc} d ON d.id = s.doc_id WHERE s.id IN rarray(?1)",
+        seg = ns.seg(),
+        doc = ns.doc(),
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query(rusqlite::params![arr])?;
     while let Some(r) = rows.next()? {
-        let id: i64 = r.get(0)?;
-        out.insert(id as u32, (r.get(1)?, r.get(2)?, r.get(3)?));
+        let seg_id: i64 = r.get(0)?;
+        let doc: i64 = r.get(1)?;
+        let label: String = r.get(2)?;
+        let kv: Value = r.get(3)?;
+        out.insert(seg_id as u32, (doc as u32, Key::from_value(key_shape, kv)?, label));
     }
     Ok(out)
 }
@@ -404,17 +416,13 @@ impl Candidate<'_> {
     pub fn index(&self) -> usize {
         self.index
     }
-    /// The caller's document id.
-    pub fn doc_id(&self) -> i64 {
-        self.s.doc_id
+    /// The caller's document key.
+    pub fn key(&self) -> &Key {
+        &self.s.key
     }
-    /// The provenance `source` label.
-    pub fn source(&self) -> &str {
-        &self.s.source
-    }
-    /// The provenance `ref` label.
-    pub fn ref_(&self) -> &str {
-        &self.s.ref_
+    /// The matched segment's label (the text field name).
+    pub fn label(&self) -> &str {
+        &self.s.label
     }
     /// How many selected tokens this candidate shares.
     pub fn overlap(&self) -> u32 {

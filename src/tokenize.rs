@@ -738,10 +738,10 @@ impl ScriptTokenizerBuilder {
     }
 }
 
-/// FNV-1a (64-bit). A tiny, dependency-free, version-stable hash for the tokenizer
-/// fingerprint — the value is stamped on disk, so it must not drift with the
+/// FNV-1a (64-bit). A tiny, dependency-free, version-stable hash for the tokenizer and
+/// schema fingerprints — the values are stamped on disk, so they must not drift with the
 /// standard library's default hasher.
-fn fnv1a_64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x00000100000001b3;
     let mut hash = OFFSET;

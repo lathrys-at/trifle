@@ -38,6 +38,11 @@ pub enum Error {
     #[error("invalid namespace: {0}")]
     Namespace(String),
 
+    /// The declared [`Schema`](crate::Schema) is invalid — for example no key field, a
+    /// duplicate or identifier-unsafe field name, or no text field to index.
+    #[error("invalid schema: {0}")]
+    Schema(String),
+
     /// The store is internally inconsistent in a way that cannot be repaired in
     /// place (for example a posting references a segment id with no row, beyond
     /// what a pending fold explains). The cache is rebuildable: a
@@ -55,5 +60,10 @@ impl Error {
     /// Construct an [`Error::Corrupt`] from anything string-like.
     pub(crate) fn corrupt(msg: impl Into<String>) -> Self {
         Error::Corrupt(msg.into())
+    }
+
+    /// Construct an [`Error::Schema`] from anything string-like.
+    pub(crate) fn schema(msg: impl Into<String>) -> Self {
+        Error::Schema(msg.into())
     }
 }

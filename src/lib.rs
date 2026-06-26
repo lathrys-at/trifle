@@ -55,6 +55,7 @@ pub mod store;
 pub mod tokenize;
 
 mod dict;
+mod model;
 mod postings;
 mod schema;
 mod select;
@@ -67,8 +68,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use roaring::RoaringBitmap;
-use rusqlite::Connection;
 use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension};
 
 /// Re-export of the `rusqlite` version trifle is built against, so consumers
 /// implementing a custom [`store::Backend`] (or constructing a [`store::Shared`])
@@ -76,6 +77,7 @@ use rusqlite::types::Value;
 pub use rusqlite;
 
 pub use error::{Error, Result};
+pub use model::{Document, Key, KeyShape, Match, Schema, SchemaBuilder, StorageMode};
 use dict::{Dictionary, TermId};
 use rank::{Bm25Ranker, Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
 use schema::SCHEMA_VERSION;
@@ -125,65 +127,15 @@ impl Config {
     }
 }
 
-/// A segment to index: `(doc_id, source, ref, text)`. Used by
-/// [`insert_batch`](Index::insert_batch) and [`rebuild`](Index::rebuild).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Segment {
-    /// The caller's document id — the unit of retrieval: a search returns at most one
-    /// match per `doc_id`.
-    pub doc_id: i64,
-    /// A category within the document, and the unit of write:
-    /// [`insert`](Index::insert) and [`remove_source`](Index::remove_source) operate on a
-    /// whole `(doc_id, source)`.
-    pub source: String,
-    /// A per-segment label returned on a match (e.g. a field name, a chunk position).
-    /// Metadata, not a key: there is no replace or delete by `ref`.
-    pub ref_: String,
-    /// The segment text (stored raw; the tokenizer normalizes internally).
-    pub text: String,
-}
-
-impl Segment {
-    /// Construct a segment.
-    pub fn new(
-        doc_id: i64,
-        source: impl Into<String>,
-        ref_: impl Into<String>,
-        text: impl Into<String>,
-    ) -> Self {
-        Segment {
-            doc_id,
-            source: source.into(),
-            ref_: ref_.into(),
-            text: text.into(),
-        }
-    }
-}
-
-/// One ranked match. Rank is conveyed by position in the returned `Vec<Match>`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Match {
-    /// The caller's document id.
-    pub doc_id: i64,
-    /// The matched segment's provenance category.
-    pub source: String,
-    /// The matched segment's provenance sub-location.
-    pub ref_: String,
-    /// The `[first, last)` UTF-8 byte span of the matched region within
-    /// [`text`](Self::text). `None` when no span could be located (a custom
-    /// tokenizer without span support, or text unavailable in contentless mode).
-    pub span: Option<(usize, usize)>,
-    /// The whole matched segment, original form. `None` only in contentless mode
-    /// when the resolver returned no text.
-    pub text: Option<String>,
-}
+// The data model — `Document`, `Match`, `Key`, `Schema`, … — lives in `model` and is
+// re-exported at the crate root.
 
 /// A scope/exclusion predicate over a candidate's provenance:
-/// `(doc_id, source, ref) -> keep`. Used for [`SearchOpts::scope`].
+/// `(key, label) -> keep`. Used for [`SearchOpts::scope`].
 ///
 /// The `'a` lifetime lets the predicate borrow local state (e.g. an allow-set on the
 /// stack); a `dyn Fn` alias without it would force `'static` and reject such closures.
-pub type ScopeFn<'a> = dyn Fn(i64, &str, &str) -> bool + 'a;
+pub type ScopeFn<'a> = dyn Fn(&Key, &str) -> bool + 'a;
 
 /// How hard the ranker tries: how deep a candidate pool to over-fetch and rerank.
 ///
@@ -364,6 +316,9 @@ pub struct Stats {
     pub tokenizer_fingerprint: u64,
     /// trifle's on-disk schema version.
     pub schema_version: u32,
+    /// The schema fingerprint currently stamped — the semantic identity of the declared
+    /// data model (folded into the drift check).
+    pub schema_fingerprint: u64,
 }
 
 /// What a [`compact`](Index::compact) reclaimed.
@@ -377,15 +332,6 @@ pub struct CompactStats {
     pub terms_dropped: u64,
     /// Delta-blob bytes the fold cleared.
     pub bytes_reclaimed: u64,
-}
-
-/// Where segment text comes from.
-enum Content {
-    /// Default: a text snapshot is stored in `seg.txt`.
-    Snapshot,
-    /// Contentless: no snapshot; text resolved through the caller's [`TextResolver`],
-    /// and per-segment token sets stored in `fwd` so deletion needs no text.
-    External(Box<dyn TextResolver>),
 }
 
 /// An embedded fuzzy-search index over text segments.
@@ -402,23 +348,26 @@ pub struct Index<T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
     backend: B,
     tokenizer: T,
     data_version: u64,
-    content: Content,
+    /// The declared data model (key shape, text fields, per-field storage modes).
+    schema: Schema,
+    /// The caller's text resolver, for `Resolver`-mode fields (`None` if unused).
+    resolver: Option<Box<dyn TextResolver>>,
     /// The in-memory faulting term dictionary (gram → `u32` id), shared by the writer
     /// and the read pool. Hydrated on open; rebuilt under the swap on `rebuild`.
     dict: Dictionary,
 }
 
 impl Index<TrigramTokenizer, Sidecar> {
-    /// Open (creating if absent) an index at `path` with the default trigram
-    /// tokenizer and an owned [`Sidecar`] file. The common case.
+    /// Open (creating if absent) an index at `path` with the given [`Schema`], the
+    /// default trigram tokenizer, and an owned [`Sidecar`] file. The common case.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be opened or the store cannot be
     /// initialized.
-    pub fn open_at(path: &Path, config: Config) -> Result<Self> {
+    pub fn open_at(path: &Path, schema: Schema, config: Config) -> Result<Self> {
         let backend = Sidecar::open(path)?;
-        Index::open(backend, TrigramTokenizer::new(), config)
+        Index::open(backend, TrigramTokenizer::new(), schema, config)
     }
 }
 
@@ -434,16 +383,19 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     /// # Errors
     ///
     /// Returns an error if the store cannot be initialized.
-    pub fn open(backend: B, tokenizer: T, config: Config) -> Result<Self> {
-        let content = match config.external_content {
-            Some(resolver) => Content::External(resolver),
-            None => Content::Snapshot,
-        };
+    pub fn open(backend: B, tokenizer: T, schema: Schema, config: Config) -> Result<Self> {
+        // A `Resolver`-mode field needs a resolver; reject the mismatch up front.
+        if schema.needs_resolver() && config.external_content.is_none() {
+            return Err(Error::InvalidInput(
+                "schema has a Resolver-mode field but no TextResolver was configured".into(),
+            ));
+        }
         let index = Index {
             backend,
             tokenizer,
             data_version: config.data_version,
-            content,
+            schema,
+            resolver: config.external_content,
             dict: Dictionary::empty(),
         };
         index.init()?;
@@ -456,32 +408,31 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(index)
     }
 
-    fn is_contentless(&self) -> bool {
-        matches!(self.content, Content::External(_))
-    }
-
     /// Create tables and reconcile drift, all in one transaction.
     fn init(&self) -> Result<()> {
         let mut guard = self.backend.write()?;
         let ns = self.backend.namespace();
+        let key_ty = self.schema.key_shape().sql_type();
         let tx = guard.transaction()?;
         schema::drop_shadows(&tx, ns)?;
-        schema::create_tables(&tx, ns)?;
+        schema::create_tables(&tx, ns, key_ty)?;
 
         let stamps = schema::read_stamps(&tx, ns)?;
         let fingerprint = self.tokenizer.fingerprint();
+        let schema_fp = self.schema.fingerprint();
         let drift = stamps.schema_version != Some(SCHEMA_VERSION)
             || stamps.fingerprint != Some(fingerprint)
-            || stamps.data_version != Some(self.data_version);
+            || stamps.data_version != Some(self.data_version)
+            || stamps.schema_fingerprint != Some(schema_fp);
         let desync = !drift && self.desync(&tx, ns)?;
 
         if drift || desync {
-            schema::reset(&tx, ns)?;
+            schema::reset(&tx, ns, key_ty)?;
             schema::set_next_id(&tx, ns, 1)?;
             // A reset empties the dictionary and so reassigns the (now empty) id space;
             // bump the generation so any concurrent reader detects the change.
             schema::bump_dict_generation(&tx, ns)?;
-            schema::write_stamps(&tx, ns, self.data_version, fingerprint)?;
+            schema::write_stamps(&tx, ns, self.data_version, fingerprint, schema_fp)?;
         }
         tx.commit()?;
         Ok(())
@@ -501,19 +452,24 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
 
     // ----- writes -------------------------------------------------------------
 
-    /// Replace all segments under `(doc_id, source)` with the given `(ref, text)`
-    /// pairs, in one transaction.
+    /// Replace all segments of the document keyed `key` with the given `(label, text)`
+    /// pairs, in one transaction (creating the document if absent).
+    ///
+    /// Each `label` must name a text field the [`Schema`] accepts (a declared field, or
+    /// any label when the schema has a default text mode).
     ///
     /// # Errors
     ///
-    /// Returns an error if the store write fails.
-    pub fn insert(&self, doc_id: i64, source: &str, segments: &[(&str, &str)]) -> Result<()> {
+    /// [`Error::InvalidInput`] for a label the schema does not accept; otherwise an error
+    /// if the store write fails.
+    pub fn insert(&self, key: impl Into<Key>, segments: &[(&str, &str)]) -> Result<()> {
+        let key = key.into();
         let mut guard = self.backend.write()?;
         let ns = self.backend.namespace();
         let tx = guard.transaction()?;
         let mut stage = self.dict.stage();
         let mut changes = TokenChanges::default();
-        self.replace_group(&tx, ns, doc_id, source, segments, &mut changes, &mut stage)?;
+        self.replace_doc(&tx, ns, &key, segments, &mut changes, &mut stage)?;
         let df_changes = changes.apply(&tx, ns)?;
         tx.commit()?;
         // Only after the transaction commits do the newly-interned grams enter the
@@ -524,23 +480,15 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
-    /// Insert many segments in one transaction. Segments are grouped by
-    /// `(doc_id, source)`, and each group replaces any existing segments under that
-    /// pair (the same semantics as [`insert`](Self::insert)).
+    /// Insert many documents in one (atomic) transaction; each replaces any existing
+    /// segments under its key (the same semantics as [`insert`](Self::insert)).
     ///
     /// # Errors
     ///
-    /// Returns an error if the store write fails.
-    pub fn insert_batch(&self, batch: impl IntoIterator<Item = Segment>) -> Result<()> {
-        // Group by (doc_id, source); a group's segments all become that pair's content.
-        let mut groups: HashMap<(i64, String), Vec<(String, String)>> = HashMap::new();
-        for seg in batch {
-            groups
-                .entry((seg.doc_id, seg.source))
-                .or_default()
-                .push((seg.ref_, seg.text));
-        }
-        if groups.is_empty() {
+    /// Returns an error if the store write fails (rolling the whole batch back).
+    pub fn insert_batch(&self, batch: impl IntoIterator<Item = Document>) -> Result<()> {
+        let docs: Vec<Document> = batch.into_iter().collect();
+        if docs.is_empty() {
             return Ok(());
         }
         let mut guard = self.backend.write()?;
@@ -548,12 +496,13 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let tx = guard.transaction()?;
         let mut stage = self.dict.stage();
         let mut changes = TokenChanges::default();
-        for ((doc_id, source), refs_text) in &groups {
-            let pairs: Vec<(&str, &str)> = refs_text
+        for d in &docs {
+            let pairs: Vec<(&str, &str)> = d
+                .segments
                 .iter()
-                .map(|(r, t)| (r.as_str(), t.as_str()))
+                .map(|(l, t)| (l.as_str(), t.as_str()))
                 .collect();
-            self.replace_group(&tx, ns, *doc_id, source, &pairs, &mut changes, &mut stage)?;
+            self.replace_doc(&tx, ns, &d.key, &pairs, &mut changes, &mut stage)?;
         }
         let df_changes = changes.apply(&tx, ns)?;
         tx.commit()?;
@@ -562,27 +511,27 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
-    /// Remove all segments of `doc_id` (every source), in one transaction.
+    /// Remove the document keyed `key` and all its segments, in one transaction. A
+    /// nonexistent key is a no-op.
     ///
     /// # Errors
     ///
     /// Returns an error if the store write fails.
-    pub fn remove(&self, doc_id: i64) -> Result<()> {
+    pub fn remove(&self, key: impl Into<Key>) -> Result<()> {
+        let key = key.into();
         let mut guard = self.backend.write()?;
         let ns = self.backend.namespace();
         let tx = guard.transaction()?;
-
-        let old = self.old_segments(&tx, ns, doc_id, None)?;
         let mut changes = TokenChanges::default();
-        for (id, tokens) in old {
-            changes.remove(id, &tokens);
-        }
-        tx.execute(
-            &format!("DELETE FROM {} WHERE doc_id = ?1", ns.seg()),
-            rusqlite::params![doc_id],
-        )?;
-        if self.is_contentless() {
-            self.delete_fwd_for_doc(&tx, ns, doc_id)?;
+        if let Some(doc) = self.doc_id_for(&tx, ns, &key, false)? {
+            for (id, tokens) in self.doc_segments(&tx, ns, doc)? {
+                changes.remove(id, &tokens);
+            }
+            self.delete_doc_rows(&tx, ns, doc)?;
+            tx.execute(
+                &format!("DELETE FROM {} WHERE id = ?1", ns.doc()),
+                rusqlite::params![doc],
+            )?;
         }
         let df_changes = changes.apply(&tx, ns)?;
         tx.commit()?;
@@ -590,162 +539,132 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
-    /// Remove every segment of `doc_id` under one `source`, leaving the doc's other
-    /// sources intact, in one transaction. A `(doc_id, source)` pair with no segments
-    /// is a no-op. This is the delete counterpart to [`insert`](Self::insert) (which
-    /// replaces a `(doc_id, source)` group); [`remove`](Self::remove) drops every source.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store write fails.
-    pub fn remove_source(&self, doc_id: i64, source: &str) -> Result<()> {
-        let mut guard = self.backend.write()?;
-        let ns = self.backend.namespace();
-        let tx = guard.transaction()?;
-        let mut stage = self.dict.stage();
-        let mut changes = TokenChanges::default();
-        // Replacing the group with no segments deletes it (no interning happens, so the
-        // stage stays empty and its commit is a no-op).
-        self.replace_group(&tx, ns, doc_id, source, &[], &mut changes, &mut stage)?;
-        let df_changes = changes.apply(&tx, ns)?;
-        tx.commit()?;
-        stage.commit();
-        self.dict.apply_df_changes(&df_changes);
-        Ok(())
-    }
-
-    /// Delete-then-insert one `(doc_id, source)` group, accumulating its token
-    /// changes into `changes` (applied once per write batch) and interning new grams
-    /// through `stage`.
-    #[allow(clippy::too_many_arguments)]
-    fn replace_group(
+    /// Find the internal doc id for `key`, creating a fresh `doc` row if absent and
+    /// `create` is set (otherwise `None`).
+    fn doc_id_for(
         &self,
         conn: &Connection,
         ns: &Namespace,
-        doc_id: i64,
-        source: &str,
+        key: &Key,
+        create: bool,
+    ) -> Result<Option<i64>> {
+        let found: Option<i64> = conn
+            .query_row(
+                &format!("SELECT id FROM {} WHERE key = ?1", ns.doc()),
+                rusqlite::params![key.to_value()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = found {
+            return Ok(Some(id));
+        }
+        if !create {
+            return Ok(None);
+        }
+        conn.execute(
+            &format!("INSERT INTO {}(key) VALUES(?1)", ns.doc()),
+            rusqlite::params![key.to_value()],
+        )?;
+        Ok(Some(conn.last_insert_rowid()))
+    }
+
+    /// The `(seg_id, interned term-id set)` of every segment under an internal doc id,
+    /// read from the `fwd` index (delete needs neither the text nor the tokenizer).
+    fn doc_segments(
+        &self,
+        conn: &Connection,
+        ns: &Namespace,
+        doc: i64,
+    ) -> Result<Vec<(u32, Vec<TermId>)>> {
+        let ids: Vec<u32> = {
+            let mut stmt =
+                conn.prepare_cached(&format!("SELECT id FROM {} WHERE doc_id = ?1", ns.seg()))?;
+            let mut rows = stmt.query(rusqlite::params![doc])?;
+            let mut v = Vec::new();
+            while let Some(r) = rows.next()? {
+                v.push(r.get::<_, i64>(0)? as u32);
+            }
+            v
+        };
+        let fwd = self.read_fwd(conn, ns, &ids)?;
+        Ok(ids
+            .into_iter()
+            .map(|id| (id, fwd.get(&id).cloned().unwrap_or_default()))
+            .collect())
+    }
+
+    /// Delete the `seg` and `fwd` rows of an internal doc id (not the `doc` row).
+    fn delete_doc_rows(&self, conn: &Connection, ns: &Namespace, doc: i64) -> Result<()> {
+        conn.execute(
+            &format!(
+                "DELETE FROM {} WHERE id IN (SELECT id FROM {} WHERE doc_id = ?1)",
+                ns.fwd(),
+                ns.seg()
+            ),
+            rusqlite::params![doc],
+        )?;
+        conn.execute(
+            &format!("DELETE FROM {} WHERE doc_id = ?1", ns.seg()),
+            rusqlite::params![doc],
+        )?;
+        Ok(())
+    }
+
+    /// Replace all of a document's segments: find/create its `doc` row, drop its existing
+    /// segments (accumulating their removals into `changes`), then insert the new ones,
+    /// interning each segment's grams through `stage`. The `fwd` term-id set is stored for
+    /// every segment so delete never needs text; `seg.txt` is stored only for a `Stored`
+    /// field.
+    fn replace_doc(
+        &self,
+        conn: &Connection,
+        ns: &Namespace,
+        key: &Key,
         segments: &[(&str, &str)],
         changes: &mut TokenChanges,
         stage: &mut dict::InternStage<'_>,
     ) -> Result<()> {
-        // Removals: the old segments' ids and interned term-id sets.
-        let old = self.old_segments(conn, ns, doc_id, Some(source))?;
-        for (id, tokens) in old {
+        let doc = self
+            .doc_id_for(conn, ns, key, true)?
+            .expect("create=true always yields a doc id");
+        // Removals: the old segments' ids and term-id sets, then drop their rows.
+        for (id, tokens) in self.doc_segments(conn, ns, doc)? {
             changes.remove(id, &tokens);
         }
-        conn.execute(
-            &format!("DELETE FROM {} WHERE doc_id = ?1 AND source = ?2", ns.seg()),
-            rusqlite::params![doc_id, source],
-        )?;
-        if self.is_contentless() {
-            conn.execute(
-                &format!(
-                    "DELETE FROM {} WHERE id IN (SELECT id FROM {} WHERE doc_id = ?1 AND source = ?2)",
-                    ns.fwd(),
-                    ns.seg()
-                ),
-                rusqlite::params![doc_id, source],
-            )?;
-        }
+        self.delete_doc_rows(conn, ns, doc)?;
 
         if segments.is_empty() {
             return Ok(());
         }
-        // Additions: fresh monotonic segment ids for the new segments.
         let first_id = schema::alloc_ids(conn, ns, segments.len() as u64)?;
-        let contentless = self.is_contentless();
         let mut seg_ins = conn.prepare_cached(&format!(
-            "INSERT INTO {}(id, doc_id, source, ref, txt) VALUES(?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO {}(id, doc_id, label, txt) VALUES(?1, ?2, ?3, ?4)",
             ns.seg()
         ))?;
-        let mut fwd_ins = if contentless {
-            Some(conn.prepare_cached(&format!(
-                "INSERT INTO {}(id, tokens) VALUES(?1, ?2)",
-                ns.fwd()
-            ))?)
-        } else {
-            None
-        };
-        for (i, (ref_, text)) in segments.iter().enumerate() {
+        let mut fwd_ins =
+            conn.prepare_cached(&format!("INSERT INTO {}(id, tokens) VALUES(?1, ?2)", ns.fwd()))?;
+        for (i, (label, text)) in segments.iter().enumerate() {
+            let mode = self.schema.storage_for(label).ok_or_else(|| {
+                Error::InvalidInput(format!("label {label:?} is not a field of the schema"))
+            })?;
             let id = first_id + i as i64;
-            let stored_txt = if contentless { None } else { Some(*text) };
-            seg_ins.execute(rusqlite::params![id, doc_id, source, ref_, stored_txt])?;
+            let stored_txt = if mode == StorageMode::Stored {
+                Some(*text)
+            } else {
+                None
+            };
+            seg_ins.execute(rusqlite::params![id, doc, label, stored_txt])?;
             // Intern this segment's distinct grams to term-ids (writer fault).
             let tokens = self.distinct_tokens(text);
             let mut ids: Vec<TermId> = Vec::with_capacity(tokens.len());
             for t in &tokens {
                 ids.push(stage.intern(t, conn, ns)?);
             }
-            if let Some(stmt) = fwd_ins.as_mut() {
-                // The forward index stores the segment's term-id set as a roaring bitmap
-                // (so a later delete needs neither the text nor the tokenizer).
-                let bm: RoaringBitmap = ids.iter().copied().collect();
-                stmt.execute(rusqlite::params![id, postings::serialize(&bm)?])?;
-            }
+            let bm: RoaringBitmap = ids.iter().copied().collect();
+            fwd_ins.execute(rusqlite::params![id, postings::serialize(&bm)?])?;
             changes.add(id as u32, &ids);
         }
         Ok(())
-    }
-
-    /// The `(seg_id, interned term-id set)` of every existing segment under `doc_id`
-    /// (optionally one `source`). In snapshot mode the set is re-derived from the stored
-    /// text and resolved through the dictionary; in contentless mode it comes from the
-    /// stored `fwd` term-id bitmap (the source text is typically already gone on a
-    /// delete — the §5 win).
-    fn old_segments(
-        &self,
-        conn: &Connection,
-        ns: &Namespace,
-        doc_id: i64,
-        source: Option<&str>,
-    ) -> Result<Vec<(u32, Vec<TermId>)>> {
-        let (sql, params): (String, Vec<Value>) = match source {
-            Some(s) => (
-                format!(
-                    "SELECT id, txt FROM {} WHERE doc_id = ?1 AND source = ?2",
-                    ns.seg()
-                ),
-                vec![Value::Integer(doc_id), Value::Text(s.to_string())],
-            ),
-            None => (
-                format!("SELECT id, txt FROM {} WHERE doc_id = ?1", ns.seg()),
-                vec![Value::Integer(doc_id)],
-            ),
-        };
-        let mut rows_out: Vec<(u32, Option<String>)> = Vec::new();
-        {
-            let mut stmt = conn.prepare_cached(&sql)?;
-            let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-            while let Some(r) = rows.next()? {
-                rows_out.push((r.get::<_, i64>(0)? as u32, r.get::<_, Option<String>>(1)?));
-            }
-        }
-        if self.is_contentless() {
-            let ids: Vec<u32> = rows_out.iter().map(|(id, _)| *id).collect();
-            let fwd = self.read_fwd(conn, ns, &ids)?;
-            Ok(ids
-                .into_iter()
-                .map(|id| (id, fwd.get(&id).cloned().unwrap_or_default()))
-                .collect())
-        } else {
-            // Re-tokenize and resolve each gram to its id. A stored segment's grams were
-            // interned at insert and dict rows are permanent between rebuilds, so a miss
-            // is an internal-invariant violation (not an absent token) — fail loud, since
-            // a dropped removal would silently drift df.
-            let mut out = Vec::with_capacity(rows_out.len());
-            for (id, txt) in rows_out {
-                let tokens = self.distinct_tokens(txt.as_deref().unwrap_or(""));
-                let mut ids = Vec::with_capacity(tokens.len());
-                for t in &tokens {
-                    let tid = self.dict.resolve(t).ok_or_else(|| {
-                        Error::corrupt("stored segment gram missing from dictionary")
-                    })?;
-                    ids.push(tid);
-                }
-                out.push((id, ids));
-            }
-            Ok(out)
-        }
     }
 
     /// The distinct token strings of `text`, deduplicated via the token type (no
@@ -794,76 +713,79 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     ///
     /// Returns an error if the store write fails; on failure the live index is left
     /// intact.
-    pub fn rebuild(&self, corpus: impl IntoIterator<Item = Segment>) -> Result<()> {
+    pub fn rebuild(&self, corpus: impl IntoIterator<Item = Document>) -> Result<()> {
         let mut guard = self.backend.write()?;
         let ns = self.backend.namespace();
-        let contentless = self.is_contentless();
+        let key_ty = self.schema.key_shape().sql_type();
 
         let tx = guard.transaction()?;
-        schema::create_shadows(&tx, ns)?;
+        schema::create_shadows(&tx, ns, key_ty)?;
 
-        // Accumulate the inverted index in memory while streaming segment rows to the
-        // shadow tables (O(chunk) memory for the text; postings are roaring-compact).
-        // Term-ids are reassigned dense first-encounter into a rebuild-local map; the
-        // inverted index is keyed by that id, and the dictionary is rewritten from it.
-        // Keyed by the gram's packed u128 term encoding (the dictionary key), so the
-        // dictionary shadow rows write the 16-byte big-endian blob directly.
+        // Accumulate the inverted index in memory while streaming doc/seg rows to the
+        // shadow tables. Three id spaces are reassigned dense (doc, segment, term); the
+        // inverted index is keyed by segment id and the dictionary by the gram's packed
+        // u128 (stored as the 16-byte big-endian blob).
         let mut local: HashMap<u128, TermId> = HashMap::new();
         let mut next_term: u64 = 1;
         let mut inverted: HashMap<TermId, RoaringBitmap> = HashMap::new();
-        let mut next_id: i64 = 1;
+        let mut next_doc: i64 = 1;
+        let mut next_seg: i64 = 1;
         {
+            let mut doc_ins = tx.prepare_cached(&format!(
+                "INSERT INTO {}(id, key) VALUES(?1, ?2)",
+                ns.doc_shadow()
+            ))?;
             let mut seg_ins = tx.prepare_cached(&format!(
-                "INSERT INTO {}(id, doc_id, source, ref, txt) VALUES(?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO {}(id, doc_id, label, txt) VALUES(?1, ?2, ?3, ?4)",
                 ns.seg_shadow()
             ))?;
-            let mut fwd_ins = if contentless {
-                Some(tx.prepare_cached(&format!(
-                    "INSERT INTO {}(id, tokens) VALUES(?1, ?2)",
-                    ns.fwd_shadow()
-                ))?)
-            } else {
-                None
-            };
-            for seg in corpus {
-                let id = next_id;
-                next_id += 1;
-                let stored_txt = if contentless {
-                    None
-                } else {
-                    Some(seg.text.as_str())
-                };
-                seg_ins.execute(rusqlite::params![
-                    id, seg.doc_id, seg.source, seg.ref_, stored_txt
-                ])?;
-                let tokens = self.distinct_tokens(&seg.text);
-                let mut ids: Vec<TermId> = Vec::with_capacity(tokens.len());
-                for tok in tokens {
-                    let key = term::encode_term(&tok)
-                        .ok_or_else(|| {
-                            Error::InvalidInput(format!(
-                                "gram {tok:?} exceeds the 3-codepoint term-encoding ceiling"
-                            ))
-                        })?
-                        .0;
-                    let tid = match local.get(&key) {
-                        Some(&t) => t,
-                        None => {
-                            if next_term == 0 || next_term > u32::MAX as u64 {
-                                return Err(Error::corrupt("term id space exhausted"));
-                            }
-                            let t = next_term as TermId;
-                            next_term += 1;
-                            local.insert(key, t);
-                            t
-                        }
+            let mut fwd_ins = tx.prepare_cached(&format!(
+                "INSERT INTO {}(id, tokens) VALUES(?1, ?2)",
+                ns.fwd_shadow()
+            ))?;
+            for doc in corpus {
+                let doc_id = next_doc;
+                next_doc += 1;
+                doc_ins.execute(rusqlite::params![doc_id, doc.key.to_value()])?;
+                for (label, text) in &doc.segments {
+                    let mode = self.schema.storage_for(label).ok_or_else(|| {
+                        Error::InvalidInput(format!("label {label:?} is not a field of the schema"))
+                    })?;
+                    let seg_id = next_seg;
+                    next_seg += 1;
+                    let stored_txt = if mode == StorageMode::Stored {
+                        Some(text.as_str())
+                    } else {
+                        None
                     };
-                    ids.push(tid);
-                    inverted.entry(tid).or_default().insert(id as u32);
-                }
-                if let Some(stmt) = fwd_ins.as_mut() {
+                    seg_ins.execute(rusqlite::params![seg_id, doc_id, label, stored_txt])?;
+                    let tokens = self.distinct_tokens(text);
+                    let mut ids: Vec<TermId> = Vec::with_capacity(tokens.len());
+                    for tok in tokens {
+                        let gkey = term::encode_term(&tok)
+                            .ok_or_else(|| {
+                                Error::InvalidInput(format!(
+                                    "gram {tok:?} exceeds the 3-codepoint term-encoding ceiling"
+                                ))
+                            })?
+                            .0;
+                        let tid = match local.get(&gkey) {
+                            Some(&t) => t,
+                            None => {
+                                if next_term == 0 || next_term > u32::MAX as u64 {
+                                    return Err(Error::corrupt("term id space exhausted"));
+                                }
+                                let t = next_term as TermId;
+                                next_term += 1;
+                                local.insert(gkey, t);
+                                t
+                            }
+                        };
+                        ids.push(tid);
+                        inverted.entry(tid).or_default().insert(seg_id as u32);
+                    }
                     let bm: RoaringBitmap = ids.iter().copied().collect();
-                    stmt.execute(rusqlite::params![id, postings::serialize(&bm)?])?;
+                    fwd_ins.execute(rusqlite::params![seg_id, postings::serialize(&bm)?])?;
                 }
             }
         }
@@ -874,8 +796,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 "INSERT INTO {}(id, gram) VALUES(?1, ?2)",
                 ns.dict_shadow()
             ))?;
-            for (key, id) in &local {
-                dict_ins.execute(rusqlite::params![*id as i64, key.to_be_bytes().as_slice()])?;
+            for (gkey, id) in &local {
+                dict_ins.execute(rusqlite::params![*id as i64, gkey.to_be_bytes().as_slice()])?;
             }
         }
 
@@ -887,11 +809,17 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         )?;
 
         schema::swap_shadows(&tx, ns)?;
-        schema::set_next_id(&tx, ns, next_id)?;
+        schema::set_next_id(&tx, ns, next_seg)?;
         // Reassigning the term-id space bumps the generation so a concurrent reader
         // detects the change and re-resolves against the new snapshot.
         schema::bump_dict_generation(&tx, ns)?;
-        schema::write_stamps(&tx, ns, self.data_version, self.tokenizer.fingerprint())?;
+        schema::write_stamps(
+            &tx,
+            ns,
+            self.data_version,
+            self.tokenizer.fingerprint(),
+            self.schema.fingerprint(),
+        )?;
         tx.commit()?;
         // Re-hydrate the in-memory dictionary from the swapped-in tables, still under the
         // held write lease — so no reader splices the old map onto the new snapshot.
@@ -924,6 +852,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 .fingerprint
                 .unwrap_or_else(|| self.tokenizer.fingerprint()),
             schema_version: stamps.schema_version.unwrap_or(SCHEMA_VERSION),
+            schema_fingerprint: stamps
+                .schema_fingerprint
+                .unwrap_or_else(|| self.schema.fingerprint()),
         })
     }
 
@@ -1054,8 +985,15 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                     })
                     .collect();
 
-                let mut survivors =
-                    overlap_search(conn, ns, &present, pool, min_shared, opts.scope)?;
+                let mut survivors = overlap_search(
+                    conn,
+                    ns,
+                    &present,
+                    pool,
+                    min_shared,
+                    self.schema.key_shape(),
+                    opts.scope,
+                )?;
                 self.hydrate_text(conn, ns, &mut survivors)?;
 
                 out.push(self.rank_to_matches(
@@ -1099,9 +1037,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 .as_deref()
                 .and_then(|t| self.tokenizer.span(t, &sel_refs));
             matches.push(Match {
-                doc_id: s.doc_id,
-                source: s.source.clone(),
-                ref_: s.ref_.clone(),
+                key: s.key.clone(),
+                label: s.label.clone(),
                 span,
                 text: s.text.clone(),
             });
@@ -1109,8 +1046,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         matches
     }
 
-    /// Hydrate each survivor's text: from `seg.txt` (snapshot) or the resolver
-    /// (contentless), in one batched read.
+    /// Hydrate each survivor's text according to its field's [`StorageMode`]: `Stored`
+    /// from `seg.txt` (one batched read), `Resolver` from the caller's resolver (one
+    /// batched callback), `CoordinatesOnly` left `None`.
     fn hydrate_text(
         &self,
         conn: &Connection,
@@ -1120,39 +1058,48 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         if survivors.is_empty() {
             return Ok(());
         }
-        match &self.content {
-            Content::Snapshot => {
-                let ids: Vec<u32> = survivors.iter().map(|s| s.seg_id).collect();
-                let arr: std::rc::Rc<Vec<Value>> =
-                    std::rc::Rc::new(ids.iter().map(|&i| Value::Integer(i as i64)).collect());
-                let sql = format!("SELECT id, txt FROM {} WHERE id IN rarray(?1)", ns.seg());
-                let mut texts: HashMap<u32, Option<String>> = HashMap::with_capacity(ids.len());
-                {
-                    let mut stmt = conn.prepare_cached(&sql)?;
-                    let mut rows = stmt.query(rusqlite::params![arr])?;
-                    while let Some(r) = rows.next()? {
-                        texts.insert(r.get::<_, i64>(0)? as u32, r.get::<_, Option<String>>(1)?);
-                    }
-                }
-                for s in survivors {
-                    s.text = texts.get(&s.seg_id).cloned().flatten();
-                }
+        // Stored text — `seg.txt` is NULL for any non-`Stored` field, so this batched read
+        // naturally yields `None` for them.
+        let ids: Vec<u32> = survivors.iter().map(|s| s.seg_id).collect();
+        let arr: std::rc::Rc<Vec<Value>> =
+            std::rc::Rc::new(ids.iter().map(|&i| Value::Integer(i as i64)).collect());
+        let sql = format!("SELECT id, txt FROM {} WHERE id IN rarray(?1)", ns.seg());
+        let mut texts: HashMap<u32, Option<String>> = HashMap::with_capacity(ids.len());
+        {
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let mut rows = stmt.query(rusqlite::params![arr])?;
+            while let Some(r) = rows.next()? {
+                texts.insert(r.get::<_, i64>(0)? as u32, r.get::<_, Option<String>>(1)?);
             }
-            Content::External(resolver) => {
-                let segs: Vec<(i64, &str, &str)> = survivors
-                    .iter()
-                    .map(|s| (s.doc_id, s.source.as_str(), s.ref_.as_str()))
-                    .collect();
-                let texts = resolver.resolve(&segs)?;
-                for (s, text) in survivors.iter_mut().zip(texts) {
-                    s.text = text;
+        }
+        // Assign per storage mode; collect `Resolver`-mode survivors for one callback.
+        let mut resolver_idx: Vec<usize> = Vec::new();
+        for (i, s) in survivors.iter_mut().enumerate() {
+            match self.schema.storage_for(&s.label) {
+                Some(StorageMode::Stored) => s.text = texts.get(&s.seg_id).cloned().flatten(),
+                Some(StorageMode::Resolver) => resolver_idx.push(i),
+                _ => s.text = None, // CoordinatesOnly (or a label no longer in the schema)
+            }
+        }
+        if !resolver_idx.is_empty() {
+            if let Some(resolver) = &self.resolver {
+                let got = {
+                    let segs: Vec<(&Key, &str)> = resolver_idx
+                        .iter()
+                        .map(|&i| (&survivors[i].key, survivors[i].label.as_str()))
+                        .collect();
+                    resolver.resolve(&segs)?
+                };
+                for (slot, text) in resolver_idx.iter().zip(got) {
+                    survivors[*slot].text = text;
                 }
             }
         }
         Ok(())
     }
 
-    /// Read the stored `fwd` term-id sets for a set of segment ids (contentless mode).
+    /// Read the stored `fwd` term-id sets for a set of segment ids (every segment has
+    /// one, so delete needs neither the text nor the tokenizer).
     fn read_fwd(
         &self,
         conn: &Connection,
@@ -1174,19 +1121,6 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             out.insert(id as u32, postings::deserialize(&blob)?.iter().collect());
         }
         Ok(out)
-    }
-
-    /// Delete `fwd` rows for every segment of a doc (contentless delete).
-    fn delete_fwd_for_doc(&self, conn: &Connection, ns: &Namespace, doc_id: i64) -> Result<()> {
-        conn.execute(
-            &format!(
-                "DELETE FROM {} WHERE id IN (SELECT id FROM {} WHERE doc_id = ?1)",
-                ns.fwd(),
-                ns.seg()
-            ),
-            rusqlite::params![doc_id],
-        )?;
-        Ok(())
     }
 
     /// Run a search read on a pooled connection under one WAL snapshot, resolving the

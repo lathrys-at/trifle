@@ -127,12 +127,8 @@ impl Dictionary {
         Ok(())
     }
 
-    /// Reader fault: resolve a gram to its id, or `None` if absent. Never mutates.
-    pub(crate) fn resolve(&self, gram: &str) -> Option<TermId> {
-        let key = gram_key(gram)?;
-        self.resolve_key(key)
-    }
-
+    /// Reader fault: resolve a gram-encoding key to its id, or `None` if absent. Never
+    /// mutates. (Batched query resolution goes through [`resolve_batch`](Self::resolve_batch).)
     fn resolve_key(&self, key: u128) -> Option<TermId> {
         self.inner
             .read()

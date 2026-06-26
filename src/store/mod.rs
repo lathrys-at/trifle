@@ -101,7 +101,9 @@ pub(crate) fn register_carray(conn: &Connection) -> Result<()> {
 pub struct TableMap {
     /// Key/value metadata: schema/data/tokenizer version stamps, rolling counters.
     pub meta: String,
-    /// One row per indexed segment (id, provenance, snapshot text).
+    /// One row per document: the internal dense id and the caller's key.
+    pub doc: String,
+    /// One row per indexed segment (id, doc_id, label, snapshot text).
     pub seg: String,
     /// Contentless-mode forward index (per-segment token set); unused in snapshot
     /// mode.
@@ -121,9 +123,10 @@ pub struct TableMap {
 
 impl TableMap {
     /// Every persistent table name, in a stable order.
-    fn names(&self) -> [&str; 7] {
+    fn names(&self) -> [&str; 8] {
         [
             &self.meta,
+            &self.doc,
             &self.seg,
             &self.fwd,
             &self.term,
@@ -145,6 +148,7 @@ impl TableMap {
 pub struct Namespace {
     map: TableMap,
     // Derived transient rebuild-shadow names, parallel to the persistent tables.
+    doc_shadow: String,
     seg_shadow: String,
     fwd_shadow: String,
     term_shadow: String,
@@ -177,6 +181,7 @@ impl Namespace {
         let t = |name: &str| format!("{prefix}{name}");
         Namespace::explicit(TableMap {
             meta: t("meta"),
+            doc: t("doc"),
             seg: t("seg"),
             fwd: t("fwd"),
             term: t("term"),
@@ -203,6 +208,7 @@ impl Namespace {
             validate_ident(name)?;
         }
         let ns = Namespace {
+            doc_shadow: format!("{}_shadow", map.doc),
             seg_shadow: format!("{}_shadow", map.seg),
             fwd_shadow: format!("{}_shadow", map.fwd),
             term_shadow: format!("{}_shadow", map.term),
@@ -215,6 +221,7 @@ impl Namespace {
         // can still push its `_shadow` suffix past it, which would only fail at DDL
         // time, far from this call. Validate here so the caller hears it immediately.
         for shadow in [
+            &ns.doc_shadow,
             &ns.seg_shadow,
             &ns.fwd_shadow,
             &ns.term_shadow,
@@ -242,12 +249,14 @@ impl Namespace {
     pub fn table_names(&self) -> impl Iterator<Item = &str> {
         [
             self.map.meta.as_str(),
+            self.map.doc.as_str(),
             self.map.seg.as_str(),
             self.map.fwd.as_str(),
             self.map.term.as_str(),
             self.map.post.as_str(),
             self.map.delta.as_str(),
             self.map.dict.as_str(),
+            self.doc_shadow.as_str(),
             self.seg_shadow.as_str(),
             self.fwd_shadow.as_str(),
             self.term_shadow.as_str(),
@@ -261,6 +270,9 @@ impl Namespace {
     // Accessors used by the schema/postings SQL builders.
     pub(crate) fn meta(&self) -> &str {
         &self.map.meta
+    }
+    pub(crate) fn doc(&self) -> &str {
+        &self.map.doc
     }
     pub(crate) fn seg(&self) -> &str {
         &self.map.seg
@@ -279,6 +291,9 @@ impl Namespace {
     }
     pub(crate) fn dict(&self) -> &str {
         &self.map.dict
+    }
+    pub(crate) fn doc_shadow(&self) -> &str {
+        &self.doc_shadow
     }
     pub(crate) fn seg_shadow(&self) -> &str {
         &self.seg_shadow
@@ -301,8 +316,9 @@ impl Namespace {
 }
 
 /// Validate a SQL identifier: ASCII, starts with a letter or `_`, then letters /
-/// digits / `_`, length-bounded, and not a reserved `sqlite_` name.
-fn validate_ident(name: &str) -> Result<()> {
+/// digits / `_`, length-bounded, and not a reserved `sqlite_` name. Used for table
+/// names and for schema-derived column names (key / field labels).
+pub(crate) fn validate_ident(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::namespace("empty table name"));
     }
@@ -344,17 +360,18 @@ fn validate_prefix(prefix: &str) -> Result<()> {
 ///
 /// trifle calls this where it would otherwise read its stored text snapshot:
 /// hydrating survivors for [`Match.text`](crate::Match::text) and a ranker's
-/// literal-verify. That use is drift-tolerant — a `None` yields `Match.text = None`,
-/// a stale string only mis-highlights a span.
+/// literal-verify, for any field declared with the `Resolver`
+/// [`StorageMode`](crate::StorageMode). That use is drift-tolerant — a `None` yields
+/// `Match.text = None`, a stale string only mis-highlights a span.
 pub trait TextResolver: Send + Sync {
-    /// The current text for each requested `(doc_id, source, ref)`, in order.
-    /// `None` marks a segment whose text is unavailable at the source.
+    /// The current text for each requested `(key, label)`, in order. `None` marks a
+    /// segment whose text is unavailable at the source.
     ///
     /// # Errors
     ///
     /// Returns an error if the source cannot be consulted at all (distinct from a
     /// per-segment `None`).
-    fn resolve(&self, segs: &[(i64, &str, &str)]) -> Result<Vec<Option<String>>>;
+    fn resolve(&self, segs: &[(&crate::Key, &str)]) -> Result<Vec<Option<String>>>;
 }
 
 #[cfg(test)]

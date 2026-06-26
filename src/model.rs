@@ -4,15 +4,16 @@
 //! trifle does exactly one type-dependent thing — tokenize text — so the schema axis is
 //! **roles**, not types, with one principled exception: the **key**'s shape is declared
 //! (`Integer`/`Text`/`Blob`), because the key is the one field trifle *compares* (dedup /
-//! replace / delete / return). Everything else is a **text field** (tokenized; its name
-//! is the label returned on a match) with a per-field [`StorageMode`] choosing where its
-//! text comes from on hydration.
+//! replace / delete / return). Everything else is a **text field** (tokenized; its name is
+//! the label returned on a match). Every indexed text field's text is **stored** and is
+//! always surfaced to the reranker and returned on a match; filterable **payload** columns
+//! (Tier 2) are stored separately for filtering only and are never reranked or returned.
 //!
 //! A document is a `key` plus a set of named segments (`label → text`) — the two-level
 //! document→segment hierarchy. `flat()` and `chunked()` are ergonomic front-ends that
 //! both lower to the same engine.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use rusqlite::types::Value;
 
@@ -125,30 +126,6 @@ impl KeyShape {
             KeyShape::Integer => 1,
             KeyShape::Text => 2,
             KeyShape::Blob => 3,
-        }
-    }
-}
-
-/// Where a text field's text comes from when hydrating a match — chosen per field
-/// because interning decoupled delete from text (delete reads the stored term-id set, so
-/// storage mode affects only hydration, never delete correctness).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StorageMode {
-    /// trifle stores the text (`seg.txt`) and returns it on a match.
-    Stored,
-    /// trifle calls the caller's [`TextResolver`](crate::store::TextResolver) for the
-    /// text on hydration (it stores none).
-    Resolver,
-    /// trifle stores no text and returns none — the caller renders from `(key, label)`.
-    CoordinatesOnly,
-}
-
-impl StorageMode {
-    fn code(self) -> u8 {
-        match self {
-            StorageMode::Stored => 1,
-            StorageMode::Resolver => 2,
-            StorageMode::CoordinatesOnly => 3,
         }
     }
 }
@@ -268,14 +245,15 @@ pub enum Filter {
         /// The `LIKE` pattern.
         pattern: String,
     },
-    /// A raw, parameterized SQL predicate **fragment over the filterable columns** — the
-    /// escape hatch. It exposes all of SQLite's expression language (date functions,
-    /// arithmetic, …) but is fenced to the materialized `doc` columns: it cannot reach the
-    /// postings or internal tables. **Costs:** *untyped* (a malformed fragment is a
-    /// runtime error, not a compile error); the **fragment is trusted** (it is the
-    /// injection surface — keep it a constant and bind data through `params`, never format
-    /// values into it); and it **couples you to trifle's column names**. Advanced and may
-    /// break across versions — prefer the structured variants.
+    /// A raw, parameterized SQL predicate fragment — the escape hatch. It exposes all of
+    /// SQLite's expression language (date functions, arithmetic, …). It is spliced into the
+    /// `WHERE` of a `SELECT … FROM doc`, so the materialized filterable columns are in
+    /// scope; it is **not** sandboxed — a subquery could reference other tables, which is
+    /// why the **fragment must be a trusted constant**, not built from untrusted input.
+    /// **Costs:** *untyped* (a malformed fragment is a runtime error, not a compile error);
+    /// the **fragment is the injection surface** (keep it a constant and bind data through
+    /// `params`, never format values into it); and it **couples you to trifle's column
+    /// names**. Advanced and may break across versions — prefer the structured variants.
     Sql {
         /// The SQL predicate fragment, with `?` placeholders for `params`.
         fragment: String,
@@ -364,7 +342,7 @@ impl Filter {
             Filter::Cmp { field, op, value } => {
                 let col = schema.filter_column(field)?;
                 params.push(value.clone());
-                Ok(format!("{col} {} ?", op.sql()))
+                Ok(format!("\"{col}\" {} ?", op.sql()))
             }
             Filter::In { field, values } => {
                 let col = schema.filter_column(field)?;
@@ -375,31 +353,32 @@ impl Filter {
                 for v in values {
                     params.push(v.clone());
                 }
-                Ok(format!("{col} IN ({marks})"))
+                Ok(format!("\"{col}\" IN ({marks})"))
             }
             Filter::Between { field, low, high } => {
                 let col = schema.filter_column(field)?;
                 params.push(low.clone());
                 params.push(high.clone());
-                Ok(format!("{col} BETWEEN ? AND ?"))
+                Ok(format!("\"{col}\" BETWEEN ? AND ?"))
             }
             Filter::IsNull { field } => {
                 let col = schema.filter_column(field)?;
-                Ok(format!("{col} IS NULL"))
+                Ok(format!("\"{col}\" IS NULL"))
             }
             Filter::Like { field, pattern } => {
                 let col = schema.filter_column(field)?;
                 params.push(Value::Text(pattern.clone()));
-                Ok(format!("{col} LIKE ?"))
+                Ok(format!("\"{col}\" LIKE ?"))
             }
             Filter::Sql {
                 fragment,
                 params: p,
             } => {
                 // The escape hatch: the fragment is trusted and not field-validated (it is
-                // the injection surface); only its values are parameterized. Fenced to the
-                // `doc` table by where it is spliced — it cannot name postings/internal
-                // tables.
+                // the injection surface); only its values are parameterized. It is spliced
+                // into a `WHERE` over the `doc` table, so the filterable columns are in
+                // scope — but it is not sandboxed (a subquery could name other tables),
+                // hence the trusted-constant contract on `Filter::Sql`.
                 for v in p {
                     params.push(v.clone());
                 }
@@ -457,11 +436,11 @@ pub struct Match {
     /// The label of the segment that matched (the text field name).
     pub label: String,
     /// The `[first, last)` UTF-8 byte span of the matched region within
-    /// [`text`](Self::text). `None` when no span could be located or text is unavailable.
+    /// [`text`](Self::text). `None` when no span could be located.
     pub span: Option<(usize, usize)>,
-    /// The matched segment's text. `None` for a `CoordinatesOnly` field, or a `Resolver`
-    /// field whose resolver returned nothing.
-    pub text: Option<String>,
+    /// The matched segment's text. Every indexed text field is stored, so this is always
+    /// present.
+    pub text: String,
 }
 
 /// A validated, immutable index schema.
@@ -473,10 +452,10 @@ pub struct Match {
 #[derive(Clone, Debug)]
 pub struct Schema {
     key_shape: KeyShape,
-    /// Declared text fields: `label → storage mode`.
-    fields: HashMap<String, StorageMode>,
-    /// Storage mode for labels not explicitly declared (`flat()`); `None` rejects them.
-    default_text: Option<StorageMode>,
+    /// Declared text-field labels (all stored + indexed).
+    fields: HashSet<String>,
+    /// Whether labels not explicitly declared are accepted (`flat()`); `false` rejects them.
+    default_text: bool,
     /// Declared filterable fields (Tier 2): materialized as indexed `doc` columns, in
     /// declaration order (the order the columns are created).
     filterable: Vec<(String, FilterType)>,
@@ -489,23 +468,23 @@ impl Schema {
         SchemaBuilder {
             key: None,
             fields: Vec::new(),
-            default_text: None,
+            default_text: false,
             filterable: Vec::new(),
         }
     }
 
     /// A flat schema: one integer key named `key` and a single default text field (any
-    /// label accepted), stored. The closest analogue to the v0.1 fixed model.
+    /// label accepted). The closest analogue to the v0.1 fixed model.
     pub fn flat() -> Schema {
         Schema::builder()
             .key("key", KeyShape::Integer)
-            .default_text(StorageMode::Stored)
+            .default_text()
             .build()
             .expect("the flat schema is always valid")
     }
 
     /// A chunked schema: an integer key named `key` with explicitly declared text
-    /// fields, each `Stored`. Add fields with [`SchemaBuilder::text`].
+    /// fields. Add fields with [`SchemaBuilder::text`].
     pub fn chunked() -> SchemaBuilder {
         Schema::builder().key("key", KeyShape::Integer)
     }
@@ -514,15 +493,10 @@ impl Schema {
     pub(crate) fn key_shape(&self) -> KeyShape {
         self.key_shape
     }
-    /// The storage mode for a segment label (declared field, else the default), or `None`
-    /// if the label is not accepted by this schema.
-    pub(crate) fn storage_for(&self, label: &str) -> Option<StorageMode> {
-        self.fields.get(label).copied().or(self.default_text)
-    }
-    /// Whether any field resolves its text through the [`TextResolver`](crate::store::TextResolver).
-    pub(crate) fn needs_resolver(&self) -> bool {
-        self.default_text == Some(StorageMode::Resolver)
-            || self.fields.values().any(|m| *m == StorageMode::Resolver)
+    /// Whether a segment `label` is accepted by this schema (a declared field, or any
+    /// label when the schema has a default text field). Accepted labels are always stored.
+    pub(crate) fn accepts_label(&self, label: &str) -> bool {
+        self.default_text || self.fields.contains(label)
     }
     /// The `doc` column name for a declared filterable `field`, or an error if it is not
     /// declared filterable (the injection guard for a compiled `WHERE`).
@@ -546,8 +520,8 @@ impl Schema {
 /// Builder for a [`Schema`].
 pub struct SchemaBuilder {
     key: Option<(String, KeyShape)>,
-    fields: Vec<(String, StorageMode)>,
-    default_text: Option<StorageMode>,
+    fields: Vec<String>,
+    default_text: bool,
     filterable: Vec<(String, FilterType)>,
 }
 
@@ -558,21 +532,17 @@ impl SchemaBuilder {
         self
     }
 
-    /// Declare a `Stored` text field named `name`.
-    pub fn text(self, name: impl Into<String>) -> Self {
-        self.text_mode(name, StorageMode::Stored)
-    }
-
-    /// Declare a text field named `name` with the given [`StorageMode`].
-    pub fn text_mode(mut self, name: impl Into<String>, storage: StorageMode) -> Self {
-        self.fields.push((name.into(), storage));
+    /// Declare a text field named `name`. Its text is stored, indexed, and surfaced to the
+    /// reranker / returned on a match.
+    pub fn text(mut self, name: impl Into<String>) -> Self {
+        self.fields.push(name.into());
         self
     }
 
-    /// Accept any (undeclared) segment label with this storage mode — the open-label
+    /// Accept any (undeclared) segment label as a stored text field — the open-label
     /// front-end used by [`Schema::flat`].
-    pub fn default_text(mut self, storage: StorageMode) -> Self {
-        self.default_text = Some(storage);
+    pub fn default_text(mut self) -> Self {
+        self.default_text = true;
         self
     }
 
@@ -597,17 +567,17 @@ impl SchemaBuilder {
         // Every schema-derived name is interpolated into DDL / WHERE, so validate it as a
         // safe identifier (the new injection surface).
         crate::store::validate_ident(&key_name)?;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         seen.insert(key_name.clone());
-        let mut fields = HashMap::new();
-        for (name, mode) in &self.fields {
+        let mut fields = HashSet::new();
+        for name in &self.fields {
             crate::store::validate_ident(name)?;
             if !seen.insert(name.clone()) {
                 return Err(Error::schema(format!("duplicate field name {name:?}")));
             }
-            fields.insert(name.clone(), *mode);
+            fields.insert(name.clone());
         }
-        if fields.is_empty() && self.default_text.is_none() {
+        if fields.is_empty() && !self.default_text {
             return Err(Error::schema(
                 "schema declares no text field and no default — nothing to index",
             ));
@@ -643,32 +613,32 @@ impl SchemaBuilder {
     }
 }
 
-/// A stable FNV-1a over a canonical *semantic* encoding of the schema (names, the key
-/// shape, field storage modes, the default) — **not** column layout (`sqlite_schema`
-/// owns structure). The dangerous drift is same-tables / reinterpreted-columns, which
-/// this catches.
+/// A stable FNV-1a over a canonical *semantic* encoding of the schema (key name + shape,
+/// the set of text-field names, the open-label default, and the filterable columns) —
+/// **not** column layout (`sqlite_schema` owns structure). The dangerous drift is
+/// same-tables / reinterpreted-columns, which this catches. (`schema-v2`: v0.2 dropped
+/// per-field storage modes — all text fields are stored.)
 fn schema_fingerprint(
     key_name: &str,
     key_shape: KeyShape,
-    fields: &[(String, StorageMode)],
-    default_text: Option<StorageMode>,
+    fields: &[String],
+    default_text: bool,
     filterable: &[(String, FilterType)],
 ) -> u64 {
-    let mut sorted: Vec<&(String, StorageMode)> = fields.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut sorted: Vec<&String> = fields.iter().collect();
+    sorted.sort();
     let mut filt: Vec<&(String, FilterType)> = filterable.iter().collect();
     filt.sort_by(|a, b| a.0.cmp(&b.0));
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"schema-v1");
+    bytes.extend_from_slice(b"schema-v2");
     bytes.extend_from_slice(&(key_name.len() as u64).to_le_bytes());
     bytes.extend_from_slice(key_name.as_bytes());
     bytes.push(key_shape.code());
-    bytes.push(default_text.map_or(0, |m| m.code()));
+    bytes.push(default_text as u8);
     bytes.extend_from_slice(&(sorted.len() as u64).to_le_bytes());
-    for (name, mode) in sorted {
+    for name in sorted {
         bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
         bytes.extend_from_slice(name.as_bytes());
-        bytes.push(mode.code());
     }
     bytes.extend_from_slice(&(filt.len() as u64).to_le_bytes());
     for (name, ty) in filt {
@@ -684,33 +654,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flat_schema_accepts_any_label_stored() {
+    fn flat_schema_accepts_any_label() {
         let s = Schema::flat();
         assert_eq!(s.key_shape(), KeyShape::Integer);
-        assert_eq!(s.storage_for("anything"), Some(StorageMode::Stored));
-        assert!(!s.needs_resolver());
+        assert!(s.accepts_label("anything"));
     }
 
     #[test]
     fn chunked_schema_only_accepts_declared_fields() {
-        let s = Schema::chunked()
-            .text("front")
-            .text_mode("back", StorageMode::CoordinatesOnly)
-            .build()
-            .unwrap();
-        assert_eq!(s.storage_for("front"), Some(StorageMode::Stored));
-        assert_eq!(s.storage_for("back"), Some(StorageMode::CoordinatesOnly));
-        assert_eq!(s.storage_for("undeclared"), None);
+        let s = Schema::chunked().text("front").text("back").build().unwrap();
+        assert!(s.accepts_label("front"));
+        assert!(s.accepts_label("back"));
+        assert!(!s.accepts_label("undeclared"));
     }
 
     #[test]
     fn build_rejects_no_key_and_dup_names_and_no_text() {
-        assert!(
-            Schema::builder()
-                .default_text(StorageMode::Stored)
-                .build()
-                .is_err()
-        );
+        assert!(Schema::builder().default_text().build().is_err());
         assert!(
             Schema::builder()
                 .key("id", KeyShape::Integer)
@@ -743,13 +703,17 @@ mod tests {
             .unwrap();
         // Field declaration order does not change identity.
         assert_eq!(a.fingerprint(), b.fingerprint());
-        // Storage mode is semantic identity.
-        let c = Schema::chunked()
+        // The set of indexed fields is semantic identity.
+        let c = Schema::chunked().text("front").build().unwrap();
+        assert_ne!(a.fingerprint(), c.fingerprint());
+        // A filterable column is semantic identity too.
+        let d = Schema::chunked()
             .text("front")
-            .text_mode("back", StorageMode::CoordinatesOnly)
+            .text("back")
+            .filterable("deck", FilterType::Int)
             .build()
             .unwrap();
-        assert_ne!(a.fingerprint(), c.fingerprint());
+        assert_ne!(a.fingerprint(), d.fingerprint());
     }
 
     #[test]
@@ -762,35 +726,38 @@ mod tests {
             .build()
             .unwrap();
 
-        // Comparison, range, null, like, in.
+        // Comparison, range, null, like, in. Column names are double-quoted (keyword-safe).
         assert_eq!(
             Filter::eq("deck", Value::Integer(3)).compile(&s).unwrap().0,
-            "deck = ?"
+            "\"deck\" = ?"
         );
         let (sql, p) = Filter::between("created", Value::Integer(100), Value::Integer(200))
             .compile(&s)
             .unwrap();
-        assert_eq!(sql, "created BETWEEN ? AND ?");
+        assert_eq!(sql, "\"created\" BETWEEN ? AND ?");
         assert_eq!(p.len(), 2);
         assert_eq!(
             Filter::is_null("lang").compile(&s).unwrap().0,
-            "lang IS NULL"
+            "\"lang\" IS NULL"
         );
         assert_eq!(
             Filter::like("lang", "en%").compile(&s).unwrap().0,
-            "lang LIKE ?"
+            "\"lang\" LIKE ?"
         );
         assert_eq!(
             Filter::in_("deck", [Value::Integer(1), Value::Integer(2)])
                 .compile(&s)
                 .unwrap()
                 .0,
-            "deck IN (?, ?)"
+            "\"deck\" IN (?, ?)"
         );
 
         // AND / OR nest with parentheses.
         let nested = Filter::eq("deck", Value::Integer(1)).and(Filter::like("lang", "en%"));
-        assert_eq!(nested.compile(&s).unwrap().0, "(deck = ? AND lang LIKE ?)");
+        assert_eq!(
+            nested.compile(&s).unwrap().0,
+            "(\"deck\" = ? AND \"lang\" LIKE ?)"
+        );
 
         // The raw SQL hatch is spliced verbatim (parenthesized), values bound.
         let (sql, p) = Filter::sql(

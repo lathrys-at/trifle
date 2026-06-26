@@ -42,7 +42,7 @@
 //! declared type, because the key is what trifle compares) plus named **text fields**.
 //! A [`Document`] is a [`Key`] and a set of named segments (`label → text`); a match
 //! comes back as a [`Match`] carrying the document key, the matched segment's label, the
-//! matched byte span, and (per the field's [`StorageMode`]) optionally its text.
+//! matched byte span, and the segment's text (every indexed text field is stored).
 //!
 //! Reads and writes go through **leases** — [`Index::writer`] (the exclusive
 //! single-writer lock, with commit-and-continue) and [`Index::reader`] /
@@ -100,12 +100,12 @@ pub use rusqlite;
 use dict::{Dictionary, TermId};
 pub use error::{Error, Result};
 pub use model::{
-    CmpOp, Document, Filter, FilterType, Key, KeyShape, Match, Schema, SchemaBuilder, StorageMode,
+    CmpOp, Document, Filter, FilterType, Key, KeyShape, Match, Schema, SchemaBuilder,
 };
 use rank::{Bm25Ranker, Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
 use schema::SCHEMA_VERSION;
 use select::{SelectParams, select};
-use store::{Backend, Namespace, Sidecar, TextResolver};
+use store::{Backend, Namespace, Sidecar};
 pub use term::{IntoTerm, Term};
 use tokenize::{DefaultTokenizer, Tokenizer};
 use welford::ClassSnap;
@@ -129,10 +129,6 @@ pub struct Config {
     /// The caller's drift/epoch token. Bumping it on reopen invalidates the cache
     /// (drops it to empty), so the next [`rebuild`](Index::rebuild) repopulates.
     pub data_version: u64,
-    /// A [`TextResolver`] to run **contentless** (store no text snapshot, fetch text
-    /// from the caller's source). `None` (default) stores a self-contained snapshot.
-    /// See the [crate] docs and [`TextResolver`] for the contract.
-    pub external_content: Option<Box<dyn TextResolver>>,
 }
 
 impl Config {
@@ -140,14 +136,7 @@ impl Config {
     pub fn new(data_version: u64) -> Self {
         Config {
             data_version,
-            ..Config::default()
         }
-    }
-
-    /// Run contentless against the given resolver instead of storing a text snapshot.
-    pub fn with_external_content(mut self, resolver: Box<dyn TextResolver>) -> Self {
-        self.external_content = Some(resolver);
-        self
     }
 }
 
@@ -238,23 +227,6 @@ impl Effort {
     }
 }
 
-/// The hydration cost ladder: how much of a match to materialize, as an explicit
-/// ordered choice (not independent booleans), so a deeper join is never paid by accident
-/// in a hot loop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
-#[non_exhaustive]
-pub enum Hydration {
-    /// `(key, label)` only — no segment text is fetched ([`Match::text`] stays `None`).
-    Coordinates,
-    /// Also fetch the matched segment's text (a [`Stored`](StorageMode::Stored) field's
-    /// `seg.txt`, or the resolver for a `Resolver` field). The default.
-    #[default]
-    SegmentText,
-    /// Also fetch the document payload. Payload columns are a later phase; today this
-    /// behaves as [`SegmentText`](Hydration::SegmentText).
-    DocumentPayload,
-}
-
 /// Per-search options.
 ///
 /// Construct with [`SearchOpts::new`] and the builder setters, then set any of the public
@@ -286,9 +258,6 @@ pub struct SearchOpts<'a> {
     /// plain overlap order (cheapest). When `ranker` is also set, `effort` still chooses
     /// the pool depth but that custom ranker scores it.
     pub effort: Effort,
-    /// How much of a match to materialize — the [`Hydration`] cost ladder. Defaults to
-    /// [`SegmentText`](Hydration::SegmentText).
-    pub hydration: Hydration,
     /// An optional [`Filter`] over the schema's **filterable** fields (Tier 2). Applied as
     /// a doc-id intersection during candidate generation — it prunes before rerank and
     /// hydration, but does not save the overlap work itself.
@@ -306,15 +275,8 @@ impl<'a> SearchOpts<'a> {
             ranker: None,
             scope: None,
             effort: Effort::default(),
-            hydration: Hydration::default(),
             filter: None,
         }
-    }
-
-    /// Set the [`Hydration`] level (how much of each match to materialize).
-    pub fn hydrate(mut self, hydration: Hydration) -> Self {
-        self.hydration = hydration;
-        self
     }
 
     /// Set a [`Filter`] over the schema's filterable fields.
@@ -410,10 +372,8 @@ pub struct Index<T: Tokenizer = DefaultTokenizer, B: Backend = Sidecar> {
     backend: B,
     tokenizer: T,
     data_version: u64,
-    /// The declared data model (key shape, text fields, per-field storage modes).
+    /// The declared data model (key shape, text fields, filterable columns).
     schema: Schema,
-    /// The caller's text resolver, for `Resolver`-mode fields (`None` if unused).
-    resolver: Option<Box<dyn TextResolver>>,
     /// The in-memory faulting term dictionary (gram → `u32` id), shared by the writer
     /// and the read pool. Hydrated on open; rebuilt under the swap on `rebuild`.
     dict: Dictionary,
@@ -446,18 +406,11 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     ///
     /// Returns an error if the store cannot be initialized.
     pub fn open(backend: B, tokenizer: T, schema: Schema, config: Config) -> Result<Self> {
-        // A `Resolver`-mode field needs a resolver; reject the mismatch up front.
-        if schema.needs_resolver() && config.external_content.is_none() {
-            return Err(Error::InvalidInput(
-                "schema has a Resolver-mode field but no TextResolver was configured".into(),
-            ));
-        }
         let index = Index {
             backend,
             tokenizer,
             data_version: config.data_version,
             schema,
-            resolver: config.external_content,
             dict: Dictionary::empty(),
         };
         index.init()?;
@@ -638,9 +591,11 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         stage: &mut dict::InternStage<'_>,
         replace: bool,
     ) -> Result<()> {
-        let mode = self.schema.storage_for(label).ok_or_else(|| {
-            Error::InvalidInput(format!("label {label:?} is not a field of the schema"))
-        })?;
+        if !self.schema.accepts_label(label) {
+            return Err(Error::InvalidInput(format!(
+                "label {label:?} is not a field of the schema"
+            )));
+        }
         if let Some(seg_id) = self.find_segment(conn, ns, doc, label)? {
             if !replace {
                 return Err(Error::InvalidInput(format!(
@@ -650,17 +605,12 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             self.drop_segment(conn, ns, seg_id, changes)?;
         }
         let id = schema::alloc_ids(conn, ns, 1)?;
-        let stored_txt = if mode == StorageMode::Stored {
-            Some(text)
-        } else {
-            None
-        };
         conn.execute(
             &format!(
                 "INSERT INTO {}(id, doc_id, label, txt) VALUES(?1, ?2, ?3, ?4)",
                 ns.seg()
             ),
-            rusqlite::params![id, doc, label, stored_txt],
+            rusqlite::params![id, doc, label, text],
         )?;
         // Intern straight from the tokens (`token.term()`), not via stringified grams — the
         // blanket `IntoTerm` packs each token with no per-token `String` allocation.
@@ -757,7 +707,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let mut params: Vec<Value> = Vec::new();
         for (name, value) in fields {
             if let Ok(col) = self.schema.filter_column(name) {
-                sets.push(format!("{col} = ?"));
+                sets.push(format!("\"{col}\" = ?")); // double-quoted: keyword-safe column
                 params.push(value.clone());
             }
         }
@@ -872,17 +822,14 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                     self.set_doc_fields(&tx, ns.doc_shadow(), doc_id, &doc.payload)?;
                 }
                 for (label, text) in &doc.segments {
-                    let mode = self.schema.storage_for(label).ok_or_else(|| {
-                        Error::InvalidInput(format!("label {label:?} is not a field of the schema"))
-                    })?;
+                    if !self.schema.accepts_label(label) {
+                        return Err(Error::InvalidInput(format!(
+                            "label {label:?} is not a field of the schema"
+                        )));
+                    }
                     let seg_id = next_seg;
                     next_seg += 1;
-                    let stored_txt = if mode == StorageMode::Stored {
-                        Some(text.as_str())
-                    } else {
-                        None
-                    };
-                    seg_ins.execute(rusqlite::params![seg_id, doc_id, label, stored_txt])?;
+                    seg_ins.execute(rusqlite::params![seg_id, doc_id, label, text.as_str()])?;
                     let distinct: HashSet<T::Token> = self.tokenizer.tokenize(text).collect();
                     let mut ids: Vec<TermId> = Vec::with_capacity(distinct.len());
                     for tok in &distinct {
@@ -1125,9 +1072,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 filter_docs.as_ref(),
                 opts.scope,
             )?;
-            if opts.hydration != Hydration::Coordinates {
-                self.hydrate_text(conn, ns, &mut survivors)?;
-            }
+            // Every indexed field is stored, so a match always carries its text and the
+            // reranker always sees it (no opt-out that could leave BM25 textless).
+            self.hydrate_text(conn, ns, &mut survivors)?;
 
             out.push(self.rank_to_matches(
                 &survivors, &present, selected, query, min_shared, ranker, opts.limit, n_segments,
@@ -1163,10 +1110,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             let Some(s) = survivors.get(r.candidate) else {
                 continue;
             };
-            let span = s
-                .text
-                .as_deref()
-                .and_then(|t| self.tokenizer.span(t, &sel_refs));
+            let span = self.tokenizer.span(&s.text, &sel_refs);
             matches.push(Match {
                 key: s.key.clone(),
                 label: s.label.clone(),
@@ -1177,9 +1121,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         matches
     }
 
-    /// Hydrate each survivor's text according to its field's [`StorageMode`]: `Stored`
-    /// from `seg.txt` (one batched read), `Resolver` from the caller's resolver (one
-    /// batched callback), `CoordinatesOnly` left `None`.
+    /// Hydrate each survivor's text from `seg.txt` in one batched read (`WHERE id IN
+    /// rarray`). Every indexed field is stored, so every survivor gets its segment text.
     fn hydrate_text(
         &self,
         conn: &Connection,
@@ -1189,41 +1132,21 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         if survivors.is_empty() {
             return Ok(());
         }
-        // Stored text — `seg.txt` is NULL for any non-`Stored` field, so this batched read
-        // naturally yields `None` for them.
         let ids: Vec<u32> = survivors.iter().map(|s| s.seg_id).collect();
         let arr: std::rc::Rc<Vec<Value>> =
             std::rc::Rc::new(ids.iter().map(|&i| Value::Integer(i as i64)).collect());
         let sql = format!("SELECT id, txt FROM {} WHERE id IN rarray(?1)", ns.seg());
-        let mut texts: HashMap<u32, Option<String>> = HashMap::with_capacity(ids.len());
+        let mut texts: HashMap<u32, String> = HashMap::with_capacity(ids.len());
         {
             let mut stmt = conn.prepare_cached(&sql)?;
             let mut rows = stmt.query(rusqlite::params![arr])?;
             while let Some(r) = rows.next()? {
-                texts.insert(r.get::<_, i64>(0)? as u32, r.get::<_, Option<String>>(1)?);
+                texts.insert(r.get::<_, i64>(0)? as u32, r.get::<_, String>(1)?);
             }
         }
-        // Assign per storage mode; collect `Resolver`-mode survivors for one callback.
-        let mut resolver_idx: Vec<usize> = Vec::new();
-        for (i, s) in survivors.iter_mut().enumerate() {
-            match self.schema.storage_for(&s.label) {
-                Some(StorageMode::Stored) => s.text = texts.get(&s.seg_id).cloned().flatten(),
-                Some(StorageMode::Resolver) => resolver_idx.push(i),
-                _ => s.text = None, // CoordinatesOnly (or a label no longer in the schema)
-            }
-        }
-        if !resolver_idx.is_empty() {
-            if let Some(resolver) = &self.resolver {
-                let got = {
-                    let segs: Vec<(&Key, &str)> = resolver_idx
-                        .iter()
-                        .map(|&i| (&survivors[i].key, survivors[i].label.as_str()))
-                        .collect();
-                    resolver.resolve(&segs)?
-                };
-                for (slot, text) in resolver_idx.iter().zip(got) {
-                    survivors[*slot].text = text;
-                }
+        for s in survivors.iter_mut() {
+            if let Some(t) = texts.remove(&s.seg_id) {
+                s.text = t;
             }
         }
         Ok(())

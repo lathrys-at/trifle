@@ -40,3 +40,4 @@ target
 # Output of benchmarks/tools/latency_plot.py (captured raw JSON, summary CSV, rendered
 # PNGs). Regenerate with `--reuse-raw`; never committed.
 /benchmarks/reports/
+.audit-scratch/

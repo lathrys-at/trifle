@@ -32,7 +32,10 @@ pub(crate) struct Survivor {
     pub doc: u32,
     pub seg_id: u32,
     pub overlap: u32,
-    pub text: Option<String>,
+    /// The matched segment's text — empty until [`hydrate_text`](crate::Index) fills it
+    /// (every indexed field is stored, so a survivor's text is always populated before
+    /// ranking).
+    pub text: String,
 }
 
 /// Bit-sliced overlap counting. Returns the count "bit planes" `acc` where a given
@@ -158,7 +161,7 @@ pub(crate) fn overlap_search(
                     doc: *doc,
                     seg_id: id,
                     overlap: c,
-                    text: None,
+                    text: String::new(),
                 });
             }
         }
@@ -321,25 +324,24 @@ impl Ranker for Bm25Ranker {
                         }
                     }
                 }
-                let len = s.text.as_deref().map_or(1, |t| t.chars().count()).max(1);
+                let len = s.text.chars().count().max(1);
                 let mut score = idf_sum / (len as f64).powf(ALPHA);
                 // Literal tier, trigram-gated: lowercase + memmem only the words that can
                 // be present; a discriminating word triggers the work, common words ride
                 // the lowercase we already paid for (so the gate never drops a real hit).
                 if !lits.is_empty() {
-                    let hits = s.text.as_deref().map_or(0, |text| {
-                        let gate = |mask: u64| !gated || (mask & matched_mask) == mask;
-                        let triggers =
-                            |mask: u64| if gated { mask != 0 && gate(mask) } else { true };
-                        if !lits.iter().any(|(mask, _)| triggers(*mask)) {
-                            return 0;
-                        }
+                    let text = s.text.as_str();
+                    let gate = |mask: u64| !gated || (mask & matched_mask) == mask;
+                    let triggers = |mask: u64| if gated { mask != 0 && gate(mask) } else { true };
+                    let hits = if !lits.iter().any(|(mask, _)| triggers(*mask)) {
+                        0
+                    } else {
                         let lower = text.to_lowercase();
                         lits.iter()
                             .filter(|(mask, _)| gate(*mask))
                             .filter(|(_, f)| f.find(lower.as_bytes()).is_some())
                             .count()
-                    });
+                    };
                     score *= 1.0 + LIT_BOOST * hits as f64;
                 }
                 (i, score, s.overlap)
@@ -438,10 +440,10 @@ impl Candidate<'_> {
     pub fn overlap(&self) -> u32 {
         self.s.overlap
     }
-    /// The matched segment's text, if available (absent only in contentless mode
-    /// when the resolver returned `None`).
-    pub fn text(&self) -> Option<&str> {
-        self.s.text.as_deref()
+    /// The matched segment's text. Every indexed field is stored, so this is always the
+    /// segment's full text.
+    pub fn text(&self) -> &str {
+        &self.s.text
     }
     /// Which selected tokens this candidate's segment actually contains.
     pub fn matched_tokens(&self) -> Vec<&str> {

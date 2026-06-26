@@ -12,24 +12,24 @@ use crate::model::Schema;
 use crate::store::Namespace;
 
 /// The extra `doc` column definitions for the schema's filterable fields, e.g.
-/// `, deck INTEGER, lang TEXT`. Names are validated identifiers (checked at schema build).
+/// `, "deck" INTEGER, "lang" TEXT`. Names are validated identifiers (checked at schema
+/// build) and **double-quoted** so a name that is a SQL keyword (e.g. `order`) is still a
+/// legal column rather than a syntax error.
 fn doc_filt_cols(schema: &Schema) -> String {
     let mut s = String::new();
     for (name, ty) in schema.filterable_columns() {
-        s.push_str(", ");
-        s.push_str(name);
-        s.push(' ');
-        s.push_str(ty.sql_type());
+        s.push_str(&format!(", \"{name}\" {}", ty.sql_type()));
     }
     s
 }
 
-/// `CREATE INDEX` statements for the schema's filterable `doc` columns (on `table`).
+/// `CREATE INDEX` statements for the schema's filterable `doc` columns (on `table`). The
+/// column is double-quoted (keyword-safe); the index name is a synthesized identifier.
 fn doc_filt_indexes(table: &str, schema: &Schema) -> String {
     let mut s = String::new();
     for (name, _) in schema.filterable_columns() {
         s.push_str(&format!(
-            "CREATE INDEX IF NOT EXISTS {table}_filt_{name} ON {table}({name});\n"
+            "CREATE INDEX IF NOT EXISTS {table}_filt_{name} ON {table}(\"{name}\");\n"
         ));
     }
     s
@@ -40,7 +40,9 @@ fn doc_filt_indexes(table: &str, schema: &Schema) -> String {
 ///
 /// v2 (rev-v0.2): postings are keyed by an interned `u32` term-id (the `dict` table),
 /// not gram text; `fwd` holds a roaring bitmap of term-ids.
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+/// v3 (rev-v0.2): per-field storage modes dropped (every text field is stored); `doc`
+/// gains a `len` column (per-document gram length for BM25+).
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 pub(crate) const KEY_SCHEMA_VERSION: &str = "schema_version";
 pub(crate) const KEY_DATA_VERSION: &str = "data_version";

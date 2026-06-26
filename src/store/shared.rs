@@ -16,9 +16,6 @@ use super::{Backend, Namespace, configure_sqlite_perf, register_carray};
 /// single-writer serialization across the whole file, compatible WAL/pragma setup,
 /// and not holding a transaction across trifle's [`rebuild`](crate::Index::rebuild)
 /// swap. trifle touches only its own namespaced tables.
-///
-/// Pair with a [`TextResolver`](super::TextResolver) ([`Config::external_content`](crate::Config::external_content))
-/// to run contentless and avoid duplicating text already in the shared file.
 pub struct Shared {
     store: Store,
 }

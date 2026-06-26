@@ -355,25 +355,6 @@ fn validate_prefix(prefix: &str) -> Result<()> {
         .map_err(|_| Error::namespace(format!("invalid namespace prefix: {prefix:?}")))
 }
 
-/// Resolves the *current* text of segments for a [contentless](crate#text-storage)
-/// index, so trifle need not store a copy.
-///
-/// trifle calls this where it would otherwise read its stored text snapshot:
-/// hydrating survivors for [`Match.text`](crate::Match::text) and a ranker's
-/// literal-verify, for any field declared with the `Resolver`
-/// [`StorageMode`](crate::StorageMode). That use is drift-tolerant — a `None` yields
-/// `Match.text = None`, a stale string only mis-highlights a span.
-pub trait TextResolver: Send + Sync {
-    /// The current text for each requested `(key, label)`, in order. `None` marks a
-    /// segment whose text is unavailable at the source.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the source cannot be consulted at all (distinct from a
-    /// per-segment `None`).
-    fn resolve(&self, segs: &[(&crate::Key, &str)]) -> Result<Vec<Option<String>>>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

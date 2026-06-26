@@ -3,9 +3,10 @@
 //! Every fallible operation in trifle returns [`Result`]. The variants separate
 //! the failure classes a caller reasons about differently: a transient or
 //! environmental store fault ([`Error::Sqlite`], [`Error::Busy`]), bad input the caller
-//! can fix ([`Error::InvalidInput`], [`Error::Namespace`], [`Error::Schema`]), and an
+//! can fix ([`Error::InvalidInput`], [`Error::Namespace`], [`Error::Schema`]), an
 //! internal invariant violation that should be impossible ([`Error::Corrupt`],
-//! [`Error::Posting`]).
+//! [`Error::Posting`]), and a [`Writer`](crate::Writer) handle that can no longer maintain
+//! its transaction ([`Error::WriterStranded`]) — the store is intact, re-acquire the writer.
 
 /// A specialized [`Result`](std::result::Result) for trifle operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -57,6 +58,15 @@ pub enum Error {
     /// operation on a fresh [`reader`](crate::Index::reader)** and it will succeed.
     #[error("transient (retry): {0}")]
     Busy(String),
+
+    /// A [`Writer`](crate::Writer) lease can no longer maintain its transaction and is
+    /// unusable — for example a [`commit`](crate::Writer::commit) whose durable `COMMIT`
+    /// succeeded but whose follow-on `BEGIN` failed, or a write whose savepoint rollback
+    /// faulted. **The store is intact** (neither corrupt nor lost-needing-retry); drop this
+    /// writer and acquire a fresh one. When it comes from `commit()`, the just-committed
+    /// batch **is durable** — do not retry it (that would double-apply).
+    #[error("writer stranded (re-acquire): {0}")]
+    WriterStranded(String),
 }
 
 impl Error {
@@ -73,6 +83,12 @@ impl Error {
     /// Construct an [`Error::Busy`] (transient; retry on a fresh reader) from a string.
     pub(crate) fn busy(msg: impl Into<String>) -> Self {
         Error::Busy(msg.into())
+    }
+
+    /// Construct an [`Error::WriterStranded`] (re-acquire the writer; store intact) from a
+    /// string.
+    pub(crate) fn writer_stranded(msg: impl Into<String>) -> Self {
+        Error::WriterStranded(msg.into())
     }
 
     /// Construct an [`Error::Schema`] from anything string-like.

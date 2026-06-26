@@ -1409,11 +1409,9 @@ pub struct Writer<'a, T: Tokenizer = DefaultTokenizer, B: Backend = Sidecar> {
     stage: Option<dict::InternStage<'a>>,
     /// `(term-id, old_df, new_df)` deltas to fold into the class stats on commit.
     pending_df: Vec<(TermId, i64, i64)>,
-    /// Whether uncommitted work exists since the last `BEGIN`.
-    dirty: bool,
-    /// Whether a transaction is currently open. `false` only if a re-`BEGIN` after a
-    /// `commit()` failed — the writer is then poisoned and every method returns an error
-    /// rather than silently running in autocommit (which would lose atomicity).
+    /// Whether a transaction is currently open. `false` once the writer is stranded — a
+    /// re-`BEGIN` after a `commit()` failed, or a savepoint rollback faulted — so every
+    /// method returns an error rather than silently running in autocommit (losing atomicity).
     txn_open: bool,
 }
 
@@ -1427,7 +1425,6 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
             index,
             stage: Some(index.dict.stage()),
             pending_df: Vec::new(),
-            dirty: false,
             txn_open: true,
         })
     }
@@ -1439,8 +1436,8 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
     /// internally-inconsistent partial write (orphan segments, negative df).
     fn atomic<R>(&mut self, body: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
         if !self.txn_open {
-            return Err(Error::corrupt(
-                "writer transaction is not open (a prior commit failed to re-begin); re-acquire the writer",
+            return Err(Error::writer_stranded(
+                "the writer is no longer usable (a prior commit or rollback could not maintain its transaction); re-acquire the writer",
             ));
         }
         let stage_mark = self.stage.as_ref().expect("writer stage present").mark();
@@ -1452,10 +1449,19 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
                 Ok(r)
             }
             Err(e) => {
-                // Undo the SQL and the in-memory staging this call accumulated.
-                let _ = self
+                // Undo the SQL and the in-memory staging this call accumulated, so the store
+                // is left exactly as before the call. If the savepoint undo itself faults (a
+                // connection-level failure), escalate to aborting the whole transaction and
+                // poison the writer — that prevents a later `commit()` from persisting a torn
+                // savepoint, at the cost of the uncommitted tail (within the lease contract).
+                if self
                     .guard
-                    .execute_batch("ROLLBACK TO trifle_w; RELEASE trifle_w");
+                    .execute_batch("ROLLBACK TO trifle_w; RELEASE trifle_w")
+                    .is_err()
+                {
+                    let _ = self.guard.execute_batch("ROLLBACK");
+                    self.txn_open = false;
+                }
                 if let Some(stage) = self.stage.as_mut() {
                     stage.rollback_to(stage_mark);
                 }
@@ -1565,7 +1571,6 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
         }
         let df = changes.apply(conn, ns)?;
         self.pending_df.extend(df);
-        self.dirty = true;
         Ok(())
     }
 
@@ -1598,7 +1603,6 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
             }
             let df = changes.apply(conn, ns)?;
             w.pending_df.extend(df);
-            w.dirty = true;
             Ok(())
         })
     }
@@ -1619,7 +1623,6 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
                 .map(|(n, v)| (n.to_string(), v.clone()))
                 .collect();
             w.index.set_doc_fields(conn, ns.doc(), doc, &owned)?;
-            w.dirty = true;
             Ok(())
         })
     }
@@ -1638,7 +1641,6 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
             }
             let df = changes.apply(conn, ns)?;
             w.pending_df.extend(df);
-            w.dirty = true;
             Ok(())
         })
     }
@@ -1650,12 +1652,20 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the commit or the re-`BEGIN` fails.
+    /// The two failure points need different caller responses, so they surface as different
+    /// errors:
+    /// - the **`COMMIT` itself fails** ([`Error::Sqlite`]/[`Error::Busy`]): the batch was
+    ///   **not** made durable (it rolls back); retry it on a fresh writer.
+    /// - the **`COMMIT` succeeds but the follow-on `BEGIN` fails**
+    ///   ([`Error::WriterStranded`]): the batch **is** durable — do not retry it; the writer
+    ///   is unusable, so drop it and acquire a fresh one to continue.
     pub fn commit(&mut self) -> Result<()> {
+        // A failure here rolls the batch back (Drop's ROLLBACK / connection close); the
+        // transaction is still open, so the writer remains usable for a retry.
         self.guard.execute_batch("COMMIT")?;
-        // The COMMIT succeeded; the txn is now closed. If the re-`BEGIN` below fails we must
-        // not leave the writer silently in autocommit, so mark it closed up front and only
-        // re-open on success.
+        // The COMMIT succeeded and is durable; the txn is now closed. If the re-`BEGIN` below
+        // fails we must not leave the writer silently in autocommit, so mark it closed up
+        // front and only re-open on success.
         self.txn_open = false;
         // Order matters: merge the staged interns first (advancing the shared high-water
         // mark), then snapshot a fresh stage off the advanced mark.
@@ -1665,8 +1675,14 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
         let df = std::mem::take(&mut self.pending_df);
         self.index.dict.apply_df_changes(&df);
         self.stage = Some(self.index.dict.stage());
-        self.dirty = false;
-        self.guard.execute_batch("BEGIN IMMEDIATE")?;
+        // The batch is already durable; a re-`BEGIN` failure only strands this writer — say so
+        // distinctly so the caller re-acquires instead of re-applying the committed batch.
+        if let Err(e) = self.guard.execute_batch("BEGIN IMMEDIATE") {
+            return Err(Error::writer_stranded(format!(
+                "the batch committed durably, but the writer could not begin a new transaction \
+                 (do not retry the committed batch; acquire a fresh writer to continue): {e}"
+            )));
+        }
         self.txn_open = true;
         Ok(())
     }
@@ -1868,6 +1884,29 @@ mod poison_tests {
         // A successful rebuild rebuilds the in-memory dictionary, so it is a recovery path.
         idx.rebuild(std::iter::empty()).unwrap();
         assert!(idx.reader().is_ok(), "rebuild cleared the poison");
+        assert!(idx.writer().is_ok());
+    }
+
+    /// A stranded writer (a `commit()` that committed durably but could not re-`BEGIN`, or a
+    /// savepoint-rollback fault) fails its methods with [`Error::WriterStranded`] — store
+    /// intact, re-acquire — not [`Error::Corrupt`] (which would wrongly imply a rebuild).
+    #[test]
+    fn a_stranded_writer_reports_writer_stranded() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx =
+            Index::open_at(&dir.path().join("t.db"), Schema::flat(), Config::default()).unwrap();
+        let mut w = idx.writer().unwrap();
+        // Reproduce exactly what a COMMIT-succeeded-but-reBEGIN-failed leaves: the open txn
+        // closed (so nothing is open to roll back) and the writer marked stranded.
+        w.guard.execute_batch("COMMIT").unwrap();
+        w.txn_open = false;
+        assert!(matches!(
+            w.insert(1, &[("body", "x")]),
+            Err(Error::WriterStranded(_))
+        ));
+        assert!(matches!(w.remove(1), Err(Error::WriterStranded(_))));
+        // A fresh writer is unaffected — the store was never harmed.
+        drop(w);
         assert!(idx.writer().is_ok());
     }
 }

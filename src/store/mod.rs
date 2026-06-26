@@ -106,17 +106,22 @@ pub struct TableMap {
     /// Contentless-mode forward index (per-segment token set); unused in snapshot
     /// mode.
     pub fwd: String,
-    /// Per-token effective document frequency (the pruner reads this).
+    /// Per-token effective document frequency (the pruner reads this), keyed by the
+    /// interned `u32` term-id.
     pub term: String,
-    /// Per-token base roaring posting (written only by fold/rebuild).
+    /// Per-token base roaring posting (written only by fold/rebuild), keyed by term-id.
     pub post: String,
-    /// Per-token added/removed roaring delta (written on every incremental write).
+    /// Per-token added/removed roaring delta (written on every incremental write),
+    /// keyed by term-id.
     pub delta: String,
+    /// The interning dictionary: `term-id <-> gram` (the gram is the only place gram
+    /// text/encoding is stored; postings reference the `u32` id).
+    pub dict: String,
 }
 
 impl TableMap {
     /// Every persistent table name, in a stable order.
-    fn names(&self) -> [&str; 6] {
+    fn names(&self) -> [&str; 7] {
         [
             &self.meta,
             &self.seg,
@@ -124,6 +129,7 @@ impl TableMap {
             &self.term,
             &self.post,
             &self.delta,
+            &self.dict,
         ]
     }
 }
@@ -144,6 +150,7 @@ pub struct Namespace {
     term_shadow: String,
     post_shadow: String,
     delta_shadow: String,
+    dict_shadow: String,
 }
 
 impl Default for Namespace {
@@ -175,6 +182,7 @@ impl Namespace {
             term: t("term"),
             post: t("post"),
             delta: t("delta"),
+            dict: t("dict"),
         })
     }
 
@@ -200,6 +208,7 @@ impl Namespace {
             term_shadow: format!("{}_shadow", map.term),
             post_shadow: format!("{}_shadow", map.post),
             delta_shadow: format!("{}_shadow", map.delta),
+            dict_shadow: format!("{}_shadow", map.dict),
             map,
         };
         // Validate the derived shadow names too — a base name within the length bound
@@ -211,6 +220,7 @@ impl Namespace {
             &ns.term_shadow,
             &ns.post_shadow,
             &ns.delta_shadow,
+            &ns.dict_shadow,
         ] {
             validate_ident(shadow)?;
         }
@@ -237,11 +247,13 @@ impl Namespace {
             self.map.term.as_str(),
             self.map.post.as_str(),
             self.map.delta.as_str(),
+            self.map.dict.as_str(),
             self.seg_shadow.as_str(),
             self.fwd_shadow.as_str(),
             self.term_shadow.as_str(),
             self.post_shadow.as_str(),
             self.delta_shadow.as_str(),
+            self.dict_shadow.as_str(),
         ]
         .into_iter()
     }
@@ -265,6 +277,9 @@ impl Namespace {
     pub(crate) fn delta(&self) -> &str {
         &self.map.delta
     }
+    pub(crate) fn dict(&self) -> &str {
+        &self.map.dict
+    }
     pub(crate) fn seg_shadow(&self) -> &str {
         &self.seg_shadow
     }
@@ -279,6 +294,9 @@ impl Namespace {
     }
     pub(crate) fn delta_shadow(&self) -> &str {
         &self.delta_shadow
+    }
+    pub(crate) fn dict_shadow(&self) -> &str {
+        &self.dict_shadow
     }
 }
 
@@ -364,7 +382,7 @@ mod tests {
         let names: Vec<&str> = ns.table_names().collect();
         assert!(names.contains(&"seg"));
         assert!(names.contains(&"seg_shadow"));
-        assert_eq!(names.len(), 11); // 6 persistent + 5 shadows
+        assert_eq!(names.len(), 13); // 7 persistent + 6 shadows
     }
 
     #[test]
@@ -384,6 +402,7 @@ mod tests {
             term: "c".into(),
             post: "d".into(),
             delta: "e".into(),
+            dict: "f".into(),
         };
         assert!(Namespace::explicit(map).is_err());
     }
@@ -398,6 +417,7 @@ mod tests {
             term: "term".into(),
             post: "post".into(),
             delta: "delta".into(),
+            dict: "dict".into(),
         };
         assert!(Namespace::explicit(map).is_err());
     }

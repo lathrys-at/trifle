@@ -12,19 +12,29 @@ use crate::store::Namespace;
 
 /// trifle's on-disk format version. Bump on any incompatible schema change; an
 /// index stamped with a different value is reset on open.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (rev-v0.2): postings are keyed by an interned `u32` term-id (the `dict` table),
+/// not gram text; `fwd` holds a roaring bitmap of term-ids.
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 pub(crate) const KEY_SCHEMA_VERSION: &str = "schema_version";
 pub(crate) const KEY_DATA_VERSION: &str = "data_version";
 pub(crate) const KEY_FINGERPRINT: &str = "tokenizer_fingerprint";
 pub(crate) const KEY_NEXT_ID: &str = "next_id";
+/// The dictionary generation (id-assignment epoch): bumped on every reassignment of
+/// term-ids (rebuild + reset). The read path compares the snapshot's value to the
+/// in-memory dictionary's loaded generation to detect a concurrent reassignment.
+pub(crate) const KEY_DICT_GENERATION: &str = "dict_generation";
 
 /// Create every persistent table and index if absent. Idempotent.
 pub(crate) fn create_tables(conn: &Connection, ns: &Namespace) -> Result<()> {
     // `seg.txt` is NULL in contentless mode; `fwd` is populated only in contentless
-    // mode (the per-segment token set used by delete). The three-way write-frequency
-    // split — `term`/`delta` on every write, `post` only on fold/rebuild — is
-    // deliberate: a write never rewrites the big base posting.
+    // mode (the per-segment token set, now a roaring bitmap of `u32` term-ids, used by
+    // delete). Postings are keyed by the interned term-id from `dict` (gram text lives
+    // only there). The three-way write-frequency split — `term`/`delta` on every write,
+    // `post` only on fold/rebuild — is deliberate: a write never rewrites the big base
+    // posting. `dict` rows are permanent between rebuilds (ids never reused); `term`(df)
+    // rows are pruned when df falls to zero, so df lives apart from `dict`.
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {meta}(key TEXT PRIMARY KEY, value);
          CREATE TABLE IF NOT EXISTS {seg}(
@@ -36,14 +46,17 @@ pub(crate) fn create_tables(conn: &Connection, ns: &Namespace) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS {seg}_by_doc ON {seg}(doc_id, source);
          CREATE TABLE IF NOT EXISTS {fwd}(id INTEGER PRIMARY KEY, tokens BLOB NOT NULL);
-         CREATE TABLE IF NOT EXISTS {term}(term TEXT PRIMARY KEY, df INTEGER NOT NULL);
-         CREATE TABLE IF NOT EXISTS {post}(term TEXT PRIMARY KEY, base BLOB NOT NULL);
+         CREATE TABLE IF NOT EXISTS {dict}(id INTEGER PRIMARY KEY, gram BLOB NOT NULL);
+         CREATE UNIQUE INDEX IF NOT EXISTS {dict}_by_gram ON {dict}(gram);
+         CREATE TABLE IF NOT EXISTS {term}(id INTEGER PRIMARY KEY, df INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS {post}(id INTEGER PRIMARY KEY, base BLOB NOT NULL);
          CREATE TABLE IF NOT EXISTS {delta}(
-            term TEXT PRIMARY KEY, added BLOB NOT NULL, removed BLOB NOT NULL
+            id INTEGER PRIMARY KEY, added BLOB NOT NULL, removed BLOB NOT NULL
          );",
         meta = ns.meta(),
         seg = ns.seg(),
         fwd = ns.fwd(),
+        dict = ns.dict(),
         term = ns.term(),
         post = ns.post(),
         delta = ns.delta(),
@@ -56,13 +69,16 @@ pub(crate) fn create_tables(conn: &Connection, ns: &Namespace) -> Result<()> {
 pub(crate) fn drop_persistent(conn: &Connection, ns: &Namespace) -> Result<()> {
     let sql = format!(
         "DROP INDEX IF EXISTS {seg}_by_doc;
+         DROP INDEX IF EXISTS {dict}_by_gram;
          DROP TABLE IF EXISTS {seg};
          DROP TABLE IF EXISTS {fwd};
+         DROP TABLE IF EXISTS {dict};
          DROP TABLE IF EXISTS {term};
          DROP TABLE IF EXISTS {post};
          DROP TABLE IF EXISTS {delta};",
         seg = ns.seg(),
         fwd = ns.fwd(),
+        dict = ns.dict(),
         term = ns.term(),
         post = ns.post(),
         delta = ns.delta(),
@@ -76,11 +92,13 @@ pub(crate) fn drop_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
     let sql = format!(
         "DROP TABLE IF EXISTS {seg};
          DROP TABLE IF EXISTS {fwd};
+         DROP TABLE IF EXISTS {dict};
          DROP TABLE IF EXISTS {term};
          DROP TABLE IF EXISTS {post};
          DROP TABLE IF EXISTS {delta};",
         seg = ns.seg_shadow(),
         fwd = ns.fwd_shadow(),
+        dict = ns.dict_shadow(),
         term = ns.term_shadow(),
         post = ns.post_shadow(),
         delta = ns.delta_shadow(),
@@ -90,7 +108,9 @@ pub(crate) fn drop_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
 }
 
 /// Create fresh, empty rebuild-shadow tables (dropping any leftovers first). No
-/// `seg`-by-doc index — it is recreated on the live table after the swap.
+/// `seg`-by-doc or `dict`-by-gram index — both are recreated on the live tables after
+/// the swap (the shadow bulk-inserts are dup-free, so the unique gram index is not
+/// needed during the build).
 pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
     drop_shadows(conn, ns)?;
     let sql = format!(
@@ -99,11 +119,13 @@ pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
             source TEXT NOT NULL, ref TEXT NOT NULL, txt TEXT
          );
          CREATE TABLE {fwd}(id INTEGER PRIMARY KEY, tokens BLOB NOT NULL);
-         CREATE TABLE {term}(term TEXT PRIMARY KEY, df INTEGER NOT NULL);
-         CREATE TABLE {post}(term TEXT PRIMARY KEY, base BLOB NOT NULL);
-         CREATE TABLE {delta}(term TEXT PRIMARY KEY, added BLOB NOT NULL, removed BLOB NOT NULL);",
+         CREATE TABLE {dict}(id INTEGER PRIMARY KEY, gram BLOB NOT NULL);
+         CREATE TABLE {term}(id INTEGER PRIMARY KEY, df INTEGER NOT NULL);
+         CREATE TABLE {post}(id INTEGER PRIMARY KEY, base BLOB NOT NULL);
+         CREATE TABLE {delta}(id INTEGER PRIMARY KEY, added BLOB NOT NULL, removed BLOB NOT NULL);",
         seg = ns.seg_shadow(),
         fwd = ns.fwd_shadow(),
+        dict = ns.dict_shadow(),
         term = ns.term_shadow(),
         post = ns.post_shadow(),
         delta = ns.delta_shadow(),
@@ -118,19 +140,24 @@ pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
 pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
     let sql = format!(
         "DROP INDEX IF EXISTS {seg}_by_doc;
+         DROP INDEX IF EXISTS {dict}_by_gram;
          DROP TABLE IF EXISTS {seg};   ALTER TABLE {seg_s}   RENAME TO {seg};
          DROP TABLE IF EXISTS {fwd};   ALTER TABLE {fwd_s}   RENAME TO {fwd};
+         DROP TABLE IF EXISTS {dict};  ALTER TABLE {dict_s}  RENAME TO {dict};
          DROP TABLE IF EXISTS {term};  ALTER TABLE {term_s}  RENAME TO {term};
          DROP TABLE IF EXISTS {post};  ALTER TABLE {post_s}  RENAME TO {post};
          DROP TABLE IF EXISTS {delta}; ALTER TABLE {delta_s} RENAME TO {delta};
-         CREATE INDEX {seg}_by_doc ON {seg}(doc_id, source);",
+         CREATE INDEX {seg}_by_doc ON {seg}(doc_id, source);
+         CREATE UNIQUE INDEX {dict}_by_gram ON {dict}(gram);",
         seg = ns.seg(),
         fwd = ns.fwd(),
+        dict = ns.dict(),
         term = ns.term(),
         post = ns.post(),
         delta = ns.delta(),
         seg_s = ns.seg_shadow(),
         fwd_s = ns.fwd_shadow(),
+        dict_s = ns.dict_shadow(),
         term_s = ns.term_shadow(),
         post_s = ns.post_shadow(),
         delta_s = ns.delta_shadow(),
@@ -224,6 +251,23 @@ pub(crate) fn set_next_id(conn: &Connection, ns: &Namespace, next_id: i64) -> Re
         return Err(crate::Error::corrupt("segment id space exhausted"));
     }
     meta_set(conn, ns, KEY_NEXT_ID, &next_id.to_string())
+}
+
+/// The current dictionary generation (term-id-assignment epoch). Absent → 0.
+pub(crate) fn dict_generation(conn: &Connection, ns: &Namespace) -> Result<u64> {
+    Ok(meta_get(conn, ns, KEY_DICT_GENERATION)?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0))
+}
+
+/// Bump the dictionary generation. Called whenever term-ids are reassigned — a
+/// [`rebuild`](crate::Index::rebuild)'s shadow swap or a drift/desync `reset` — so a
+/// reader can detect that the in-memory dictionary it resolved against no longer
+/// matches its SQLite snapshot. A plain incremental write does *not* bump it (interning
+/// only appends ids; existing ids keep their meaning).
+pub(crate) fn bump_dict_generation(conn: &Connection, ns: &Namespace) -> Result<()> {
+    let next = dict_generation(conn, ns)?.wrapping_add(1);
+    meta_set(conn, ns, KEY_DICT_GENERATION, &next.to_string())
 }
 
 #[cfg(test)]

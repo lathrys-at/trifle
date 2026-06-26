@@ -243,8 +243,8 @@ fn contentless_corrupt_fwd_blob_surfaces_an_error_not_a_panic() {
     });
     idx.insert(7, "field", &[("r", "soon to be corrupted")])
         .unwrap();
-    // Corrupt the stored token set via a separate connection (a count prefix that
-    // promises tokens the blob does not contain).
+    // Corrupt the stored term-id set via a separate connection (bytes that are not a
+    // valid roaring bitmap — the `fwd` blob is now a roaring posting of term-ids).
     let raw = Connection::open(dir.path().join("t.db")).unwrap();
     raw.execute(
         "UPDATE fwd SET tokens = ?1",
@@ -252,8 +252,9 @@ fn contentless_corrupt_fwd_blob_surfaces_an_error_not_a_panic() {
     )
     .unwrap();
     drop(raw);
-    // remove() must consult fwd and surface the corruption, not panic.
-    assert!(matches!(idx.remove(7), Err(trifle::Error::Corrupt(_))));
+    // remove() must consult fwd and surface the corruption, not panic. A corrupt
+    // roaring blob surfaces as the posting-codec error.
+    assert!(matches!(idx.remove(7), Err(trifle::Error::Posting(_))));
 }
 
 #[test]

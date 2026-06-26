@@ -54,6 +54,7 @@ pub mod rank;
 pub mod store;
 pub mod tokenize;
 
+mod dict;
 mod postings;
 mod schema;
 mod select;
@@ -73,6 +74,7 @@ use rusqlite::types::Value;
 pub use rusqlite;
 
 pub use error::{Error, Result};
+use dict::{Dictionary, TermId};
 use rank::{Bm25Ranker, Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
 use schema::SCHEMA_VERSION;
 use select::{SelectParams, select};
@@ -398,6 +400,9 @@ pub struct Index<T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
     tokenizer: T,
     data_version: u64,
     content: Content,
+    /// The in-memory faulting term dictionary (gram → `u32` id), shared by the writer
+    /// and the read pool. Hydrated on open; rebuilt under the swap on `rebuild`.
+    dict: Dictionary,
 }
 
 impl Index<TrigramTokenizer, Sidecar> {
@@ -436,8 +441,15 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             tokenizer,
             data_version: config.data_version,
             content,
+            dict: Dictionary::empty(),
         };
         index.init()?;
+        // Hydrate the in-memory dictionary from the (possibly just-reset) `dict` table.
+        // Done after `init` commits, so a drift reset hydrates an empty map.
+        {
+            let conn = index.backend.read()?;
+            index.dict.load(&conn, index.backend.namespace())?;
+        }
         Ok(index)
     }
 
@@ -463,6 +475,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         if drift || desync {
             schema::reset(&tx, ns)?;
             schema::set_next_id(&tx, ns, 1)?;
+            // A reset empties the dictionary and so reassigns the (now empty) id space;
+            // bump the generation so any concurrent reader detects the change.
+            schema::bump_dict_generation(&tx, ns)?;
             schema::write_stamps(&tx, ns, self.data_version, fingerprint)?;
         }
         tx.commit()?;
@@ -493,10 +508,14 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let mut guard = self.backend.write()?;
         let ns = self.backend.namespace();
         let tx = guard.transaction()?;
+        let mut stage = self.dict.stage();
         let mut changes = TokenChanges::default();
-        self.replace_group(&tx, ns, doc_id, source, segments, &mut changes)?;
+        self.replace_group(&tx, ns, doc_id, source, segments, &mut changes, &mut stage)?;
         changes.apply(&tx, ns)?;
         tx.commit()?;
+        // Only after the transaction commits do the newly-interned grams enter the
+        // shared in-memory map (a rolled-back write leaves no orphan id).
+        stage.commit();
         Ok(())
     }
 
@@ -522,16 +541,18 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let mut guard = self.backend.write()?;
         let ns = self.backend.namespace();
         let tx = guard.transaction()?;
+        let mut stage = self.dict.stage();
         let mut changes = TokenChanges::default();
         for ((doc_id, source), refs_text) in &groups {
             let pairs: Vec<(&str, &str)> = refs_text
                 .iter()
                 .map(|(r, t)| (r.as_str(), t.as_str()))
                 .collect();
-            self.replace_group(&tx, ns, *doc_id, source, &pairs, &mut changes)?;
+            self.replace_group(&tx, ns, *doc_id, source, &pairs, &mut changes, &mut stage)?;
         }
         changes.apply(&tx, ns)?;
         tx.commit()?;
+        stage.commit();
         Ok(())
     }
 
@@ -548,7 +569,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let old = self.old_segments(&tx, ns, doc_id, None)?;
         let mut changes = TokenChanges::default();
         for (id, tokens) in old {
-            changes.remove(id, tokens);
+            changes.remove(id, &tokens);
         }
         tx.execute(
             &format!("DELETE FROM {} WHERE doc_id = ?1", ns.seg()),
@@ -574,16 +595,21 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let mut guard = self.backend.write()?;
         let ns = self.backend.namespace();
         let tx = guard.transaction()?;
+        let mut stage = self.dict.stage();
         let mut changes = TokenChanges::default();
-        // Replacing the group with no segments deletes it.
-        self.replace_group(&tx, ns, doc_id, source, &[], &mut changes)?;
+        // Replacing the group with no segments deletes it (no interning happens, so the
+        // stage stays empty and its commit is a no-op).
+        self.replace_group(&tx, ns, doc_id, source, &[], &mut changes, &mut stage)?;
         changes.apply(&tx, ns)?;
         tx.commit()?;
+        stage.commit();
         Ok(())
     }
 
     /// Delete-then-insert one `(doc_id, source)` group, accumulating its token
-    /// changes into `changes` (applied once per write batch).
+    /// changes into `changes` (applied once per write batch) and interning new grams
+    /// through `stage`.
+    #[allow(clippy::too_many_arguments)]
     fn replace_group(
         &self,
         conn: &Connection,
@@ -592,11 +618,12 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         source: &str,
         segments: &[(&str, &str)],
         changes: &mut TokenChanges,
+        stage: &mut dict::InternStage<'_>,
     ) -> Result<()> {
-        // Removals: the old segments' ids and token sets.
+        // Removals: the old segments' ids and interned term-id sets.
         let old = self.old_segments(conn, ns, doc_id, Some(source))?;
         for (id, tokens) in old {
-            changes.remove(id, tokens);
+            changes.remove(id, &tokens);
         }
         conn.execute(
             &format!("DELETE FROM {} WHERE doc_id = ?1 AND source = ?2", ns.seg()),
@@ -616,7 +643,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         if segments.is_empty() {
             return Ok(());
         }
-        // Additions: fresh monotonic ids for the new segments.
+        // Additions: fresh monotonic segment ids for the new segments.
         let first_id = schema::alloc_ids(conn, ns, segments.len() as u64)?;
         let contentless = self.is_contentless();
         let mut seg_ins = conn.prepare_cached(&format!(
@@ -635,26 +662,35 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             let id = first_id + i as i64;
             let stored_txt = if contentless { None } else { Some(*text) };
             seg_ins.execute(rusqlite::params![id, doc_id, source, ref_, stored_txt])?;
+            // Intern this segment's distinct grams to term-ids (writer fault).
             let tokens = self.distinct_tokens(text);
-            if let Some(stmt) = fwd_ins.as_mut() {
-                stmt.execute(rusqlite::params![id, encode_tokens(&tokens)])?;
+            let mut ids: Vec<TermId> = Vec::with_capacity(tokens.len());
+            for t in &tokens {
+                ids.push(stage.intern(t, conn, ns)?);
             }
-            changes.add(id as u32, tokens);
+            if let Some(stmt) = fwd_ins.as_mut() {
+                // The forward index stores the segment's term-id set as a roaring bitmap
+                // (so a later delete needs neither the text nor the tokenizer).
+                let bm: RoaringBitmap = ids.iter().copied().collect();
+                stmt.execute(rusqlite::params![id, postings::serialize(&bm)?])?;
+            }
+            changes.add(id as u32, &ids);
         }
         Ok(())
     }
 
-    /// The `(id, token set)` of every existing segment under `doc_id` (optionally one
-    /// `source`). In snapshot mode the token set is re-derived from the stored text;
-    /// in contentless mode it comes from the stored `fwd` token set (the source text
-    /// is typically already gone on a delete).
+    /// The `(seg_id, interned term-id set)` of every existing segment under `doc_id`
+    /// (optionally one `source`). In snapshot mode the set is re-derived from the stored
+    /// text and resolved through the dictionary; in contentless mode it comes from the
+    /// stored `fwd` term-id bitmap (the source text is typically already gone on a
+    /// delete — the §5 win).
     fn old_segments(
         &self,
         conn: &Connection,
         ns: &Namespace,
         doc_id: i64,
         source: Option<&str>,
-    ) -> Result<Vec<(u32, Vec<String>)>> {
+    ) -> Result<Vec<(u32, Vec<TermId>)>> {
         let (sql, params): (String, Vec<Value>) = match source {
             Some(s) => (
                 format!(
@@ -684,10 +720,23 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 .map(|id| (id, fwd.get(&id).cloned().unwrap_or_default()))
                 .collect())
         } else {
-            Ok(rows_out
-                .into_iter()
-                .map(|(id, txt)| (id, self.distinct_tokens(txt.as_deref().unwrap_or(""))))
-                .collect())
+            // Re-tokenize and resolve each gram to its id. A stored segment's grams were
+            // interned at insert and dict rows are permanent between rebuilds, so a miss
+            // is an internal-invariant violation (not an absent token) — fail loud, since
+            // a dropped removal would silently drift df.
+            let mut out = Vec::with_capacity(rows_out.len());
+            for (id, txt) in rows_out {
+                let tokens = self.distinct_tokens(txt.as_deref().unwrap_or(""));
+                let mut ids = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let tid = self.dict.resolve(t).ok_or_else(|| {
+                        Error::corrupt("stored segment gram missing from dictionary")
+                    })?;
+                    ids.push(tid);
+                }
+                out.push((id, ids));
+            }
+            Ok(out)
         }
     }
 
@@ -747,7 +796,11 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
 
         // Accumulate the inverted index in memory while streaming segment rows to the
         // shadow tables (O(chunk) memory for the text; postings are roaring-compact).
-        let mut inverted: HashMap<String, RoaringBitmap> = HashMap::new();
+        // Term-ids are reassigned dense first-encounter into a rebuild-local map; the
+        // inverted index is keyed by that id, and the dictionary is rewritten from it.
+        let mut local: HashMap<String, TermId> = HashMap::new();
+        let mut next_term: u64 = 1;
+        let mut inverted: HashMap<TermId, RoaringBitmap> = HashMap::new();
         let mut next_id: i64 = 1;
         {
             let mut seg_ins = tx.prepare_cached(&format!(
@@ -774,12 +827,38 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                     id, seg.doc_id, seg.source, seg.ref_, stored_txt
                 ])?;
                 let tokens = self.distinct_tokens(&seg.text);
-                if let Some(stmt) = fwd_ins.as_mut() {
-                    stmt.execute(rusqlite::params![id, encode_tokens(&tokens)])?;
-                }
+                let mut ids: Vec<TermId> = Vec::with_capacity(tokens.len());
                 for tok in tokens {
-                    inverted.entry(tok).or_default().insert(id as u32);
+                    let tid = match local.get(&tok) {
+                        Some(&t) => t,
+                        None => {
+                            if next_term == 0 || next_term > u32::MAX as u64 {
+                                return Err(Error::corrupt("term id space exhausted"));
+                            }
+                            let t = next_term as TermId;
+                            next_term += 1;
+                            local.insert(tok, t);
+                            t
+                        }
+                    };
+                    ids.push(tid);
+                    inverted.entry(tid).or_default().insert(id as u32);
                 }
+                if let Some(stmt) = fwd_ins.as_mut() {
+                    let bm: RoaringBitmap = ids.iter().copied().collect();
+                    stmt.execute(rusqlite::params![id, postings::serialize(&bm)?])?;
+                }
+            }
+        }
+
+        // Persist the rebuilt dictionary (id -> gram) into the shadow table.
+        {
+            let mut dict_ins = tx.prepare_cached(&format!(
+                "INSERT INTO {}(id, gram) VALUES(?1, ?2)",
+                ns.dict_shadow()
+            ))?;
+            for (gram, id) in &local {
+                dict_ins.execute(rusqlite::params![*id as i64, &dict::gram_key(gram)])?;
             }
         }
 
@@ -787,13 +866,19 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             &tx,
             ns.post_shadow(),
             ns.term_shadow(),
-            inverted.iter().map(|(t, bm)| (t.as_str(), bm)),
+            inverted.iter().map(|(id, bm)| (*id, bm)),
         )?;
 
         schema::swap_shadows(&tx, ns)?;
         schema::set_next_id(&tx, ns, next_id)?;
+        // Reassigning the term-id space bumps the generation so a concurrent reader
+        // detects the change and re-resolves against the new snapshot.
+        schema::bump_dict_generation(&tx, ns)?;
         schema::write_stamps(&tx, ns, self.data_version, self.tokenizer.fingerprint())?;
         tx.commit()?;
+        // Re-hydrate the in-memory dictionary from the swapped-in tables, still under the
+        // held write lease — so no reader splices the old map onto the new snapshot.
+        self.dict.load(&guard, ns)?;
         Ok(())
     }
 
@@ -874,34 +959,52 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         // Distinct tokens per query (deduplicated), computed once outside the read.
         let query_tokens: Vec<Vec<String>> =
             queries.iter().map(|q| self.distinct_tokens(q)).collect();
+        // Every distinct gram across the batch — resolved once to term-ids inside the
+        // read (under the dictionary's generation guard).
+        let all_grams: Vec<&str> = query_tokens
+            .iter()
+            .flat_map(|q| q.iter().map(String::as_str))
+            .collect::<BTreeSet<&str>>()
+            .into_iter()
+            .collect();
 
-        self.read_retry(|conn, ns| {
-            // One batched frequency read over every distinct token in the batch.
-            let all_tokens: BTreeSet<&str> = query_tokens
-                .iter()
-                .flat_map(|q| q.iter().map(String::as_str))
+        self.search_read(&all_grams, |conn, ns, resolved| {
+            // One batched frequency read over every resolved term-id in the batch.
+            let all_ids: Vec<TermId> = resolved
+                .values()
+                .copied()
+                .collect::<BTreeSet<TermId>>()
+                .into_iter()
                 .collect();
-            let all_vec: Vec<&str> = all_tokens.into_iter().collect();
-            let dfs = postings::read_dfs(conn, ns, &all_vec)?;
+            let dfs = postings::read_dfs(conn, ns, &all_ids)?;
+            // A gram's df: 0 if it resolved to no id (absent token) or its id has no
+            // live df row — exactly the existing df-0 behavior.
+            let df_of = |t: &str| -> i64 {
+                resolved
+                    .get(t)
+                    .and_then(|id| dfs.get(id))
+                    .copied()
+                    .unwrap_or(0)
+            };
 
             // Per-query selection, then one batched posting read over every selected
             // token in the batch.
             let selected_per: Vec<Vec<String>> = query_tokens
                 .iter()
                 .map(|q| {
-                    let pairs: Vec<(String, i64)> = q
-                        .iter()
-                        .map(|t| (t.clone(), dfs.get(t.as_str()).copied().unwrap_or(0)))
-                        .collect();
+                    let pairs: Vec<(String, i64)> =
+                        q.iter().map(|t| (t.clone(), df_of(t))).collect();
                     select(&pairs, sel_params)
                 })
                 .collect();
-            let sel_all: BTreeSet<&str> = selected_per
+            let sel_ids: Vec<TermId> = selected_per
                 .iter()
-                .flat_map(|s| s.iter().map(String::as_str))
+                .flat_map(|s| s.iter())
+                .filter_map(|t| resolved.get(t.as_str()).copied())
+                .collect::<BTreeSet<TermId>>()
+                .into_iter()
                 .collect();
-            let sel_vec: Vec<&str> = sel_all.into_iter().collect();
-            let postings_map = postings::effective_postings(conn, ns, &sel_vec)?;
+            let postings_map = postings::effective_postings(conn, ns, &sel_ids)?;
 
             // Total live segments — the `N` a length/idf reranker normalizes by. One
             // count for the whole batch (cheap; the default overlap ranker ignores it).
@@ -918,9 +1021,15 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             let mut out = Vec::with_capacity(queries.len());
             for (qi, query) in queries.iter().enumerate() {
                 let selected = &selected_per[qi];
+                // Map each selected token back to its posting via its resolved id.
                 let present: Vec<(&str, &RoaringBitmap)> = selected
                     .iter()
-                    .filter_map(|t| postings_map.get(t.as_str()).map(|bm| (t.as_str(), bm)))
+                    .filter_map(|t| {
+                        resolved
+                            .get(t.as_str())
+                            .and_then(|id| postings_map.get(id))
+                            .map(|bm| (t.as_str(), bm))
+                    })
                     .collect();
 
                 let mut survivors =
@@ -1021,13 +1130,13 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
-    /// Read the stored `fwd` token sets for a set of segment ids (contentless mode).
+    /// Read the stored `fwd` term-id sets for a set of segment ids (contentless mode).
     fn read_fwd(
         &self,
         conn: &Connection,
         ns: &Namespace,
         ids: &[u32],
-    ) -> Result<HashMap<u32, Vec<String>>> {
+    ) -> Result<HashMap<u32, Vec<TermId>>> {
         let mut out = HashMap::with_capacity(ids.len());
         if ids.is_empty() {
             return Ok(out);
@@ -1040,7 +1149,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         while let Some(r) = rows.next()? {
             let id: i64 = r.get(0)?;
             let blob: Vec<u8> = r.get(1)?;
-            out.insert(id as u32, decode_tokens(&blob)?);
+            out.insert(id as u32, postings::deserialize(&blob)?.iter().collect());
         }
         Ok(out)
     }
@@ -1058,26 +1167,68 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
-    /// Run a read closure on a pooled connection, retrying a transient
-    /// busy/locked/schema-change fault a few times before surfacing it.
-    fn read_retry<R>(&self, mut f: impl FnMut(&Connection, &Namespace) -> Result<R>) -> Result<R> {
+    /// Run a search read on a pooled connection under one WAL snapshot, resolving the
+    /// query grams to term-ids and guarding against a concurrent rebuild.
+    ///
+    /// The whole read runs inside one DEFERRED transaction so every statement (token
+    /// dfs, postings, segment count, hydration) sees a single snapshot; without it they
+    /// could straddle a concurrent id-reassigning `rebuild` commit and splice postings
+    /// from the old snapshot onto seg rows from the new one. The transaction is read-only
+    /// and never committed; dropping it just releases the snapshot.
+    ///
+    /// Because the term dictionary is in memory (out of the SQL snapshot), the grams are
+    /// resolved and the dictionary generation captured atomically, then compared to the
+    /// snapshot's stored `dict_generation`. A mismatch means a rebuild/reset reassigned
+    /// ids relative to this snapshot — the read retries on a fresh snapshot, where the
+    /// generations agree. Transient busy/locked/schema-change faults are retried too.
+    fn search_read<R>(
+        &self,
+        all_grams: &[&str],
+        mut f: impl FnMut(&Connection, &Namespace, &HashMap<String, TermId>) -> Result<R>,
+    ) -> Result<R> {
         let ns = self.backend.namespace();
         let mut attempt = 0;
         loop {
             let conn = self.backend.read()?;
-            // Run the whole read inside one DEFERRED transaction so every statement sees a
-            // single WAL snapshot. A search issues several SELECTs (token dfs, postings,
-            // segment count, hydration); without a shared snapshot they could straddle a
-            // concurrent id-reassigning `rebuild`/`compact` commit and splice postings from
-            // the old snapshot onto seg rows from the new one — hydrating the wrong document.
-            // The transaction is read-only and never committed; dropping it rolls back, which
-            // just releases the snapshot.
-            let outcome = match conn.unchecked_transaction() {
-                Ok(tx) => f(&tx, ns),
-                Err(e) => Err(Error::from(e)),
+            let tx = match conn.unchecked_transaction() {
+                Ok(tx) => tx,
+                Err(e) => return Err(Error::from(e)),
             };
-            match outcome {
+            // Resolve the grams in memory + capture the generation atomically, then read
+            // the snapshot's generation to compare.
+            let (resolved, gen_mem) = self.dict.resolve_batch(all_grams);
+            let gen_snap = match schema::dict_generation(&tx, ns) {
+                Ok(g) => g,
+                Err(e) => {
+                    let retry =
+                        attempt < RETRY_MAX && matches!(&e, Error::Sqlite(se) if is_retryable(se));
+                    drop(tx);
+                    drop(conn);
+                    if retry {
+                        attempt += 1;
+                        std::thread::sleep(Duration::from_millis(10 * attempt as u64));
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+            if gen_snap != gen_mem {
+                // A rebuild/reset reassigned ids between the in-memory capture and this
+                // snapshot — retry on a fresh snapshot.
+                drop(tx);
+                drop(conn);
+                if attempt >= RETRY_MAX {
+                    return Err(Error::corrupt(
+                        "dictionary generation skew did not settle across retries",
+                    ));
+                }
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(10 * attempt as u64));
+                continue;
+            }
+            match f(&tx, ns, &resolved) {
                 Err(Error::Sqlite(e)) if attempt < RETRY_MAX && is_retryable(&e) => {
+                    drop(tx);
                     drop(conn);
                     attempt += 1;
                     std::thread::sleep(Duration::from_millis(10 * attempt as u64));
@@ -1088,23 +1239,24 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     }
 }
 
-/// Accumulated per-token id changes for one write batch, applied in a single
-/// [`postings::apply_writes`] pass.
+/// Accumulated per-term-id segment changes for one write batch, applied in a single
+/// [`postings::apply_writes`] pass. Keyed by the interned `u32` term-id; the values are
+/// the segment ids added and removed for that term.
 #[derive(Default)]
 struct TokenChanges {
-    map: HashMap<String, (Vec<u32>, Vec<u32>)>,
+    map: HashMap<TermId, (Vec<u32>, Vec<u32>)>,
 }
 
 impl TokenChanges {
-    fn add(&mut self, id: u32, tokens: Vec<String>) {
-        for t in tokens {
-            self.map.entry(t).or_default().0.push(id);
+    fn add(&mut self, seg_id: u32, ids: &[TermId]) {
+        for &t in ids {
+            self.map.entry(t).or_default().0.push(seg_id);
         }
     }
 
-    fn remove(&mut self, id: u32, tokens: Vec<String>) {
-        for t in tokens {
-            self.map.entry(t).or_default().1.push(id);
+    fn remove(&mut self, seg_id: u32, ids: &[TermId]) {
+        for &t in ids {
+            self.map.entry(t).or_default().1.push(seg_id);
         }
     }
 
@@ -1112,7 +1264,11 @@ impl TokenChanges {
         let writes: Vec<postings::TermWrite<'_>> = self
             .map
             .iter()
-            .map(|(term, (add, remove))| postings::TermWrite { term, add, remove })
+            .map(|(id, (add, remove))| postings::TermWrite {
+                id: *id,
+                add,
+                remove,
+            })
             .collect();
         postings::apply_writes(conn, ns, &writes)
     }
@@ -1132,52 +1288,6 @@ fn is_retryable(e: &rusqlite::Error) -> bool {
             _,
         )
     )
-}
-
-/// Encode a segment's distinct token set as the contentless-mode `fwd` blob:
-/// `u32 count`, then per token `u32 byte-length + bytes`.
-fn encode_tokens(tokens: &[String]) -> Vec<u8> {
-    let cap = 4 + tokens.iter().map(|t| 4 + t.len()).sum::<usize>();
-    let mut buf = Vec::with_capacity(cap);
-    buf.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
-    for t in tokens {
-        buf.extend_from_slice(&(t.len() as u32).to_le_bytes());
-        buf.extend_from_slice(t.as_bytes());
-    }
-    buf
-}
-
-/// Decode a `fwd` blob produced by [`encode_tokens`].
-fn decode_tokens(blob: &[u8]) -> Result<Vec<String>> {
-    let mut pos = 0usize;
-    let read_u32 = |blob: &[u8], pos: &mut usize| -> Result<u32> {
-        let end = *pos + 4;
-        let slice = blob
-            .get(*pos..end)
-            .ok_or_else(|| Error::corrupt("truncated fwd token blob"))?;
-        *pos = end;
-        Ok(u32::from_le_bytes(slice.try_into().expect("4 bytes")))
-    };
-    let count = read_u32(blob, &mut pos)? as usize;
-    // Bound the preallocation by what the remaining bytes could possibly hold (each
-    // token costs at least its 4-byte length prefix), so a corrupt `count` prefix
-    // cannot drive a multi-gigabyte allocation before the per-token reads error out.
-    let max_possible = blob.len().saturating_sub(pos) / 4;
-    let mut tokens = Vec::with_capacity(count.min(max_possible));
-    for _ in 0..count {
-        let len = read_u32(blob, &mut pos)? as usize;
-        let end = pos + len;
-        let bytes = blob
-            .get(pos..end)
-            .ok_or_else(|| Error::corrupt("truncated fwd token blob"))?;
-        tokens.push(
-            std::str::from_utf8(bytes)
-                .map_err(|_| Error::corrupt("invalid utf-8 in fwd token blob"))?
-                .to_string(),
-        );
-        pos = end;
-    }
-    Ok(tokens)
 }
 
 #[cfg(test)]

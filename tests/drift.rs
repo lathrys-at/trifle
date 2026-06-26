@@ -93,7 +93,7 @@ fn changing_the_tokenizer_empties_the_cache() {
 fn schema_version_is_stamped_and_observable() {
     let h = Harness::new();
     let s = h.index.stats().unwrap();
-    assert_eq!(s.schema_version, 1);
+    assert_eq!(s.schema_version, 2);
     assert_eq!(s.data_version, 0);
 }
 

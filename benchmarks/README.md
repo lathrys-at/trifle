@@ -91,6 +91,40 @@ for n in 10000 50000 100000 500000 1000000; do
 done
 ```
 
+### Speed + recall (`eval`), JSON, plots & profiling
+
+The **`eval`** command is the combined **speed + quality** profile: latency, throughput, AND
+honest recall@k on *labeled* queries, across the effort sweep. Unlike `latency` (in-corpus
+snippets, FTS5 phrase-MATCH — a speed comparison where a recall number would misrepresent
+FTS5), `eval` uses the recall-eval regimes and scores FTS5 via the **fair OR-bag `MATCH`**:
+
+- `--corpus msmarco` — real dev queries + qrels (paraphrase; the effort ladder moves recall);
+- `--corpus geonames-all` — entity name + `--edits` typos (the *real* typo regime).
+
+Both profiles also:
+
+- **measure several efforts from one index build** — `--effort-sweep low,medium,high`;
+- **emit machine-readable JSON** — `--format json` writes one object carrying, per
+  (engine, effort), the p50/p90/p99/max latency, throughput, recall@k, **and the raw
+  per-query samples** (so a post-processor can recompute anything without re-running);
+- **profile a run** — `--instrument xctrace` (Instruments' Time Profiler, macOS) or
+  `--instrument samply` (cross-platform) re-execs the run under a sampling profiler and
+  writes a trace artifact. A hook for *where* the time goes, separate from the JSON's
+  *how much*.
+
+(`latency` keeps a trifle-only self-recall figure; `eval` is the fair cross-engine recall.)
+
+`tools/latency_plot.py` drives `eval`: it sweeps the corpus-size ladder, persists the raw
+JSON, and renders the grouped p50/p90/p99 chart (recall@k + `*`max annotated) plus the
+throughput-vs-`N` plot. See [`tools/README.md`](tools/README.md).
+
+```bash
+cargo run -p trifle-benchmarks --release -- fetch --corpus relevance      # ~1 GiB, once
+python3 benchmarks/tools/latency_plot.py --queries 100 --seed 42          # msmarco sweep
+python3 benchmarks/tools/latency_plot.py --corpus geonames-all --edits 2  # typo regime
+python3 benchmarks/tools/latency_plot.py --reuse-raw                      # re-plot, no re-run
+```
+
 ## Caveats
 
 These are not your users' queries. Prefer relative signal (trifle vs BM25; typo vs no-typo;

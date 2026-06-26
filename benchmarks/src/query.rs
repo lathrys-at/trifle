@@ -14,11 +14,20 @@
 use crate::corpus::{Corpus, Entity};
 use crate::rng::Rng;
 
-/// A generated latency query: the text and how many typos it carries (for the run's
-/// recorded typo mix). Latency needs no label.
+/// A generated latency query: the text, how many typos it carries (for the run's
+/// recorded typo mix), and the id of the document the snippet was drawn from.
+///
+/// The latency *timing* needs no label, but the snippet's source doc is the natural
+/// relevant answer for an in-corpus recall@k readout: a clean snippet should retrieve
+/// its own document, and a typo'd one tests whether the fuzzy machinery still does. The
+/// `latency` command reports recall@k over `target` so the speed numbers carry a quality
+/// figure alongside (see `cmd_latency`).
 pub struct Query {
     pub text: String,
     pub edits: usize,
+    /// The id of the corpus document this snippet came from — the relevant id for the
+    /// latency command's in-corpus recall@k.
+    pub target: i64,
 }
 
 /// A fuzzy-eval query: the corrupted text, the target entity id (the label), and the
@@ -124,6 +133,7 @@ pub fn perf_queries(corpus: &Corpus, n: usize, seed: u64) -> Vec<Query> {
             Some(Query {
                 text: corrupt(snip, edits, &mut rng),
                 edits,
+                target: doc.id,
             })
         })
         .collect()

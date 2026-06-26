@@ -138,8 +138,9 @@ or `data_version` bump, both of which empty the cache on open). `stats()` report
 
 ### Cross-cutting
 
-- `src/error.rs` — `Error`/`Result`; variants separate the three failure classes (transient
-  store fault vs. fixable caller input vs. impossible internal-invariant violation). `#[non_exhaustive]`.
+- `src/error.rs` — `Error`/`Result`; variants separate the failure classes a caller handles
+  differently (transient store fault; fixable caller input; impossible internal-invariant
+  violation; a stranded writer handle — `Error::WriterStranded`). `#[non_exhaustive]`.
 - `src/instrument.rs` — `trace_debug!` etc. compile to nothing unless `--features tracing`.
 - **Tests** are integration-style binaries under `tests/`, one concern each (`typo`, `unicode`,
   `drift`, `lifecycle`, `ranking`, `scope_ranker`, `backends`, `adversarial`, `api`, `basic`),

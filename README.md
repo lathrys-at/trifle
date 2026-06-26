@@ -35,60 +35,72 @@ trifle = "0.1"
 
 ```rust
 use std::path::Path;
-use trifle::{Config, Index, SearchOpts};
+use trifle::{Config, Index, Schema, SearchOpts};
 
 fn main() -> trifle::Result<()> {
-    let index = Index::open_at(Path::new("search.db"), Config::default())?;
+    // A flat schema: an integer key plus one text field (any segment label, stored).
+    let index = Index::open_at(Path::new("search.db"), Schema::flat(), Config::default())?;
 
-    // A segment is (doc_id, source, ref, text); source and ref are opaque
-    // provenance labels returned on a match.
-    index.insert(1, "field", &[("title", "the quick brown fox")])?;
-    index.insert(2, "field", &[("title", "the quack brown ox")])?;
+    // Writes go through a single-writer lease; commit() makes them durable.
+    let mut w = index.writer()?;
+    w.insert(1, &[("title", "the quick brown fox")])?;
+    w.insert(2, &[("title", "the quack brown ox")])?;
+    w.commit()?;
 
-    // A misspelled query still matches.
-    let hits = index.search("quikc brown", SearchOpts::new(10))?;
-    assert_eq!(hits[0].doc_id, 1);
+    // Reads go through a reader lease (a pinned snapshot). A misspelled query still matches.
+    let hits = index.reader()?.search("quikc brown", SearchOpts::new(10))?;
+    assert_eq!(hits[0].key.as_i64(), Some(1));
     Ok(())
 }
 ```
 
 ## Data model
 
-A segment is `(doc_id, source, ref, text)`. The fields are caller-assigned and play
-distinct operational roles:
+A `Schema` declares the shape of your data; trifle generates its tables from it. A document
+has a **key** and one or more named **segments**:
 
-- `doc_id` — the unit of retrieval. A search returns at most one match per `doc_id`, its
-  best-matching segment, and `limit` counts `doc_id`s. Make `doc_id` whatever you want back
-  as a single result.
-- `source` — the unit of write. `insert(doc_id, source, …)` replaces every segment under a
-  `(doc_id, source)` pair; `remove_source(doc_id, source)` deletes that pair; `remove(doc_id)`
-  deletes every source of a doc.
-- `ref` — a free-form label on one segment, returned on a match so you know which segment
-  matched. It is metadata, not a key: there is no replace or delete by `ref`.
-- `text` — stored raw; the tokenizer normalizes it for matching.
+- **key** — the unit of retrieval, of a declared shape (`Integer`, `Text`, or `Blob`). A
+  search returns at most one match per key — its best-matching segment — and `limit` counts
+  keys. A `Match` carries the `key`, the matched segment's `label`, its `text`, and (when
+  locatable) a byte `span`.
+- **segment** — a `(label, text)` pair under a key. `label` is a free-form name returned on
+  a match so you know which segment matched; a document holds each label at most once. Each
+  text field has a `StorageMode`: `Stored` (snapshot kept), `Resolver` (text fetched from
+  your `TextResolver` at query time — contentless), or `CoordinatesOnly` (only the match
+  location is returned).
+- `Schema::flat()` is the simplest shape: an integer key and one default text field that
+  accepts any label, stored. `Schema::chunked()` / the builder declare named fields, their
+  storage modes, and **filterable** columns.
 
-These roles cover two distinct patterns:
+This covers two common patterns:
 
-- **Provenance** — one logical document per `doc_id`, with a segment per place its text comes
-  from: `source` the category (`"ocr"`, `"caption"`, `"field"`), `ref` the sub-location (a
-  filename or field name). A search returns the document and its best-matching segment.
-- **Chunking a large document** — if one best passage per document is enough, keep `doc_id`
-  the document, put the chunks under a single `source`, and use `ref` for each chunk's
-  position; a match returns the best chunk, with its text and (when locatable) a byte span.
-  To retrieve several passages from the same document at once, give each chunk its own
-  `doc_id` (results are deduplicated per `doc_id`) and record the parent in `source` or `ref`.
+- **Provenance** — one document per key, a segment per place its text comes from (label the
+  sub-location: `"ocr"`, `"title"`, a filename). A search returns the document and its
+  best-matching segment.
+- **Chunking a large document** — keep the document as the key and put each passage under its
+  own label; a match returns the best chunk, with its text and (when locatable) a byte span.
+  To retrieve several passages from one document at once, give each chunk its own key
+  (results are deduplicated per key).
 
 ## Features
 
-- **Typo / partial tolerance** via trigram overlap; strictness (`min_shared`) and recall
+- **Typo / partial tolerance** via n-gram overlap; strictness (`min_shared`) and recall
   (`t_max`, the rarest query tokens kept) dials.
+- **Mixed-script aware** — the default `DefaultTokenizer` splits text into same-script runs
+  and windows each appropriately (CJK bigrams, else trigrams), so no gram straddles a script
+  boundary. `NgramTokenizer<N>` (`TrigramTokenizer` / `BigramTokenizer`) is the plain
+  fixed-width tokenizer for single-script corpora.
 - **Configurable normalization** — NFC (default), NFD, accent-insensitive
   (`NfdStripMarks`), or none. Unicode casefolding is on by default.
 - **Reranking** — bit-sliced posting list overlap generates candidates; the default
   `Effort::Medium` reranks a pool of ~`c·√(k·N)` with a BM25-shaped tier (idf, length
   normalization, literal verification). Tune via `SearchOpts::rerank(Effort)` (`None`
   through `Max`), or supply a custom `Ranker`.
-- **Scoped search** — a provenance predicate evaluated over candidates only.
+- **Filtering** — declare `filterable` columns and pass a structured `Filter` (comparisons,
+  `In`/`Between`/`IsNull`/`Like`, `And`/`Or`) to cut the rerank/hydration set; plus a
+  `scope` predicate evaluated over candidates only.
+- **Hydration ladder** — `SearchOpts::hydrate` chooses how much each match carries
+  (coordinates only, segment text, or document payload), so you pay only for what you read.
 
 ## Usage
 
@@ -106,7 +118,7 @@ connections — and manages the pragmas and write serialization itself. You open
 it; nothing else is required:
 
 ```rust
-let index = Index::open_at(Path::new("search.db"), Config::default())?;
+let index = Index::open_at(Path::new("search.db"), Schema::flat(), Config::default())?;
 ```
 
 ### Shared mode
@@ -126,7 +138,7 @@ let backend = Shared::new(
     write_conn,                        // the one connection writes serialize through
     || open_readonly_connection(),     // read-only factory: || -> rusqlite::Result<Connection>
 )?;
-let index = Index::open(backend, TrigramTokenizer::new(), Config::default())?;
+let index = Index::open(backend, DefaultTokenizer::new(), Schema::flat(), Config::default())?;
 ```
 
 ### Maintenance
@@ -151,7 +163,7 @@ when choosing one:
 
 | | embedded (no server)? | updates | scales to 1M+ small docs? | provenance | matching semantics | storage |
 |---|---|---|---|---|---|---|
-| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | source / ref | trigram overlap + BM25-shaped rerank | disk (SQLite) |
+| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | key / label | trigram overlap + BM25-shaped rerank | disk (SQLite) |
 | **[SQLite FTS5](https://www.sqlite.org/fts5.html#the_trigram_tokenizer)** | yes | incremental | yes | rowid | trigram substring (`MATCH` / `LIKE`) | disk (SQLite) |
 | **[pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html)** | no (server) | incremental (GIN / GiST) | yes | table rows | trigram similarity | disk (server) |
 | **[Tantivy](https://github.com/quickwit-oss/tantivy)** | yes | incremental (segments) | yes | stored fields | Levenshtein automaton (≤ 2 edits) | disk (segments) |

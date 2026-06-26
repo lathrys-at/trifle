@@ -18,7 +18,7 @@ Ordered roughly by value-to-effort. Each task is self-contained; do them in any 
 dependency is noted. Every task is **done** only when the full gate (Part 2 §6) is green and
 its named test exists.
 
-### Quick wins (≤ half a day each)
+### Small, self-contained changes
 
 #### T1 — Fold filterable columns into the rebuild doc INSERT (was I-N1)
 - **Why.** `rebuild()` writes each document's `doc` row, then issues a *separate* `UPDATE` per
@@ -81,7 +81,7 @@ its named test exists.
   editing if you're an agent.)*
 - **Done-when.** `CLAUDE.md` matches `error.rs`.
 
-### Performance / robustness (≈ 1 day each)
+### Performance / robustness
 
 #### T5 — Scope the Tier-2 filter to candidate ids (was I12)
 - **Why.** A broad structured filter (e.g. `lang = 'en'` over most of a 1M-doc corpus)
@@ -126,7 +126,7 @@ its named test exists.
 - **Done-when.** Concurrent search under rebuild churn does not spuriously `Busy` at the
   documented scale; coherence probe green.
 
-### Architecture (≈ 2–3 days)
+### Architecture
 
 #### T7 — Extract the search pipeline; give the leases real bodies (was I22)
 - **Why.** `src/lib.rs` is ~1.9k lines and the read/write logic lives as inherent `Index`
@@ -150,7 +150,7 @@ its named test exists.
 - **Done-when.** `lib.rs` is the lifecycle + types; the pipeline lives in `search.rs`; no
   `too_many_arguments` allows; gate green.
 
-### Larger features (design exists in the addendum; multi-day)
+### Larger features (design exists in the addendum)
 
 These are unblocked — the design is written — but each is a substantial change. Sequence after
 the above unless a consumer needs one sooner.

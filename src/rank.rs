@@ -223,8 +223,16 @@ fn hydrate_provenance(
 ///
 /// The default [`OverlapRanker`] orders by overlap (free — it reads only counts).
 /// A richer ranker spends more for quality — the built-in [`Bm25Ranker`] (idf + BM25+
-/// length normalization over terms), or a custom one doing proximity, cross-segment
-/// fusion, or exact-substring promotion — over the segment text each candidate carries.
+/// length normalization over terms), or a custom one doing proximity, true term-frequency,
+/// or exact-substring promotion — over the segment text each candidate carries. The inputs a
+/// BM25-style custom ranker needs are public: [`Candidate::matched_terms`] (each matched
+/// token with its `df`), [`Candidate::seg_len`] (`|d|`), and [`QueryContext::n_segments`] /
+/// [`QueryContext::avgdl`].
+///
+/// **The unit is the segment.** Candidate generation reduces each document to its single
+/// best-matching segment before the ranker runs, so a ranker sees one candidate per document
+/// and *cannot* fuse a document's multiple segments — do cross-segment fusion *above* trifle
+/// by aggregating results across your own keys.
 pub trait Ranker: Send + Sync {
     /// Return the candidates in final result order (best first). May drop candidates
     /// by omitting them; trifle truncates the result to the search limit.
@@ -248,7 +256,10 @@ impl Ranker for OverlapRanker {
 /// BM25 idf for a token present in `df` of `n` segments, clamped at zero. For `df <= n`
 /// the value is already non-negative; the clamp only guards the `df > n` case a desynced
 /// posting could produce, so a match can never score *negative*.
-fn idf(df: u64, n: u64) -> f64 {
+///
+/// Public so a custom [`Ranker`] can weight by the same idf the built-in [`Bm25Ranker`]
+/// uses, fed from [`Candidate::matched_terms`] and [`QueryContext::n_segments`].
+pub fn idf(df: u64, n: u64) -> f64 {
     let (df, n) = (df as f64, n as f64);
     (1.0 + (n - df + 0.5) / (df + 0.5)).ln().max(0.0)
 }
@@ -267,7 +278,9 @@ fn idf(df: u64, n: u64) -> f64 {
 /// - **tf is binary** (`tf = 1` for a present term): the bit-sliced index records presence,
 ///   not per-term counts, and for short n-gram segments a gram's tf is almost always 1, so
 ///   a presence-frequency BM25+ is the faithful-and-cheap form. (An application that needs
-///   true tf or cross-segment fusion supplies its own [`Ranker`].)
+///   true tf can recompute it from each candidate's segment text in a custom [`Ranker`];
+///   cross-segment fusion is not a ranker concern — the ranker sees one best segment per
+///   document — so fuse above trifle.)
 ///
 /// The ad-hoc literal/substring tier of the previous scorer is **gone** — verifying exact
 /// substrings is the frontend's job (highlighting/annotation), not the ranker's. Reads only
@@ -382,6 +395,14 @@ impl<'a> Candidates<'a> {
     pub fn iter(&self) -> impl Iterator<Item = Candidate<'_>> {
         (0..self.len()).map(move |i| self.get(i).expect("index in range"))
     }
+
+    /// The query's selected tokens that have a posting, each paired with its document
+    /// frequency `df` (the number of segments containing it). These are the idf inputs a
+    /// custom [`Ranker`] needs — the same the built-in [`Bm25Ranker`] uses — without any
+    /// store read (the postings are already in hand).
+    pub fn present_terms(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.present.iter().map(|(t, bm)| (*t, bm.len()))
+    }
 }
 
 /// One candidate exposed to a [`Ranker`].
@@ -413,6 +434,12 @@ impl Candidate<'_> {
     pub fn text(&self) -> &str {
         &self.s.text
     }
+    /// The matched segment's gram length `|d|` (token count with repetition) — the BM25+
+    /// length-normalization input, the same value the built-in [`Bm25Ranker`] uses. `0` only
+    /// for a sub-n-gram segment that produced no tokens.
+    pub fn seg_len(&self) -> u32 {
+        self.s.len
+    }
     /// Which selected tokens this candidate's segment actually contains.
     pub fn matched_tokens(&self) -> Vec<&str> {
         self.present
@@ -420,6 +447,17 @@ impl Candidate<'_> {
             .filter(|(_, bm)| bm.contains(self.s.seg_id))
             .map(|(t, _)| *t)
             .collect()
+    }
+    /// Which selected tokens this candidate's segment contains, each paired with its document
+    /// frequency `df` (segments containing it) — everything a custom [`Ranker`] needs to
+    /// compute an idf-weighted score, exactly as the built-in [`Bm25Ranker`] does (combine
+    /// with [`QueryContext::n_segments`] for idf and [`seg_len`](Self::seg_len) /
+    /// [`QueryContext::avgdl`] for length normalization).
+    pub fn matched_terms(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.present
+            .iter()
+            .filter(|(_, bm)| bm.contains(self.s.seg_id))
+            .map(|(t, bm)| (*t, bm.len()))
     }
 }
 

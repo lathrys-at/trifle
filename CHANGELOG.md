@@ -12,7 +12,7 @@ A ground-up rework. **Breaking across the board, and a hard cache reset:** the o
   keyed by an interned `u32` term-id behind a faulting dictionary (reader `resolve`,
   writer `intern`), not gram text — narrower B-trees, smaller index.
 - **Forward index as term-ids.** Every segment stores its `u32` term-id set, so **delete
-  needs neither the text nor the tokenizer** regardless of storage mode.
+  needs neither the text nor the tokenizer**.
 - **`u128` term encoding.** A gram (≤3 codepoints) + script tag packs big-endian into a
   `u128`; the script byte is the most-significant byte (script-contiguous order).
 - **Script-segmenting default tokenizer.** `DefaultTokenizer` is now what trifle ships:
@@ -63,7 +63,10 @@ A ground-up rework. **Breaking across the board, and a hard cache reset:** the o
   rolling `seg_count`/`seg_len_sum` meta counters in the write transaction), and the BM25+
   `δ` lower bound. The previous word-tokenized, ad-hoc substring/literal-verification tier
   is **gone** (frontends annotate exact substrings). An application needing true
-  term-frequency or cross-segment fusion supplies its own `Ranker`.
+  term-frequency can recompute it from each candidate's segment text in a custom `Ranker`
+  (`Candidate::matched_terms`/`seg_len` expose the BM25 inputs); the segment is the ranking
+  unit, so **cross-segment fusion happens above trifle** (aggregate results across your keys),
+  not in a `Ranker`.
 
 ### Filtering ladder
 - **Tier 2 — filterable columns.** `Schema::filterable(name, FilterType)` materializes

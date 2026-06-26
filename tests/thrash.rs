@@ -8,6 +8,10 @@
 //! reimplementing ranking:
 //!
 //! - segment count matches the oracle exactly (catches lost/leaked/double writes);
+//! - the rolling BM25 meta counters (`seg_count`/`seg_len_sum`) reconcile against the live
+//!   `seg` table after every op (catches a write path that forgets a `bump_seg_stats` or
+//!   bumps a wrong length — the counter is maintained three ways, so drift would otherwise be
+//!   invisible), and `df` never goes negative;
 //! - `compact()` clears the delta backlog (fold correctness);
 //! - every returned match is *faithful* — its `(key, label, text)` is a real segment
 //!   currently in the oracle (catches phantom docs, stale text, monotonic-id reuse,
@@ -22,8 +26,10 @@ mod common;
 use common::*;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use proptest::prelude::*;
+use trifle::rusqlite::Connection;
 use trifle::store::Sidecar;
 use trifle::tokenize::DefaultTokenizer;
 use trifle::{Document, SearchOpts};
@@ -161,14 +167,45 @@ fn faithful(oracle: &Oracle, m: &trifle::Match) -> bool {
         == Some(m.text.as_str())
 }
 
+/// Reconcile the rolling BM25 meta counters against the live `seg` table (the source of
+/// truth for stored lengths), reading the file directly so the check is independent of the
+/// code under test. Catches a counter that has drifted from the segments it summarizes.
+fn reconcile_counters(path: &Path) {
+    let c = Connection::open(path).unwrap();
+    let meta = |k: &str| -> i64 {
+        c.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+    };
+    let (recount, len_sum): (i64, i64) = c
+        .query_row("SELECT count(*), coalesce(sum(len), 0) FROM seg", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(meta("seg_count"), recount, "seg_count counter vs seg table");
+    assert_eq!(
+        meta("seg_len_sum"),
+        len_sum,
+        "seg_len_sum counter vs seg table"
+    );
+    let min_df: i64 = c
+        .query_row("SELECT coalesce(min(df), 0) FROM term", [], |r| r.get(0))
+        .unwrap();
+    assert!(min_df >= 0, "df went negative ({min_df})");
+}
+
 /// Check every invariant against the oracle.
-fn check(idx: &Idx, oracle: &Oracle) {
+fn check(idx: &Idx, oracle: &Oracle, path: &Path) {
     let expected_segments: u64 = oracle.values().map(|v| v.len() as u64).sum();
     assert_eq!(
         idx.stats().unwrap().segments,
         expected_segments,
         "segment count"
     );
+    reconcile_counters(path);
 
     // Sample a few existing docs (deterministic BTreeMap order) and verify recall + that
     // every returned match is faithful and well-formed.
@@ -207,10 +244,11 @@ proptest! {
     #[test]
     fn thrashing_preserves_every_invariant(ops in prop::collection::vec(op_strategy(), 6..48)) {
         let h = Harness::new();
+        let path = h.db_path();
         let mut oracle = Oracle::new();
         for op in ops {
             apply(&h.index, &mut oracle, op);
-            check(&h.index, &oracle);
+            check(&h.index, &oracle, &path);
         }
     }
 }

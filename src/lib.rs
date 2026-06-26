@@ -9,8 +9,9 @@
 //! store.
 //!
 //! It targets a specific regime — **large corpora of small documents**
-//! (≲ 1–2 KB per segment), read-often / write-infrequent. The ranking omits length
-//! normalization, which is sound only for small documents.
+//! (≲ 1–2 KB per segment), read-often / write-infrequent. The precision-tier reranker is
+//! BM25+ over the index's n-gram terms, length-normalized against the online mean segment
+//! length (the design assumes small segments throughout).
 //!
 //! # Quick start
 //!
@@ -51,7 +52,11 @@
 //! # Ingest & maintenance
 //!
 //! Writes are cheap (a small delta append, `O(tokens)`) and **instantly visible** — a
-//! committed write is searchable by the very next [`reader`](Index::reader). This
+//! committed write is searchable by the very next [`reader`](Index::reader) acquired after
+//! [`commit`](Writer::commit) returns. (A reader on *another* thread that opens its snapshot
+//! during the sub-millisecond window between the SQL commit and the in-memory dictionary
+//! merge may briefly miss a *brand-new* n-gram's first occurrence — missing, never wrong, and
+//! self-healing on the next reader.) This
 //! supports both write-infrequent and continual-drip ingest; "write-infrequent" is about
 //! *fold amortization*, not write capability. Fold pending deltas into the base postings
 //! with [`compact`](Index::compact) on a cadence driven by
@@ -86,6 +91,7 @@ mod welford;
 use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use roaring::RoaringBitmap;
@@ -149,8 +155,8 @@ pub type ScopeFn<'a> = dyn Fn(&Key, &str) -> bool + 'a;
 /// How hard the ranker tries: how deep a candidate pool to over-fetch and rerank.
 ///
 /// Candidate generation by bit-sliced overlap is cheap but orders only coarsely (by
-/// shared-token count); the precision tier — idf weighting, length normalization, and
-/// literal verification (the [`Bm25Ranker`]) — reorders a *pool* of
+/// shared-token count); the precision tier — idf weighting and length normalization (the
+/// [`Bm25Ranker`]) — reorders a *pool* of
 /// the top candidates. The pool must be deeper than `limit` to recover a relevant
 /// document that overlap alone ranked past `limit`, and empirically the depth needed for
 /// a given recall scales as **`c·√(limit · N)`** (N = indexed segments) — a power law in
@@ -373,6 +379,12 @@ pub struct Index<T: Tokenizer = DefaultTokenizer, B: Backend = Sidecar> {
     /// The in-memory faulting term dictionary (gram → `u32` id), shared by the writer
     /// and the read pool. Hydrated on open; rebuilt under the swap on `rebuild`.
     dict: Dictionary,
+    /// Set if [`rebuild`](Self::rebuild)'s in-memory dictionary reload failed *after* its
+    /// SQL swap had already committed: the on-disk term space is the new generation but the
+    /// in-memory map still reflects the old one, so its ids would mis-route reads and writes.
+    /// Every lease then fails closed until the caller reopens (or a later `rebuild` succeeds
+    /// and clears it) — far better than silently serving from a stale dictionary (audit C2-FB-C1).
+    poisoned: AtomicBool,
 }
 
 impl Index<DefaultTokenizer, Sidecar> {
@@ -408,6 +420,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             data_version: config.data_version,
             schema,
             dict: Dictionary::empty(),
+            poisoned: AtomicBool::new(false),
         };
         index.init()?;
         // Hydrate the in-memory dictionary from the (possibly just-reset) `dict` table.
@@ -448,6 +461,19 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
+    /// Fail closed if a prior `rebuild` left the in-memory dictionary stale (see
+    /// [`poisoned`](Self::poisoned)). Called at every lease/maintenance entry point so a
+    /// poisoned index never serves a search or accepts a write against a mis-routed map.
+    fn check_poisoned(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::corrupt(
+                "index poisoned: an in-memory dictionary reload failed after a committed \
+                 rebuild; reopen the index (its on-disk state is intact) to recover",
+            ));
+        }
+        Ok(())
+    }
+
     /// A cheap consistency probe: the monotonic-id invariant `max(seg.id) < next_id`.
     fn desync(&self, conn: &Connection, ns: &Namespace) -> Result<bool> {
         let max_id: Option<i64> =
@@ -472,6 +498,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     ///
     /// Returns an error if the write transaction cannot begin.
     pub fn writer(&self) -> Result<Writer<'_, T, B>> {
+        self.check_poisoned()?;
         Writer::begin(self)
     }
 
@@ -482,6 +509,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     ///
     /// Returns an error if the lease cannot be set up.
     pub fn reader(&self) -> Result<Reader<'_, T, B>> {
+        self.check_poisoned()?;
         Ok(Reader { index: self })
     }
 
@@ -493,6 +521,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     ///
     /// Returns an error if a read connection cannot be acquired.
     pub fn session(&self) -> Result<SearchSession<'_, T, B>> {
+        self.check_poisoned()?;
         let conn = self.backend.read()?;
         Ok(SearchSession { index: self, conn })
     }
@@ -584,18 +613,25 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
-    /// Tokenize `text`, dedupe to its distinct grams, and resolve each to a term-id via
-    /// `assign` — the single lowering shared by the incremental write path
+    /// Tokenize `text` once, returning both its distinct resolved term-ids (each assigned
+    /// via `assign`) and its total gram count **with repetition** — the BM25+ segment
+    /// length `|d|`. This is the single lowering shared by the incremental write path
     /// ([`write_segment`](Self::write_segment), `assign` = stage intern) and
     /// [`rebuild`](Self::rebuild) (`assign` = a dense local allocator). Owning the
     /// tokenize + 3-codepoint ceiling check in one place keeps the two paths from drifting
-    /// (audit I4).
+    /// (audit I4); returning the length here keeps the segment tokenized exactly **once**
+    /// per write/rebuild (audit C2-F1 — was a second `tokenize().count()` pass).
     fn distinct_term_ids(
         &self,
         text: &str,
         mut assign: impl FnMut(Term) -> Result<TermId>,
-    ) -> Result<Vec<TermId>> {
-        let distinct: HashSet<T::Token> = self.tokenizer.tokenize(text).collect();
+    ) -> Result<(Vec<TermId>, i64)> {
+        let mut distinct: HashSet<T::Token> = HashSet::new();
+        let mut seg_len: i64 = 0;
+        for tok in self.tokenizer.tokenize(text) {
+            seg_len += 1;
+            distinct.insert(tok);
+        }
         let mut ids: Vec<TermId> = Vec::with_capacity(distinct.len());
         for tok in &distinct {
             let term = tok.term().ok_or_else(|| {
@@ -606,7 +642,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             })?;
             ids.push(assign(term)?);
         }
-        Ok(ids)
+        Ok((ids, seg_len))
     }
 
     /// Write one segment `(doc, label) = text`, interning its grams through `stage` and
@@ -639,8 +675,12 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             self.drop_segment(conn, ns, seg_id, changes)?;
         }
         let id = schema::alloc_ids(conn, ns, 1)?;
-        // The segment's gram length (with repetition) for BM25+ length normalization.
-        let seg_len = self.tokenizer.tokenize(text).count() as i64;
+        // Tokenize once: intern straight from the tokens (`token.term()`), not via stringified
+        // grams — the blanket `IntoTerm` packs each token with no per-token `String` allocation —
+        // and take the segment's gram length (with repetition) for BM25+ length normalization
+        // from the same pass (audit C2-F1).
+        let (ids, seg_len) =
+            self.distinct_term_ids(text, |term| stage.intern_term(term, conn, ns))?;
         conn.execute(
             &format!(
                 "INSERT INTO {}(id, doc_id, label, txt, len) VALUES(?1, ?2, ?3, ?4, ?5)",
@@ -648,9 +688,6 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             ),
             rusqlite::params![id, doc, label, text, seg_len],
         )?;
-        // Intern straight from the tokens (`token.term()`), not via stringified grams — the
-        // blanket `IntoTerm` packs each token with no per-token `String` allocation.
-        let ids = self.distinct_term_ids(text, |term| stage.intern_term(term, conn, ns))?;
         let bm: RoaringBitmap = ids.iter().copied().collect();
         conn.execute(
             &format!("INSERT INTO {}(id, tokens) VALUES(?1, ?2)", ns.fwd()),
@@ -716,7 +753,10 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     }
 
     /// Remove the segment `(doc, label)` if present (its removals into `changes`); a
-    /// no-op if absent. The `doc` row is left intact (it may have other segments).
+    /// no-op if absent. If that was the document's **last** segment, the now-empty `doc`
+    /// row is dropped too, so `remove_segment`-to-empty converges with [`remove`](Writer::remove)
+    /// (whole-doc) and a logically-deleted document leaves no orphan row whose filterable
+    /// payload a later insert under the same key would silently inherit (audit C2-RA-1).
     fn remove_one_segment(
         &self,
         conn: &Connection,
@@ -727,6 +767,17 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     ) -> Result<()> {
         if let Some(seg_id) = self.find_segment(conn, ns, doc, label)? {
             self.drop_segment(conn, ns, seg_id, changes)?;
+            let remaining: i64 = conn.query_row(
+                &format!("SELECT count(*) FROM {} WHERE doc_id = ?1", ns.seg()),
+                rusqlite::params![doc],
+                |r| r.get(0),
+            )?;
+            if remaining == 0 {
+                conn.execute(
+                    &format!("DELETE FROM {} WHERE id = ?1", ns.doc()),
+                    rusqlite::params![doc],
+                )?;
+            }
         }
         Ok(())
     }
@@ -798,6 +849,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     ///
     /// Returns an error if the store write fails.
     pub fn compact(&self) -> Result<CompactStats> {
+        self.check_poisoned()?;
         let mut guard = self.backend.write()?;
         let ns = self.backend.namespace();
         let tx = guard.transaction()?;
@@ -867,18 +919,10 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                     }
                     let seg_id = next_seg;
                     next_seg += 1;
-                    let seg_len = self.tokenizer.tokenize(text).count() as i64;
-                    total_seg_len += seg_len;
-                    seg_ins.execute(rusqlite::params![
-                        seg_id,
-                        doc_id,
-                        label,
-                        text.as_str(),
-                        seg_len
-                    ])?;
-                    // Same lowering as the incremental path, but assigning dense ids from a
-                    // rebuild-local allocator (see `distinct_term_ids` / audit I4).
-                    let ids = self.distinct_term_ids(text, |term| {
+                    // Same lowering as the incremental path (one tokenize pass yields both the
+                    // term-ids and the gram-count length — audit I4/C2-F1), but assigning dense
+                    // ids from a rebuild-local allocator.
+                    let (ids, seg_len) = self.distinct_term_ids(text, |term| {
                         let gkey = term.0;
                         if let Some(&t) = local.get(&gkey) {
                             return Ok(t);
@@ -891,6 +935,14 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                         local.insert(gkey, t);
                         Ok(t)
                     })?;
+                    total_seg_len += seg_len;
+                    seg_ins.execute(rusqlite::params![
+                        seg_id,
+                        doc_id,
+                        label,
+                        text.as_str(),
+                        seg_len
+                    ])?;
                     for &tid in &ids {
                         inverted.entry(tid).or_default().insert(seg_id as u32);
                     }
@@ -934,8 +986,18 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         )?;
         tx.commit()?;
         // Re-hydrate the in-memory dictionary from the swapped-in tables, still under the
-        // held write lease — so no reader splices the old map onto the new snapshot.
-        self.dict.load(&guard, ns)?;
+        // held write lease — so no reader splices the old map onto the new snapshot. The SQL
+        // swap is already durable; if this reload fails we must NOT keep serving from the now
+        // stale in-memory map (its ids point at the OLD term space — they would silently
+        // mis-route reads and writes), so poison the index: every lease fails closed until the
+        // caller reopens (the on-disk state is the consistent new generation) (audit C2-FB-C1).
+        if let Err(e) = self.dict.load(&guard, ns) {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(e);
+        }
+        // A successful rebuild rebuilds the dictionary from scratch, so it also clears any
+        // poison a previous failed reload left behind — `rebuild` is a recovery path.
+        self.poisoned.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -1780,5 +1842,32 @@ mod effort_tests {
         assert!(!Effort::None.reranks());
         assert!(Effort::Medium.reranks());
         assert!(!Effort::Custom(0.0).reranks());
+    }
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use super::*;
+
+    /// A poisoned index (a post-commit dict reload failed — audit C2-FB-C1) must fail every
+    /// lease/maintenance entry point closed, and a later successful `rebuild` must clear it.
+    #[test]
+    fn poison_fails_leases_closed_and_rebuild_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx =
+            Index::open_at(&dir.path().join("t.db"), Schema::flat(), Config::default()).unwrap();
+        assert!(idx.reader().is_ok(), "healthy index opens a reader");
+
+        // Simulate the reload failure that poisons the index.
+        idx.poisoned.store(true, Ordering::Release);
+        assert!(matches!(idx.reader().err(), Some(Error::Corrupt(_))));
+        assert!(matches!(idx.writer().err(), Some(Error::Corrupt(_))));
+        assert!(matches!(idx.session().err(), Some(Error::Corrupt(_))));
+        assert!(matches!(idx.compact().err(), Some(Error::Corrupt(_))));
+
+        // A successful rebuild rebuilds the in-memory dictionary, so it is a recovery path.
+        idx.rebuild(std::iter::empty()).unwrap();
+        assert!(idx.reader().is_ok(), "rebuild cleared the poison");
+        assert!(idx.writer().is_ok());
     }
 }

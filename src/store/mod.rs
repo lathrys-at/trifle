@@ -34,6 +34,16 @@ pub use sidecar::Sidecar;
 /// trifle is single-writer: [`write`](Backend::write) hands out the one exclusive
 /// writer, [`read`](Backend::read) a pooled read-only connection that (under WAL)
 /// runs concurrently with the writer and with other readers.
+///
+/// # Implementing a custom backend
+///
+/// trifle never opens connections itself, so it cannot run any per-connection setup for
+/// you. **Every connection handed out by [`write`](Backend::write) and [`read`](Backend::read)
+/// must already have the `carray`/`rarray` virtual table registered** — call
+/// [`register_carray`] in your connection factory (the built-in [`Sidecar`]/[`Shared`]
+/// backends do exactly this). Without it, the first batched read (`WHERE id IN rarray(?1)`,
+/// used by hydration and delete) fails with `no such function: rarray`. The connections must
+/// also be WAL-mode for the single-writer / concurrent-reader contract to hold.
 pub trait Backend: Send + Sync {
     /// The exclusive write connection guard; derefs to the [`Connection`].
     type WriteGuard<'a>: DerefMut<Target = Connection>
@@ -44,23 +54,23 @@ pub trait Backend: Send + Sync {
     where
         Self: 'a;
 
-    /// Acquire the exclusive write connection. Blocks until the writer is free.
+    /// Acquire the exclusive write connection. Blocks until the writer is free. The
+    /// returned connection must already have `carray`/`rarray` registered (see the trait
+    /// docs and [`register_carray`]).
     fn write(&self) -> Result<Self::WriteGuard<'_>>;
 
-    /// Acquire a pooled read-only connection.
+    /// Acquire a pooled read-only connection. The returned connection must already have
+    /// `carray`/`rarray` registered (see the trait docs and [`register_carray`]).
     fn read(&self) -> Result<Self::ReadGuard<'_>>;
 
     /// The table-naming namespace for this backend.
     fn namespace(&self) -> &Namespace;
 }
 
-// NOTE (audit I9): a `Backend::init_conn` hook was removed in v0.2. trifle never opened
-// connections itself, so it could never call the hook — leaving an author who implemented
-// it but didn't *also* run the same setup in their connection factory with a runtime
-// "no such function: rarray" at the first batched read. Every connection a custom backend
-// hands out from `write`/`read` **must already** have the `carray`/`rarray` vtab registered
-// (`rusqlite::vtab::array::load_module`, what [`register_carray`] does); the built-in
-// backends do this in their connection factories, which is the one place it belongs.
+// NOTE (audit I9): a `Backend::init_conn` hook was removed in v0.2 — trifle never opens
+// connections itself, so it could never call the hook. The per-connection obligation a custom
+// backend must meet (register `carray`/`rarray`) now lives in the `Backend` trait rustdoc, and
+// `register_carray` (below) is the public helper to satisfy it from a connection factory.
 
 /// One-time, process-global SQLite tuning. Best-effort and behavior-transparent.
 ///
@@ -84,7 +94,11 @@ pub(crate) fn configure_sqlite_perf() {
 
 /// Register the `carray`/`rarray` virtual table on a connection so a whole id list
 /// binds to one prepared `WHERE id IN rarray(?1)` statement. Idempotent.
-pub(crate) fn register_carray(conn: &Connection) -> Result<()> {
+///
+/// A custom [`Backend`] **must** call this on every connection its `write`/`read` factory
+/// produces (the built-in backends do); otherwise trifle's batched reads fail with
+/// `no such function: rarray`. See the [`Backend`] trait docs.
+pub fn register_carray(conn: &Connection) -> Result<()> {
     rusqlite::vtab::array::load_module(conn)?;
     Ok(())
 }
@@ -102,8 +116,8 @@ pub struct TableMap {
     pub doc: String,
     /// One row per indexed segment (id, doc_id, label, snapshot text).
     pub seg: String,
-    /// Contentless-mode forward index (per-segment token set); unused in snapshot
-    /// mode.
+    /// Per-segment forward index: the interned `u32` term-id set of each segment, as a
+    /// roaring posting. Read by delete, so delete needs neither the text nor the tokenizer.
     pub fwd: String,
     /// Per-token effective document frequency (the pruner reads this), keyed by the
     /// interned `u32` term-id.

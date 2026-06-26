@@ -77,9 +77,8 @@ fn effort_over_fetch_lets_the_reranker_recover_a_buried_answer() {
     // Insert the distractors FIRST (so they take the lower *internal* doc ids — the
     // overlap tie-break is the internal id = insertion order), then the answer last so it
     // is buried in raw overlap order. The distractors share the same two trigrams ("xqz",
-    // "qzv") but split apart in a long doc: equal overlap, yet no literal "xqzv" and a
-    // long length — both BM25 signals (length normalization + literal boost) favor the
-    // short verbatim answer.
+    // "qzv") but split apart in a long doc: equal overlap, yet a long length — BM25+
+    // length normalization favors the short verbatim answer.
     for doc in 1..=12 {
         h.put(
             doc,

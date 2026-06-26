@@ -85,15 +85,15 @@ mod dict;
 mod model;
 mod postings;
 mod schema;
+mod search;
 mod select;
 mod term;
 mod welford;
 
 use std::borrow::Borrow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
 
 use roaring::RoaringBitmap;
 use rusqlite::types::Value;
@@ -107,15 +107,11 @@ pub use rusqlite;
 use dict::{Dictionary, TermId};
 pub use error::{Error, Result};
 pub use model::{CmpOp, Document, Filter, FilterType, Key, KeyShape, Match, Schema, SchemaBuilder};
-use rank::{
-    Candidates, CompiledFilter, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search,
-};
+use rank::Ranker;
 use schema::SCHEMA_VERSION;
-use select::{SelectParams, select};
 use store::{Backend, Namespace, Sidecar};
 pub use term::{IntoTerm, Term};
 use tokenize::{DefaultTokenizer, Tokenizer};
-use welford::ClassSnap;
 
 /// Default match floor `m` — shared rare tokens required for a hit.
 const DEFAULT_MIN_SHARED: u32 = 2;
@@ -252,7 +248,7 @@ pub struct SearchOpts<'a> {
     /// raised to `F`.
     pub t_max: Option<usize>,
     /// A per-query [`Ranker`] to reorder the IDF-weighted-overlap survivors. `None` → the
-    /// built-in [`OverlapRanker`], which preserves trifle's weighted-overlap order (there is
+    /// built-in [`OverlapRanker`](rank::OverlapRanker), which preserves trifle's weighted-overlap order (there is
     /// no built-in relevance/BM25 ranker).
     pub ranker: Option<&'a dyn Ranker>,
     /// A membership predicate `(key, label) -> keep` evaluated over candidates in
@@ -1169,242 +1165,32 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
 
     /// Search a batch of queries, one result list per query in order. Invoked by a
     /// [`Reader`]; not public on `Index` (reads go through a [`reader`](Self::reader)
-    /// lease). Each query's selection and ranking derive only from its own token
-    /// frequencies, so a batch ranks each query identically to a singleton search
-    /// (batch == serial).
+    /// lease). Checks out a fresh pooled connection, then runs the shared body.
     fn search_batch(&self, queries: &[&str], opts: &SearchOpts<'_>) -> Result<Vec<Vec<Match>>> {
+        let conn = self.backend.read()?;
+        self.search_batch_on(&conn, queries, opts)
+    }
+
+    /// The shared read body on a **given** connection — used by the [`Reader`] (a fresh
+    /// per-search checkout, via [`search_batch`](Self::search_batch)) and by the warm
+    /// [`SearchSession`] (its held connection). Tokenizes, then runs the
+    /// snapshot/generation-guarded pipeline ([`search`]). Each query's selection and ranking
+    /// derive only from its own token frequencies, so a batch ranks each query identically to
+    /// a singleton search (batch == serial).
+    fn search_batch_on(
+        &self,
+        conn: &Connection,
+        queries: &[&str],
+        opts: &SearchOpts<'_>,
+    ) -> Result<Vec<Vec<Match>>> {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
-        let (query_tokens, all_grams) = Self::query_grams(queries, |q| self.distinct_tokens(q));
-        // Per-search checkout + snapshot, then the shared search body.
-        self.search_read(&all_grams, |conn, ns, resolved, class_snap| {
-            self.run_search(conn, ns, resolved, class_snap, queries, &query_tokens, opts)
+        let (query_tokens, all_grams) = search::query_grams(queries, |q| self.distinct_tokens(q));
+        search::search_read_on(self, conn, &all_grams, |conn, ns, resolved, class_snap| {
+            search::SearchCtx::new(self, conn, ns, resolved, class_snap, opts)
+                .run_search(queries, &query_tokens)
         })
-    }
-
-    /// The distinct tokens per query and the batch-wide distinct gram set (resolution
-    /// input). Factored so the [`SearchSession`] reuses it.
-    fn query_grams(
-        queries: &[&str],
-        tokenize: impl Fn(&str) -> Vec<String>,
-    ) -> (Vec<Vec<String>>, Vec<String>) {
-        let query_tokens: Vec<Vec<String>> = queries.iter().map(|q| tokenize(q)).collect();
-        let all_grams: Vec<String> = query_tokens
-            .iter()
-            .flat_map(|q| q.iter().cloned())
-            .collect::<BTreeSet<String>>()
-            .into_iter()
-            .collect();
-        (query_tokens, all_grams)
-    }
-
-    /// The per-snapshot search body: given the resolved gram→id map and class snapshot,
-    /// read dfs/postings, select, generate candidates, apply the filter, rank, hydrate.
-    /// Shared by the [`Reader`] (per-search checkout) and the warm [`SearchSession`]
-    /// (held connection).
-    #[allow(clippy::too_many_arguments)]
-    fn run_search(
-        &self,
-        conn: &Connection,
-        ns: &Namespace,
-        resolved: &HashMap<String, TermId>,
-        class_snap: &ClassSnap,
-        queries: &[&str],
-        query_tokens: &[Vec<String>],
-        opts: &SearchOpts<'_>,
-    ) -> Result<Vec<Vec<Match>>> {
-        let min_shared = opts.min_shared.unwrap_or(DEFAULT_MIN_SHARED).max(1);
-        let sel_params = SelectParams {
-            min_shared,
-            typo_damage: TYPO_DAMAGE,
-            t_max: opts.t_max.unwrap_or(DEFAULT_T_MAX),
-        };
-        // Ranking is the IDF-weighted overlap order the counter produces; the default
-        // [`OverlapRanker`] preserves it. An explicit `opts.ranker` may reorder (over an
-        // [`Effort`]-deepened pool). There is no built-in relevance/BM25 tier.
-        let overlap = OverlapRanker;
-        let ranker: &dyn Ranker = opts.ranker.unwrap_or(&overlap);
-
-        // One batched frequency read over every resolved term-id in the batch.
-        let all_ids: Vec<TermId> = resolved
-            .values()
-            .copied()
-            .collect::<BTreeSet<TermId>>()
-            .into_iter()
-            .collect();
-        let dfs = postings::read_dfs(conn, ns, &all_ids)?;
-        // A gram's df: 0 if it resolved to no id (absent token) or its id has no live df
-        // row — exactly the existing df-0 behavior.
-        let df_of = |t: &str| -> i64 {
-            resolved
-                .get(t)
-                .and_then(|id| dfs.get(id))
-                .copied()
-                .unwrap_or(0)
-        };
-
-        let selected_per: Vec<Vec<String>> = query_tokens
-            .iter()
-            .map(|q| {
-                let triples: Vec<(String, i64, u8)> = q
-                    .iter()
-                    .map(|t| {
-                        let class = term::encode_term(t).map(|tm| tm.class()).unwrap_or(0);
-                        (t.clone(), df_of(t), class)
-                    })
-                    .collect();
-                select(&triples, sel_params, class_snap)
-            })
-            .collect();
-        let sel_ids: Vec<TermId> = selected_per
-            .iter()
-            .flat_map(|s| s.iter())
-            .filter_map(|t| resolved.get(t.as_str()).copied())
-            .collect::<BTreeSet<TermId>>()
-            .into_iter()
-            .collect();
-        let postings_map = postings::effective_postings(conn, ns, &sel_ids)?;
-
-        // Corpus size + average segment length from the O(1) rolling meta counters (audit
-        // I3), read under this search's snapshot. Not used by the default overlap ranking
-        // (it is df-only); surfaced to a custom [`Ranker`] via [`QueryContext`].
-        let (seg_count, seg_len_sum) = schema::read_seg_stats(conn, ns)?;
-        let n_segments = seg_count.max(0) as u64;
-        let avgdl = if seg_count > 0 {
-            seg_len_sum as f64 / seg_count as f64
-        } else {
-            0.0
-        };
-        let pool = opts.effort.pool(opts.limit, n_segments);
-
-        // Tier-2 filter, compiled once for the whole batch. It is applied **scoped to each
-        // query's candidate ids** inside `overlap_search` (a small `WHERE id IN rarray(...)` per
-        // bucket), so its cost is bounded by the pool, never an O(N) scan of the corpus (audit
-        // T5 / I12). Compiling here rather than per query keeps batch == serial — every query in
-        // the batch sees the identical predicate.
-        let compiled_filter = match opts.filter {
-            Some(f) => Some(f.compile(&self.schema)?),
-            None => None,
-        };
-        let filter = compiled_filter
-            .as_ref()
-            .map(|(where_sql, params)| CompiledFilter { where_sql, params });
-
-        let mut out = Vec::with_capacity(queries.len());
-        for (qi, query) in queries.iter().enumerate() {
-            let selected = &selected_per[qi];
-            let present: Vec<(&str, &RoaringBitmap)> = selected
-                .iter()
-                .filter_map(|t| {
-                    resolved
-                        .get(t.as_str())
-                        .and_then(|id| postings_map.get(id))
-                        .map(|bm| (t.as_str(), bm))
-                })
-                .collect();
-            // Telemetry for the weight-step hint (df-only; no corpus read).
-            self.observe_band_spread(&present);
-
-            let mut survivors = overlap_search(
-                conn,
-                ns,
-                &present,
-                pool,
-                min_shared,
-                opts.weight_step,
-                self.schema.key_shape(),
-                filter.as_ref(),
-                opts.scope,
-            )?;
-            // Every indexed field is stored, so a match always carries its text and any
-            // custom ranker always sees it.
-            self.hydrate_text(conn, ns, &mut survivors)?;
-
-            out.push(self.rank_to_matches(
-                &survivors, &present, selected, query, min_shared, ranker, opts.limit, n_segments,
-                avgdl,
-            ));
-        }
-        Ok(out)
-    }
-
-    /// Run the ranker over the survivors and build the result matches.
-    #[allow(clippy::too_many_arguments)]
-    fn rank_to_matches(
-        &self,
-        survivors: &[Survivor],
-        present: &[(&str, &RoaringBitmap)],
-        selected: &[String],
-        query: &str,
-        min_shared: u32,
-        ranker: &dyn Ranker,
-        limit: usize,
-        n_segments: u64,
-        avgdl: f64,
-    ) -> Vec<Match> {
-        let candidates = Candidates::new(survivors, present);
-        let qctx = QueryContext {
-            query,
-            selected,
-            min_shared,
-            n_segments,
-            avgdl,
-        };
-        let ranked = ranker.rank(&candidates, &qctx);
-        let sel_refs: Vec<&str> = selected.iter().map(String::as_str).collect();
-        let mut matches = Vec::with_capacity(ranked.len().min(limit));
-        for r in ranked.into_iter().take(limit) {
-            let Some(s) = survivors.get(r.candidate) else {
-                continue;
-            };
-            let span = self.tokenizer.span(&s.text, &sel_refs);
-            matches.push(Match {
-                key: s.key.clone(),
-                label: s.label.clone(),
-                span,
-                text: s.text.clone(),
-            });
-        }
-        matches
-    }
-
-    /// Hydrate each survivor's text from `seg.txt` in one batched read (`WHERE id IN
-    /// rarray`). Every indexed field is stored, so every survivor gets its segment text.
-    fn hydrate_text(
-        &self,
-        conn: &Connection,
-        ns: &Namespace,
-        survivors: &mut [Survivor],
-    ) -> Result<()> {
-        if survivors.is_empty() {
-            return Ok(());
-        }
-        let ids: Vec<u32> = survivors.iter().map(|s| s.seg_id).collect();
-        let arr: std::rc::Rc<Vec<Value>> =
-            std::rc::Rc::new(ids.iter().map(|&i| Value::Integer(i as i64)).collect());
-        let sql = format!(
-            "SELECT id, txt, len FROM {} WHERE id IN rarray(?1)",
-            ns.seg()
-        );
-        let mut texts: HashMap<u32, (String, u32)> = HashMap::with_capacity(ids.len());
-        {
-            let mut stmt = conn.prepare_cached(&sql)?;
-            let mut rows = stmt.query(rusqlite::params![arr])?;
-            while let Some(r) = rows.next()? {
-                let id = r.get::<_, i64>(0)? as u32;
-                let txt = r.get::<_, String>(1)?;
-                let len = r.get::<_, i64>(2)?.max(0) as u32;
-                texts.insert(id, (txt, len));
-            }
-        }
-        for s in survivors.iter_mut() {
-            if let Some((t, len)) = texts.remove(&s.seg_id) {
-                s.text = t;
-                s.len = len;
-            }
-        }
-        Ok(())
     }
 
     /// Read the stored `fwd` term-id sets for a set of segment ids (every segment has
@@ -1430,92 +1216,6 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             out.insert(id as u32, postings::deserialize(&blob)?.iter().collect());
         }
         Ok(out)
-    }
-
-    /// Run a search read on a pooled connection under one WAL snapshot, resolving the
-    /// query grams to term-ids and guarding against a concurrent rebuild.
-    ///
-    /// The whole read runs inside one DEFERRED transaction so every statement (token
-    /// dfs, postings, segment count, hydration) sees a single snapshot; without it they
-    /// could straddle a concurrent id-reassigning `rebuild` commit and splice postings
-    /// from the old snapshot onto seg rows from the new one. The transaction is read-only
-    /// and never committed; dropping it just releases the snapshot.
-    ///
-    /// Because the term dictionary is in memory (out of the SQL snapshot), the grams are
-    /// resolved and the dictionary generation captured atomically, then compared to the
-    /// snapshot's stored `dict_generation`. A mismatch means a rebuild/reset reassigned
-    /// ids relative to this snapshot — the read retries on a fresh snapshot, where the
-    /// generations agree. Transient busy/locked/schema-change faults are retried too.
-    fn search_read<R>(
-        &self,
-        all_grams: &[String],
-        f: impl FnMut(&Connection, &Namespace, &HashMap<String, TermId>, &ClassSnap) -> Result<R>,
-    ) -> Result<R> {
-        let conn = self.backend.read()?;
-        self.search_read_on(&conn, all_grams, f)
-    }
-
-    /// The retry/snapshot/generation-guard loop on a **given** connection — used both by
-    /// [`search_read`](Self::search_read) (a fresh pooled checkout per call) and by the
-    /// warm [`SearchSession`] (a held connection reused across keystrokes). Retries open a
-    /// fresh snapshot on the same connection.
-    fn search_read_on<R>(
-        &self,
-        conn: &Connection,
-        all_grams: &[String],
-        mut f: impl FnMut(&Connection, &Namespace, &HashMap<String, TermId>, &ClassSnap) -> Result<R>,
-    ) -> Result<R> {
-        let ns = self.backend.namespace();
-        let gram_refs: Vec<&str> = all_grams.iter().map(String::as_str).collect();
-        let mut attempt = 0;
-        loop {
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(e) => return Err(Error::from(e)),
-            };
-            // Resolve the grams in memory + capture the generation and per-class stats
-            // snapshot atomically, then read the snapshot's generation to compare.
-            let (resolved, gen_mem, class_snap) = self.dict.resolve_batch(&gram_refs);
-            let gen_snap = match schema::dict_generation(&tx, ns) {
-                Ok(g) => g,
-                Err(e) => {
-                    let retry =
-                        attempt < RETRY_MAX && matches!(&e, Error::Sqlite(se) if is_retryable(se));
-                    drop(tx);
-                    if retry {
-                        attempt += 1;
-                        std::thread::sleep(Duration::from_millis(10 * attempt as u64));
-                        continue;
-                    }
-                    return Err(e);
-                }
-            };
-            if gen_snap != gen_mem {
-                // A rebuild/reset reassigned ids between the in-memory capture and this
-                // snapshot — retry on a fresh snapshot on the same connection.
-                drop(tx);
-                if attempt >= RETRY_MAX {
-                    // The store is consistent; only the in-memory dictionary raced a
-                    // concurrent rebuild's id-reassignment. This is transient — a fresh
-                    // reader resolves against the settled generation — so surface it as
-                    // retryable, NOT Corrupt (which would wrongly imply an unrepairable store).
-                    return Err(Error::busy(
-                        "dictionary generation skew did not settle across retries; retry on a fresh reader",
-                    ));
-                }
-                attempt += 1;
-                std::thread::sleep(Duration::from_millis(10 * attempt as u64));
-                continue;
-            }
-            match f(&tx, ns, &resolved, &class_snap) {
-                Err(Error::Sqlite(e)) if attempt < RETRY_MAX && is_retryable(&e) => {
-                    drop(tx);
-                    attempt += 1;
-                    std::thread::sleep(Duration::from_millis(10 * attempt as u64));
-                }
-                other => return other,
-            }
-        }
     }
 }
 
@@ -1915,23 +1615,7 @@ impl<T: Tokenizer, B: Backend> SearchSession<'_, T, B> {
     ///
     /// Returns an error if the store read fails.
     pub fn search_batch(&self, queries: &[&str], opts: SearchOpts<'_>) -> Result<Vec<Vec<Match>>> {
-        if queries.is_empty() {
-            return Ok(Vec::new());
-        }
-        let (query_tokens, all_grams) =
-            Index::<T, B>::query_grams(queries, |q| self.index.distinct_tokens(q));
-        self.index
-            .search_read_on(&self.conn, &all_grams, |conn, ns, resolved, class_snap| {
-                self.index.run_search(
-                    conn,
-                    ns,
-                    resolved,
-                    class_snap,
-                    queries,
-                    &query_tokens,
-                    &opts,
-                )
-            })
+        self.index.search_batch_on(&self.conn, queries, &opts)
     }
 }
 

@@ -183,6 +183,25 @@ fn filter_pass(
     Ok(out)
 }
 
+/// The knobs [`overlap_search`] reads, bundled so candidate generation takes a short argument
+/// list (the data — `conn`/`ns`/`present` — stays separate). All fields are batch-constant, so
+/// the caller builds this once and reuses it across a batch's queries.
+#[derive(Clone, Copy)]
+pub(crate) struct OverlapParams<'a> {
+    /// The candidate pool depth (`limit`, possibly [`Effort`](crate::Effort)-deepened).
+    pub limit: usize,
+    /// The raw (unweighted) overlap floor `m`.
+    pub min_shared: u32,
+    /// `D` — df-doublings per IDF weight step ([`weight_step`](crate::SearchOpts::weight_step)).
+    pub weight_step: f64,
+    /// The caller key's stored shape, for provenance hydration.
+    pub key_shape: KeyShape,
+    /// The compiled Tier-2 filter, applied scoped to candidate ids (`None` = unfiltered).
+    pub filter: Option<&'a CompiledFilter<'a>>,
+    /// The optional provenance scope predicate.
+    pub scope: Option<&'a crate::ScopeFn<'a>>,
+}
+
 /// Generate and rank candidates by IDF-weighted overlap, hydrating only as deep as the
 /// top-`limit` needs.
 ///
@@ -198,18 +217,20 @@ fn filter_pass(
 /// The `min_shared` floor stays a **raw** token count: since every weight ≥ 1, a candidate's
 /// weighted score is ≥ its raw overlap, so the walk can stop at weighted score `floor` and
 /// still need only a per-candidate raw-count check to drop high-weight/low-overlap ids.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn overlap_search(
     conn: &Connection,
     ns: &Namespace,
     present: &[(&str, &RoaringBitmap)],
-    limit: usize,
-    min_shared: u32,
-    weight_step: f64,
-    key_shape: KeyShape,
-    filter: Option<&CompiledFilter<'_>>,
-    scope: Option<&crate::ScopeFn<'_>>,
+    params: &OverlapParams<'_>,
 ) -> Result<Vec<Survivor>> {
+    let &OverlapParams {
+        limit,
+        min_shared,
+        weight_step,
+        key_shape,
+        filter,
+        scope,
+    } = params;
     let bitmaps: Vec<&RoaringBitmap> = present.iter().map(|(_, b)| *b).collect();
     if bitmaps.is_empty() || limit == 0 {
         return Ok(Vec::new());

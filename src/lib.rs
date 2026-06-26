@@ -58,6 +58,8 @@ mod dict;
 mod postings;
 mod schema;
 mod select;
+mod term;
+mod welford;
 
 use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -80,6 +82,7 @@ use schema::SCHEMA_VERSION;
 use select::{SelectParams, select};
 use store::{Backend, Namespace, Sidecar, TextResolver};
 use tokenize::{Tokenizer, TrigramTokenizer};
+use welford::ClassSnap;
 
 /// Default match floor `m` — shared rare tokens required for a hit.
 const DEFAULT_MIN_SHARED: u32 = 2;
@@ -511,11 +514,13 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let mut stage = self.dict.stage();
         let mut changes = TokenChanges::default();
         self.replace_group(&tx, ns, doc_id, source, segments, &mut changes, &mut stage)?;
-        changes.apply(&tx, ns)?;
+        let df_changes = changes.apply(&tx, ns)?;
         tx.commit()?;
         // Only after the transaction commits do the newly-interned grams enter the
-        // shared in-memory map (a rolled-back write leaves no orphan id).
+        // shared in-memory map (a rolled-back write leaves no orphan id); the class
+        // statistics then fold in the committed df changes.
         stage.commit();
+        self.dict.apply_df_changes(&df_changes);
         Ok(())
     }
 
@@ -550,9 +555,10 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 .collect();
             self.replace_group(&tx, ns, *doc_id, source, &pairs, &mut changes, &mut stage)?;
         }
-        changes.apply(&tx, ns)?;
+        let df_changes = changes.apply(&tx, ns)?;
         tx.commit()?;
         stage.commit();
+        self.dict.apply_df_changes(&df_changes);
         Ok(())
     }
 
@@ -578,8 +584,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         if self.is_contentless() {
             self.delete_fwd_for_doc(&tx, ns, doc_id)?;
         }
-        changes.apply(&tx, ns)?;
+        let df_changes = changes.apply(&tx, ns)?;
         tx.commit()?;
+        self.dict.apply_df_changes(&df_changes);
         Ok(())
     }
 
@@ -600,9 +607,10 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         // Replacing the group with no segments deletes it (no interning happens, so the
         // stage stays empty and its commit is a no-op).
         self.replace_group(&tx, ns, doc_id, source, &[], &mut changes, &mut stage)?;
-        changes.apply(&tx, ns)?;
+        let df_changes = changes.apply(&tx, ns)?;
         tx.commit()?;
         stage.commit();
+        self.dict.apply_df_changes(&df_changes);
         Ok(())
     }
 
@@ -798,7 +806,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         // shadow tables (O(chunk) memory for the text; postings are roaring-compact).
         // Term-ids are reassigned dense first-encounter into a rebuild-local map; the
         // inverted index is keyed by that id, and the dictionary is rewritten from it.
-        let mut local: HashMap<String, TermId> = HashMap::new();
+        // Keyed by the gram's packed u128 term encoding (the dictionary key), so the
+        // dictionary shadow rows write the 16-byte big-endian blob directly.
+        let mut local: HashMap<u128, TermId> = HashMap::new();
         let mut next_term: u64 = 1;
         let mut inverted: HashMap<TermId, RoaringBitmap> = HashMap::new();
         let mut next_id: i64 = 1;
@@ -829,7 +839,14 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 let tokens = self.distinct_tokens(&seg.text);
                 let mut ids: Vec<TermId> = Vec::with_capacity(tokens.len());
                 for tok in tokens {
-                    let tid = match local.get(&tok) {
+                    let key = term::encode_term(&tok)
+                        .ok_or_else(|| {
+                            Error::InvalidInput(format!(
+                                "gram {tok:?} exceeds the 3-codepoint term-encoding ceiling"
+                            ))
+                        })?
+                        .0;
+                    let tid = match local.get(&key) {
                         Some(&t) => t,
                         None => {
                             if next_term == 0 || next_term > u32::MAX as u64 {
@@ -837,7 +854,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                             }
                             let t = next_term as TermId;
                             next_term += 1;
-                            local.insert(tok, t);
+                            local.insert(key, t);
                             t
                         }
                     };
@@ -857,8 +874,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 "INSERT INTO {}(id, gram) VALUES(?1, ?2)",
                 ns.dict_shadow()
             ))?;
-            for (gram, id) in &local {
-                dict_ins.execute(rusqlite::params![*id as i64, &dict::gram_key(gram)])?;
+            for (key, id) in &local {
+                dict_ins.execute(rusqlite::params![*id as i64, key.to_be_bytes().as_slice()])?;
             }
         }
 
@@ -968,7 +985,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             .into_iter()
             .collect();
 
-        self.search_read(&all_grams, |conn, ns, resolved| {
+        self.search_read(&all_grams, |conn, ns, resolved, class_snap| {
             // One batched frequency read over every resolved term-id in the batch.
             let all_ids: Vec<TermId> = resolved
                 .values()
@@ -992,9 +1009,14 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             let selected_per: Vec<Vec<String>> = query_tokens
                 .iter()
                 .map(|q| {
-                    let pairs: Vec<(String, i64)> =
-                        q.iter().map(|t| (t.clone(), df_of(t))).collect();
-                    select(&pairs, sel_params)
+                    let triples: Vec<(String, i64, u8)> = q
+                        .iter()
+                        .map(|t| {
+                            let class = term::encode_term(t).map(|tm| tm.class()).unwrap_or(0);
+                            (t.clone(), df_of(t), class)
+                        })
+                        .collect();
+                    select(&triples, sel_params, class_snap)
                 })
                 .collect();
             let sel_ids: Vec<TermId> = selected_per
@@ -1184,7 +1206,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     fn search_read<R>(
         &self,
         all_grams: &[&str],
-        mut f: impl FnMut(&Connection, &Namespace, &HashMap<String, TermId>) -> Result<R>,
+        mut f: impl FnMut(&Connection, &Namespace, &HashMap<String, TermId>, &ClassSnap) -> Result<R>,
     ) -> Result<R> {
         let ns = self.backend.namespace();
         let mut attempt = 0;
@@ -1194,9 +1216,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 Ok(tx) => tx,
                 Err(e) => return Err(Error::from(e)),
             };
-            // Resolve the grams in memory + capture the generation atomically, then read
-            // the snapshot's generation to compare.
-            let (resolved, gen_mem) = self.dict.resolve_batch(all_grams);
+            // Resolve the grams in memory + capture the generation and per-class stats
+            // snapshot atomically, then read the snapshot's generation to compare.
+            let (resolved, gen_mem, class_snap) = self.dict.resolve_batch(all_grams);
             let gen_snap = match schema::dict_generation(&tx, ns) {
                 Ok(g) => g,
                 Err(e) => {
@@ -1226,7 +1248,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 std::thread::sleep(Duration::from_millis(10 * attempt as u64));
                 continue;
             }
-            match f(&tx, ns, &resolved) {
+            match f(&tx, ns, &resolved, &class_snap) {
                 Err(Error::Sqlite(e)) if attempt < RETRY_MAX && is_retryable(&e) => {
                     drop(tx);
                     drop(conn);
@@ -1260,7 +1282,9 @@ impl TokenChanges {
         }
     }
 
-    fn apply(&self, conn: &Connection, ns: &Namespace) -> Result<()> {
+    /// Apply the accumulated changes, returning the per-term `(id, old_df, new_df)` for
+    /// the caller to fold into the class statistics.
+    fn apply(&self, conn: &Connection, ns: &Namespace) -> Result<Vec<(TermId, i64, i64)>> {
         let writes: Vec<postings::TermWrite<'_>> = self
             .map
             .iter()

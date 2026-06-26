@@ -45,6 +45,9 @@ roaring = "0.11"
 # NFC/NFD normalization so canonically-equivalent forms match (configurable per
 # tokenizer; the default folds to NFC + lowercase).
 unicode-normalization = "0.1"
+# Unicode Script property: the script-segmented tokenizer splits text into maximal
+# same-script runs, and the term encoding derives a per-gram script tag from it.
+unicode-script = "0.5"
 thiserror = "2"
 tracing = { version = "0.1", optional = true }
 # SIMD substring search for the default ranker's literal-verification tier: a

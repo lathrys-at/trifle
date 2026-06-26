@@ -17,6 +17,7 @@ use std::borrow::Borrow;
 
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
+use unicode_script::{Script, UnicodeScript};
 
 /// Turns text into tokens, for both indexing and querying.
 ///
@@ -308,36 +309,51 @@ impl<const N: usize, const CAP: usize> NgramTokenizer<N, CAP> {
     /// Normalize and (if enabled) case-fold `text` into the code points the window
     /// slides over. One allocation per text, not per window.
     fn prepare(&self, text: &str) -> Vec<char> {
-        // Normalize. `assume_normalized` trusts the caller and skips the transform;
-        // otherwise apply the chosen form (the quick-check inside `nfc`/`nfd` makes
-        // already-normal text near-free).
-        let normalized: Vec<char> = if self.assume_normalized {
-            match self.normalization {
-                // Stripping marks is not a normalized form the input could already
-                // be in, so honor it even under `assume_normalized`.
-                Normalization::NfdStripMarks => {
-                    text.chars().filter(|c| !is_combining_mark(*c)).collect()
-                }
-                _ => text.chars().collect(),
+        prepare_chars(
+            text,
+            self.normalization,
+            self.casefold,
+            self.assume_normalized,
+        )
+    }
+}
+
+/// Normalize and (if enabled) case-fold `text` into the code points a window slides
+/// over — the shared front of both built-in tokenizers. `assume_normalized` trusts the
+/// caller and skips the transform; otherwise apply the chosen form (the quick-check
+/// inside `nfc`/`nfd` makes already-normal text near-free).
+fn prepare_chars(
+    text: &str,
+    normalization: Normalization,
+    casefold: bool,
+    assume_normalized: bool,
+) -> Vec<char> {
+    let normalized: Vec<char> = if assume_normalized {
+        match normalization {
+            // Stripping marks is not a normalized form the input could already be in, so
+            // honor it even under `assume_normalized`.
+            Normalization::NfdStripMarks => {
+                text.chars().filter(|c| !is_combining_mark(*c)).collect()
             }
-        } else {
-            match self.normalization {
-                Normalization::Nfc => text.nfc().collect(),
-                Normalization::Nfd => text.nfd().collect(),
-                Normalization::NfdStripMarks => {
-                    text.nfd().filter(|c| !is_combining_mark(*c)).collect()
-                }
-                Normalization::None => text.chars().collect(),
-            }
-        };
-        if self.casefold {
-            normalized
-                .into_iter()
-                .flat_map(|c| c.to_lowercase())
-                .collect()
-        } else {
-            normalized
+            _ => text.chars().collect(),
         }
+    } else {
+        match normalization {
+            Normalization::Nfc => text.nfc().collect(),
+            Normalization::Nfd => text.nfd().collect(),
+            Normalization::NfdStripMarks => {
+                text.nfd().filter(|c| !is_combining_mark(*c)).collect()
+            }
+            Normalization::None => text.chars().collect(),
+        }
+    };
+    if casefold {
+        normalized
+            .into_iter()
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    } else {
+        normalized
     }
 }
 
@@ -546,6 +562,178 @@ impl<const N: usize, const CAP: usize> NgramTokenizerBuilder<N, CAP> {
 
     /// Finish building the tokenizer.
     pub fn build(self) -> NgramTokenizer<N, CAP> {
+        self.inner
+    }
+}
+
+/// A script-segmented n-gram tokenizer (§6): it splits text into maximal same-script
+/// runs and tokenizes each run with a script-appropriate window size, so a mixed-script
+/// document indexes correctly without manufacturing cross-script grams at the seams.
+///
+/// `Common`/`Inherited` codepoints (digits, punctuation, combining marks) are
+/// transparent — they extend the current run rather than breaking it. The default
+/// [`WindowPolicy`] uses bigrams for the dense CJK scripts (Han / Hiragana / Katakana /
+/// Hangul) and trigrams elsewhere. Its [`Token`](Tokenizer::Token) is a [`Trigram`]
+/// (which also holds bigrams). Grams are capped at 3 codepoints (the term-encoding
+/// storage ceiling). [`span`](Tokenizer::span) currently returns `None`; the
+/// default-trigram tokenizer keeps its span support.
+///
+/// ```
+/// use trifle::tokenize::{ScriptTokenizer, Tokenizer};
+///
+/// let tok = ScriptTokenizer::new();
+/// // "ab漢字" → Latin trigram-window run "ab" (too short, no gram) + Han bigram "漢字".
+/// let grams: Vec<String> = tok.tokenize("ab漢字").map(|g| g.to_string()).collect();
+/// assert_eq!(grams, ["漢字"]);
+/// ```
+#[derive(Clone, Debug)]
+pub struct ScriptTokenizer {
+    normalization: Normalization,
+    casefold: bool,
+    assume_normalized: bool,
+    policy: WindowPolicy,
+}
+
+/// Per-script-class window sizes for [`ScriptTokenizer`], indexed by the script-tag byte.
+/// The default is trigrams everywhere except the dense CJK scripts, which take bigrams.
+#[derive(Clone, Debug)]
+pub struct WindowPolicy {
+    sizes: [u8; 256],
+}
+
+impl Default for WindowPolicy {
+    fn default() -> Self {
+        let mut sizes = [3u8; 256];
+        for tag in [
+            crate::term::TAG_HAN,
+            crate::term::TAG_HIRAGANA,
+            crate::term::TAG_KATAKANA,
+            crate::term::TAG_HANGUL,
+        ] {
+            sizes[tag as usize] = 2;
+        }
+        WindowPolicy { sizes }
+    }
+}
+
+impl Default for ScriptTokenizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScriptTokenizer {
+    /// A script tokenizer with the default behavior: NFC + Unicode lowercasing and the
+    /// default (CJK-bigram, else-trigram) window policy.
+    pub fn new() -> Self {
+        ScriptTokenizer {
+            normalization: Normalization::Nfc,
+            casefold: true,
+            assume_normalized: false,
+            policy: WindowPolicy::default(),
+        }
+    }
+
+    /// Start a [builder](ScriptTokenizerBuilder) to customize normalization/casefolding.
+    pub fn builder() -> ScriptTokenizerBuilder {
+        ScriptTokenizerBuilder { inner: Self::new() }
+    }
+
+    /// Emit the windows of one same-script run into `out`. The window size is the run's
+    /// script-class policy; a `Common`-only run uses the common-class size.
+    fn emit_run(&self, out: &mut Vec<Trigram>, run: &[char], run_script: Option<Script>) {
+        let tag = match run_script {
+            Some(s) => crate::term::script_tag(s),
+            None => crate::term::TAG_COMMON,
+        };
+        let n = self.policy.sizes[tag as usize] as usize;
+        if n == 0 || run.len() < n {
+            return;
+        }
+        for w in run.windows(n) {
+            if let Some(g) = Trigram::from_chars(w) {
+                out.push(g);
+            }
+        }
+    }
+}
+
+impl Tokenizer for ScriptTokenizer {
+    type Token = Trigram;
+
+    fn tokenize<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Self::Token> + 'a {
+        let chars = prepare_chars(
+            text,
+            self.normalization,
+            self.casefold,
+            self.assume_normalized,
+        );
+        let mut out: Vec<Trigram> = Vec::new();
+        // Walk the chars, breaking a run only at a change of *strong* script;
+        // Common/Inherited codepoints are transparent and stay in the current run.
+        let mut start = 0usize;
+        let mut run_script: Option<Script> = None;
+        for (i, &c) in chars.iter().enumerate() {
+            match c.script() {
+                Script::Common | Script::Inherited => {}
+                s => match run_script {
+                    None => run_script = Some(s),
+                    Some(cur) if cur == s => {}
+                    Some(_) => {
+                        self.emit_run(&mut out, &chars[start..i], run_script);
+                        start = i;
+                        run_script = Some(s);
+                    }
+                },
+            }
+        }
+        self.emit_run(&mut out, &chars[start..], run_script);
+        out.into_iter()
+    }
+
+    fn fingerprint(&self) -> u64 {
+        // FNV-1a over a canonical encoding of the behavior: a tag, normalization,
+        // casefold, assume_normalized, the window policy, and a layout-version byte — so a
+        // change to segmentation/window sizing forces a rebuild.
+        let mut bytes = Vec::with_capacity(3 + 3 + 256 + 1);
+        bytes.extend_from_slice(b"scr");
+        bytes.push(self.normalization.code());
+        bytes.push(self.casefold as u8);
+        bytes.push(self.assume_normalized as u8);
+        bytes.extend_from_slice(&self.policy.sizes);
+        bytes.push(1); // encoding/layout version
+        fnv1a_64(&bytes)
+    }
+}
+
+/// Builder for [`ScriptTokenizer`].
+#[derive(Clone, Debug)]
+pub struct ScriptTokenizerBuilder {
+    inner: ScriptTokenizer,
+}
+
+impl ScriptTokenizerBuilder {
+    /// Set the normalization form (default [`Normalization::Nfc`]).
+    pub fn normalization(mut self, normalization: Normalization) -> Self {
+        self.inner.normalization = normalization;
+        self
+    }
+
+    /// Enable or disable Unicode lowercasing (default `true`).
+    pub fn casefold(mut self, casefold: bool) -> Self {
+        self.inner.casefold = casefold;
+        self
+    }
+
+    /// Trust that input is already in the chosen normalization form (default `false`).
+    /// Sound only if the guarantee holds for *both* writes and queries.
+    pub fn assume_normalized(mut self, assume_normalized: bool) -> Self {
+        self.inner.assume_normalized = assume_normalized;
+        self
+    }
+
+    /// Finish building the tokenizer.
+    pub fn build(self) -> ScriptTokenizer {
         self.inner
     }
 }
@@ -835,5 +1023,42 @@ mod tests {
             rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(t)) => assert_eq!(t, b"xyz"),
             other => panic!("unexpected ToSql output: {other:?}"),
         }
+    }
+
+    #[test]
+    fn script_tokenizer_segments_by_script_with_no_cross_script_grams() {
+        let tok = ScriptTokenizer::new();
+        let g = grams(&tok, "hello漢字");
+        // Latin run -> trigrams; Han run -> one bigram.
+        assert!(g.contains(&"hel".to_string()));
+        assert!(g.contains(&"llo".to_string()));
+        assert!(g.contains(&"漢字".to_string()));
+        // No gram straddles the script boundary.
+        assert!(g.iter().all(|t| !t.contains('漢') || t == "漢字"));
+    }
+
+    #[test]
+    fn script_tokenizer_common_codepoints_are_transparent() {
+        let tok = ScriptTokenizer::new();
+        // A digit is Common: it stays in the Latin run rather than splitting it.
+        assert_eq!(grams(&tok, "a1b"), ["a1b"]);
+    }
+
+    #[test]
+    fn script_tokenizer_uses_bigrams_for_cjk() {
+        let tok = ScriptTokenizer::new();
+        assert_eq!(grams(&tok, "漢字漢"), ["漢字", "字漢"]);
+    }
+
+    #[test]
+    fn script_tokenizer_fingerprint_differs_from_ngram_and_is_stable() {
+        assert_eq!(
+            ScriptTokenizer::new().fingerprint(),
+            ScriptTokenizer::new().fingerprint()
+        );
+        assert_ne!(
+            ScriptTokenizer::new().fingerprint(),
+            TrigramTokenizer::new().fingerprint()
+        );
     }
 }

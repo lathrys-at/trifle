@@ -121,9 +121,17 @@ pub(crate) struct TermWrite<'a> {
 /// frequencies, in the caller's transaction. `O(touched tokens)`; never touches a
 /// base posting. Each `writes` entry must name a distinct term-id and honor the
 /// [`TermWrite`] monotonic-id contract.
-pub(crate) fn apply_writes(conn: &Connection, ns: &Namespace, writes: &[TermWrite]) -> Result<()> {
+///
+/// Returns the `(term-id, old_df, new_df)` of every touched term, so the caller can
+/// maintain the per-class document-frequency statistics (the live df is the single
+/// source of truth those accumulators derive from).
+pub(crate) fn apply_writes(
+    conn: &Connection,
+    ns: &Namespace,
+    writes: &[TermWrite],
+) -> Result<Vec<(TermId, i64, i64)>> {
     if writes.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // Batch-load the existing deltas for every touched term-id.
     let arr = id_array(writes.iter().map(|w| w.id));
@@ -143,6 +151,10 @@ pub(crate) fn apply_writes(conn: &Connection, ns: &Namespace, writes: &[TermWrit
             deltas.insert(id, (deserialize(&added)?, deserialize(&removed)?));
         }
     }
+    // Old df per touched term-id (the value the class stats move *from*).
+    let touched: Vec<TermId> = writes.iter().map(|w| w.id).collect();
+    let old_dfs = read_dfs(conn, ns, &touched)?;
+    let mut changes: Vec<(TermId, i64, i64)> = Vec::with_capacity(writes.len());
 
     let upsert_sql = format!(
         "INSERT INTO {0}(id, added, removed) VALUES(?1, ?2, ?3)
@@ -184,6 +196,8 @@ pub(crate) fn apply_writes(conn: &Connection, ns: &Namespace, writes: &[TermWrit
             removed.remove(id);
         }
         let df_delta = w.add.len() as i64 - w.remove.len() as i64;
+        let old_df = old_dfs.get(&w.id).copied().unwrap_or(0);
+        changes.push((w.id, old_df, old_df + df_delta));
         if df_delta != 0 {
             df.execute(rusqlite::params![id_param, df_delta])?;
         }
@@ -197,7 +211,7 @@ pub(crate) fn apply_writes(conn: &Connection, ns: &Namespace, writes: &[TermWrit
             ])?;
         }
     }
-    Ok(())
+    Ok(changes)
 }
 
 /// What a [`fold`] reclaimed.

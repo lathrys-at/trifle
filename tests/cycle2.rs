@@ -75,6 +75,59 @@ fn remove_segment_to_empty_reaps_the_doc_row_and_payload() {
     ));
 }
 
+/// Set up a doc with a deck=3 payload, then empty it via `remove_segment`; assert that a
+/// `reinsert` declaring no deck does not inherit the old payload.
+fn assert_reinsert_is_clean(reinsert: impl Fn(&Harness)) {
+    let h = Harness::with_schema(schema_with_deck(), Config::default());
+    {
+        let mut w = h.index.writer().unwrap();
+        w.insert_document(
+            Document::new(5, vec![("body".into(), "alpha bravo charlie".into())])
+                .with_payload(vec![("deck".into(), Value::Integer(3))]),
+        )
+        .unwrap();
+        w.commit().unwrap();
+    }
+    h.remove_segment(5, "body");
+    reinsert(&h);
+    let filtered = h
+        .search(
+            "delta echo",
+            SearchOpts::new(10).filter(&Filter::eq("deck", 3i64)),
+        )
+        .unwrap();
+    assert!(!hit(&filtered, 5), "stale deck=3 leaked on reinsert");
+    assert!(hit(
+        &h.search("delta echo", SearchOpts::new(10)).unwrap(),
+        5
+    ));
+}
+
+#[test]
+fn no_reinsert_api_inherits_a_reaped_docs_payload() {
+    // C2-RA-1 leaked via insert, upsert, AND insert_document(no payload); the reap fix closes
+    // all three, since no orphan doc row survives for any of them to reuse.
+    assert_reinsert_is_clean(|h| {
+        let mut w = h.index.writer().unwrap();
+        w.insert(5, &[("body", "delta echo foxtrot")]).unwrap();
+        w.commit().unwrap();
+    });
+    assert_reinsert_is_clean(|h| {
+        let mut w = h.index.writer().unwrap();
+        w.upsert(5, &[("body", "delta echo foxtrot")]).unwrap();
+        w.commit().unwrap();
+    });
+    assert_reinsert_is_clean(|h| {
+        let mut w = h.index.writer().unwrap();
+        w.insert_document(Document::new(
+            5,
+            vec![("body".into(), "delta echo foxtrot".into())],
+        ))
+        .unwrap();
+        w.commit().unwrap();
+    });
+}
+
 #[test]
 fn remove_segment_to_empty_matches_whole_remove() {
     // remove_segment of the last segment and remove(key) must leave the same residue.

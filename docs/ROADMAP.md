@@ -5,10 +5,37 @@ the task backlog — each item is unblocked and implementable today, with a conc
 the files it touches, and a done-when. Part 2 is the full recipe for running an adversarial
 review cycle (the process that produced this list).
 
-Line numbers are **as of commit `0ed449d`** and will drift — grep the named function if they
+Line numbers are **as of commit `f97a774`** and will drift — grep the named function if they
 don't match. The design rationale for anything below lives in the module `//!` docs and in the
 design spec at `~/Desktop/trifle-design-addendum.md` (+ `trifle-filter-grammar-notes.md`);
 section numbers like “§7.5” refer to the addendum.
+
+## What changed since this doc was first written
+
+A few things landed after the initial backlog, so read the tasks with this context:
+
+- **Ranking is now IDF-weighted lexical overlap, not BM25.** The BM25+ reranker (`Bm25Ranker`)
+  and the `rank::idf` helper are **gone**; trifle ranks by rarity-weighted token overlap
+  computed in the bit-sliced counter itself (per-query, df-anchored 4-tier `{1,2,3,4}`; knob
+  `SearchOpts::weight_step` `D`, default `1.0`). The default `Ranker` is `OverlapRanker`
+  (preserves that order); a custom `Ranker` is the only way to rerank, over an `Effort`
+  over-fetch pool whose **default is now `Effort::None`** (the weighted order is exact at
+  `pool = limit`). `seg.len`/`seg_len_sum`/`avgdl` are still stored but are now *extension
+  signals* (for a custom ranker), unused by the default ranking. New telemetry:
+  `Stats::weight_step_hint` suggests a corpus-fitted `D` (median band-spread / 3, with an IQR
+  confidence signal) from an in-memory per-query band-spread histogram. This redesign is the
+  origin of the new tasks **T13–T15** below.
+- **The three deferred `Writer` minors are done** (was a "minors" note): the dead
+  `Writer::dirty` field is removed; `commit()` now distinguishes a lost batch (retry) from a
+  durable-but-stranded writer via the new **`Error::WriterStranded`** (which the `atomic()`
+  poison path also returns instead of `Corrupt`); and `atomic()` escalates a faulted savepoint
+  rollback to a full `ROLLBACK` + poison. So `Error` now has **four** caller-facing classes,
+  not three.
+- **The big deferred items remain open** (I10/I12/I-N1/I22 → T1/T2/T5/T7, plus C2-FB-C2 → T6).
+  Line numbers below are refreshed to `f97a774`.
+- **Not yet adversarially reviewed:** the ranking redesign (the weighted counter, the
+  band-spread hint, the `Effort`-default change) is tested and green but has **not** been
+  through a review cycle. Point reviewers there first next cycle.
 
 ---
 
@@ -24,7 +51,7 @@ its named test exists.
 - **Why.** `rebuild()` writes each document's `doc` row, then issues a *separate* `UPDATE` per
   document that has payload. For a payload-bearing corpus that doubles the per-doc write count
   and re-compiles SQL per row — O(docs) extra writes on the heaviest path.
-- **Where.** `src/lib.rs` `rebuild()` ~`:910` (`doc_ins.execute(...)`) then `:912`
+- **Where.** `src/lib.rs` `rebuild()` ~`:980` (`doc_ins.execute(...)`) then `:982`
   (`self.set_doc_fields(&tx, ns.doc_shadow(), ...)`); the shadow `doc` column list is built in
   `src/schema.rs` (`doc_filt_cols`).
 - **Approach.** Build the shadow `doc` INSERT with the filterable columns already in its column
@@ -42,7 +69,7 @@ its named test exists.
   term key and stringifies again for the map key. The write path already interns straight from
   `token.term()`; the read path abandons that win. Per-query constant (bounded by query length,
   not corpus size), so it’s a cleanliness/latency win, not a scaling fix.
-- **Where.** `src/lib.rs` `distinct_tokens` `:833`; `src/dict.rs` `resolve_batch` `:138`,
+- **Where.** `src/lib.rs` `distinct_tokens` `:903`; `src/dict.rs` `resolve_batch` `:138`,
   `resolve_key` `:125`.
 - **Approach.** Thread `Term`/`TermId` through selection instead of `String`. Resolve each
   distinct query token to `(TermId, class)` **once** via `token.term()`, keep the term-keyed
@@ -59,7 +86,7 @@ its named test exists.
   no search can ever return (search needs segments) — an invisible “ghost”. Not a correctness
   leak (the C2-RA-1 fix reaps *delete*-orphaned rows; this is the *create* path), but a
   footgun: a typo'd key silently accretes rows.
-- **Where.** `src/lib.rs` `set_fields` `:1612` → `doc_id_for(..., create=true)` `:533`.
+- **Where.** `src/lib.rs` `set_fields` `:1715` → `doc_id_for(..., create=true)` `:602`.
 - **Approach.** Pick one and document it: **(a)** make `set_fields` require an existing
   document (`create=false`; return `Error::InvalidInput` if the key has no segments) — the
   stricter, less surprising option; or **(b)** keep create-on-set but document the payload-only
@@ -88,7 +115,7 @@ its named test exists.
   materializes a `RoaringBitmap` of **every** matching `doc` id on **every** search — an O(N)
   row scan + bitmap build, even though only the small candidate pool is ever consulted. It is
   the only O(N)-per-search path left, and it fires precisely when the filter is non-selective.
-- **Where.** `src/lib.rs` `filter_docs` `:814`, called once per batch at `:1155`; the keep-set
+- **Where.** `src/lib.rs` `filter_docs` `:884`, called once per batch at `:1255`; the keep-set
   is consulted in `src/rank.rs` `overlap_search` (`filter_docs.contains(*doc)`).
 - **Approach.** Don't materialize the whole matching universe. After candidate generation,
   intersect against the filter scoped to the candidate ids:
@@ -110,8 +137,8 @@ its named test exists.
   concurrent searches spuriously fail with `Error::Busy` on every rebuild. (Could not be
   triggered ≤ 8k docs / ~50k grams; bites only at the top of the documented multilingual
   scale.) Distinct from the now-fixed permanent-skew case (C2-FB-C1 poison).
-- **Where.** `src/lib.rs` retry loop `search_read` `:1311`, `RETRY_MAX` `:124`, skew message
-  `:1365`; `src/dict.rs` `load` scan.
+- **Where.** `src/lib.rs` retry loop `search_read` `:1414`, `RETRY_MAX` `:131`, skew message
+  `:1468`; `src/dict.rs` `load` scan.
 - **Approach.** Replace the fixed retry count with coordination. Options, cheapest first:
   **(a)** bound retries by elapsed time with backoff rather than a fixed count, so a slow
   reload still settles; **(b)** have the reader briefly wait on a reload-in-progress signal
@@ -129,17 +156,19 @@ its named test exists.
 ### Architecture
 
 #### T7 — Extract the search pipeline; give the leases real bodies (was I22)
-- **Why.** `src/lib.rs` is ~1.9k lines and the read/write logic lives as inherent `Index`
+- **Why.** `src/lib.rs` is ~2.0k lines and the read/write logic lives as inherent `Index`
   methods while `Writer`/`Reader`/`SearchSession` are thin shells — the lease types don't own
   the work the §8 model says they should, and the search pipeline is hand-wired across several
-  `#[allow(clippy::too_many_arguments)]` functions.
-- **Where.** `src/lib.rs` `run_search` `:1075`, `rank_to_matches` `:1196`, `hydrate_text`
-  `:1236`, `search_read`/`search_read_on` `:1311`/`:1324`; the four `too_many_arguments`
-  allows.
+  `#[allow(clippy::too_many_arguments)]` functions. (The ranking redesign added more to
+  `run_search`: it now also threads `weight_step` and updates the band-spread histogram.)
+- **Where.** `src/lib.rs` `run_search` `:1179`, `rank_to_matches` `:1299`, `hydrate_text`
+  `:1339`, `search_read`/`search_read_on` `:1414`/`:1427`; the `#[allow(clippy::too_many_arguments)]`
+  sites in `src/lib.rs` plus `overlap_search` in `src/rank.rs`.
 - **Approach (incremental, keep each step green).** (1) Introduce a `SearchCtx` struct that
   bundles the args currently threaded through the `too_many_arguments` functions (conn, ns,
-  schema, opts, dict snapshot), removing the allows. (2) Move `run_search`/`rank_to_matches`/
-  `hydrate_text`/`search_read*` into a new `src/search.rs` module operating on `SearchCtx`.
+  schema, opts incl. `weight_step`, dict snapshot), removing the allows. (2) Move
+  `run_search`/`rank_to_matches`/`hydrate_text`/`search_read*` into a new `src/search.rs`
+  module operating on `SearchCtx`.
   (3) Have `Reader`/`SearchSession` call into `search.rs` (collapsing the verbatim glue between
   `Reader::search` and `SearchSession::search`). Optionally (4) move the write helpers onto
   `Writer`. Do **not** change behavior — this is a pure refactor; the test suite is the
@@ -149,6 +178,53 @@ its named test exists.
   `too_many_arguments` allows **removed**.
 - **Done-when.** `lib.rs` is the lifecycle + types; the pipeline lives in `search.rs`; no
   `too_many_arguments` allows; gate green.
+
+### Ranking follow-ups (from the IDF-weighting redesign)
+
+#### T13 — Benchmark whether the IDF weighting earns its keep
+- **Why.** The weighting adds ~2 bit-planes and widens the bucket range to `0..4k` (sparser,
+  more buckets — the sparse-result case walks more empty buckets). The design's own test is:
+  measure **buckets walked to a stable top-k, weighted vs unweighted** — “if it doesn't move,
+  the weighting isn't earning its 2 planes.” This was deferred past the build (the user asked
+  to ship it first), so it's now a *measure-after* task.
+- **Where.** `benchmarks/` (`latency`, `profile`, `relevance`); the bucket walk in
+  `src/rank.rs` `overlap_search`. Unweighting for the A/B is free: `SearchOpts::weight_step`
+  with a huge `D` collapses every gram to tier 1.
+- **Approach.** Add benchmark cases that report, weighted vs unweighted: (1) buckets cracked to
+  a stable top-k; (2) p99 latency delta (the ≤2 ripples + extra planes); (3) recall@k vs the
+  BM25 baseline on MS MARCO (the `relevance` eval now compares *weighted overlap* to BM25, a
+  different question than before). Also plot `log2(df_max/df_i)` across real queries (the spec's
+  "measure the band-spread distribution"). If recall/precision doesn't move, reconsider the
+  default.
+- **Done-when.** A benchmark quantifies the weighting's recall benefit and its latency/plane
+  cost, and the no-payoff case is visible in the numbers.
+
+#### T14 — Autotune `D` from the band-spread hint
+- **Why.** `Stats::weight_step_hint` *suggests* a `D` (median band-spread / 3, with an IQR
+  confidence signal), but the caller must read it and feed it back via `SearchOpts::weight_step`
+  manually. Closing that loop — and sharpening the estimate — is the natural next step (the user
+  flagged "autotuning D is a different task").
+- **Where.** `src/lib.rs` `weight_step_hint()` (the histogram + nearest-rank quantile) and
+  `SearchOpts::weight_step`; the histogram is `Index::band_spread_hist`.
+- **Approach.** (a) Optionally let the index apply the suggested `D` when the caller doesn't set
+  one (a config flag), guarded by a warmup-sample minimum and by the IQR (if the spread of
+  spreads is wide/bimodal, *don't* auto-apply a single `D` — the corpus has multiple query
+  regimes; surface that instead). (b) Sharpen the estimate beyond the current 0.5-doubling
+  bucket midpoints — finer buckets or a streaming-quantile sketch (P² / t-digest). Note the
+  histogram is process-local and warms from zero on reopen.
+- **Done-when.** A caller can opt into a corpus-fitted `D` without manually plumbing `stats()`
+  back into `SearchOpts`, and the multi-regime case is handled honestly (no false single-`D`).
+
+#### T15 — Reset the band-spread histogram on rebuild / drift reset
+- **Why.** The weight-step hint accumulates over the index's whole lifetime, but `rebuild()` and
+  a `data_version`/schema drift reset can change the df distribution substantially — pre-change
+  band-spread samples then bias the suggested `D`.
+- **Where.** `src/lib.rs` `rebuild()` (after the swap) and the drift-reset path in `init()`;
+  `Index::band_spread_hist`.
+- **Approach.** Zero the 13 histogram atomics on a successful `rebuild` and on a drift reset, so
+  the hint reflects only the current corpus. Cheap (13 stores). `compact()` must **not** reset
+  it (a fold doesn't change df). Tiny test: hint is `None` again immediately after a rebuild.
+- **Done-when.** After `rebuild`/reset, `weight_step_hint` reflects only post-change searches.
 
 ### Larger features (design exists in the addendum)
 
@@ -210,7 +286,12 @@ repeat until **quiescent** (a cycle that finds no new correctness work).
    scope is candidates-only + early-stop-bounded; monotonic-id no-false-positive; rebuild is
    atomic + reclaims ids + result-stable; drift drops-not-migrates; compact clears-backlog +
    result-invariant; span ⇒ text + char-boundary; the dictionary generation guard (H1 benign /
-   H2 retryable); seg-stats counters reconcile with the `seg` table.
+   H2 retryable); seg-stats counters reconcile with the `seg` table. **Ranking** is now
+   IDF-weighted lexical overlap (no BM25): weights are a per-query df-anchored 4-tier `{1,2,3,4}`
+   computed from the survivors' df; the weighted score is the ordering key while the `min_shared`
+   floor stays a *raw* token count (weighted ≥ raw); the BSI `add_weighted` must equal repeated
+   unweighted adds; and `batch == serial` must still hold under weighting (weights derive only
+   from the query's own survivor df's).
 4. **Keep a board.** A scratch findings board (the repo gitignores `.audit-scratch/`) with one
    row per agent and one per finding (surface, severity, status: candidate/validated/killed,
    repro). The board *is* the handoff if the session is interrupted.

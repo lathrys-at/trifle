@@ -505,6 +505,11 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             // bump the generation so any concurrent reader detects the change.
             schema::bump_dict_generation(&tx, ns)?;
             schema::write_stamps(&tx, ns, self.data_version, fingerprint, schema_fp)?;
+            // A reset empties the corpus, so any band-spread samples no longer describe it
+            // (audit T15). `init` runs only at `open` on a freshly-zeroed histogram, so this is
+            // currently a no-op — but keeping the clear local to the reset path stops the
+            // invariant from silently depending on construction order.
+            self.reset_band_spread_hist();
         }
         tx.commit()?;
         Ok(())
@@ -541,6 +546,17 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let spread = (hi as f64 / lo.max(1) as f64).log2();
         let bucket = ((spread / HINT_BUCKET_WIDTH) as usize).min(HINT_BUCKETS - 1);
         self.band_spread_hist[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Zero the in-memory band-spread histogram. Called on a successful [`rebuild`](Self::rebuild)
+    /// and on a drift/desync reset: both can shift the corpus df distribution, so pre-change
+    /// samples would bias the [`weight_step_hint`](Self::weight_step_hint) (audit T15). A
+    /// [`compact`](Self::compact) deliberately does **not** call this — a fold leaves every df
+    /// unchanged, so its samples stay valid.
+    fn reset_band_spread_hist(&self) {
+        for b in &self.band_spread_hist {
+            b.store(0, Ordering::Relaxed);
+        }
     }
 
     /// A cheap consistency probe: the monotonic-id invariant `max(seg.id) < next_id`.
@@ -1095,6 +1111,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         // A successful rebuild rebuilds the dictionary from scratch, so it also clears any
         // poison a previous failed reload left behind — `rebuild` is a recovery path.
         self.poisoned.store(false, Ordering::Release);
+        // The rebuilt corpus can have a wholly different df distribution; drop the accumulated
+        // band-spread samples so the weight-step hint reflects only the new corpus (audit T15).
+        self.reset_band_spread_hist();
         Ok(())
     }
 

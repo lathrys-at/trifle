@@ -377,3 +377,38 @@ fn stats_suggests_a_weight_step_from_observed_band_spreads() {
         "median lies within the IQR"
     );
 }
+
+// T15: a rebuild can change the df distribution, so it must drop the accumulated band-spread
+// samples — the hint then reflects only the new corpus. A `compact` (a df-preserving fold)
+// must NOT discard them.
+#[test]
+fn rebuild_resets_the_weight_step_hint() {
+    let h = Harness::new();
+    for doc in 1..=20 {
+        h.put(doc, "field", "f", "commonword");
+    }
+    h.put(50, "field", "f", "rarezzq");
+    for _ in 0..5 {
+        let _ = h.search("rarezzq commonword", SearchOpts::new(5)).unwrap();
+    }
+    assert!(
+        h.index.stats().unwrap().weight_step_hint.is_some(),
+        "the searches built a hint"
+    );
+
+    // A compact folds deltas into bases but leaves every df unchanged → samples stay valid.
+    h.index.compact().unwrap();
+    assert!(
+        h.index.stats().unwrap().weight_step_hint.is_some(),
+        "compact must NOT discard band-spread samples"
+    );
+
+    // A rebuild reassigns the corpus and can shift the df distribution → samples are dropped.
+    h.index
+        .rebuild((1..=20).map(|d| Document::new(d, vec![("f".into(), "commonword".into())])))
+        .unwrap();
+    assert!(
+        h.index.stats().unwrap().weight_step_hint.is_none(),
+        "rebuild zeroes the band-spread histogram; no post-rebuild searches yet"
+    );
+}

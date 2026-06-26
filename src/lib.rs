@@ -588,11 +588,35 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
+    /// Tokenize `text`, dedupe to its distinct grams, and resolve each to a term-id via
+    /// `assign` — the single lowering shared by the incremental write path
+    /// ([`write_segment`](Self::write_segment), `assign` = stage intern) and
+    /// [`rebuild`](Self::rebuild) (`assign` = a dense local allocator). Owning the
+    /// tokenize + 3-codepoint ceiling check in one place keeps the two paths from drifting
+    /// (audit I4).
+    fn distinct_term_ids(
+        &self,
+        text: &str,
+        mut assign: impl FnMut(Term) -> Result<TermId>,
+    ) -> Result<Vec<TermId>> {
+        let distinct: HashSet<T::Token> = self.tokenizer.tokenize(text).collect();
+        let mut ids: Vec<TermId> = Vec::with_capacity(distinct.len());
+        for tok in &distinct {
+            let term = tok.term().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "gram {:?} exceeds the 3-codepoint term-encoding ceiling",
+                    tok.borrow()
+                ))
+            })?;
+            ids.push(assign(term)?);
+        }
+        Ok(ids)
+    }
+
     /// Write one segment `(doc, label) = text`, interning its grams through `stage` and
-    /// storing the term-id set in `fwd` (so delete needs no text). `seg.txt` is stored
-    /// only for a `Stored` field. If a segment with this label already exists: with
-    /// `replace`, it is dropped first (its removals accumulated into `changes`); without
-    /// `replace`, this errors.
+    /// storing the term-id set in `fwd` (so delete needs no text). If a segment with this
+    /// label already exists: with `replace`, it is dropped first (its removals accumulated
+    /// into `changes`); without `replace`, this errors.
     #[allow(clippy::too_many_arguments)]
     fn write_segment(
         &self,
@@ -628,17 +652,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         )?;
         // Intern straight from the tokens (`token.term()`), not via stringified grams — the
         // blanket `IntoTerm` packs each token with no per-token `String` allocation.
-        let distinct: HashSet<T::Token> = self.tokenizer.tokenize(text).collect();
-        let mut ids: Vec<TermId> = Vec::with_capacity(distinct.len());
-        for tok in &distinct {
-            let term = tok.term().ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "gram {:?} exceeds the 3-codepoint term-encoding ceiling",
-                    tok.borrow()
-                ))
-            })?;
-            ids.push(stage.intern_term(term, conn, ns)?);
-        }
+        let ids = self.distinct_term_ids(text, |term| stage.intern_term(term, conn, ns))?;
         let bm: RoaringBitmap = ids.iter().copied().collect();
         conn.execute(
             &format!("INSERT INTO {}(id, tokens) VALUES(?1, ?2)", ns.fwd()),
@@ -844,31 +858,22 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                     let seg_id = next_seg;
                     next_seg += 1;
                     seg_ins.execute(rusqlite::params![seg_id, doc_id, label, text.as_str()])?;
-                    let distinct: HashSet<T::Token> = self.tokenizer.tokenize(text).collect();
-                    let mut ids: Vec<TermId> = Vec::with_capacity(distinct.len());
-                    for tok in &distinct {
-                        let gkey = tok
-                            .term()
-                            .ok_or_else(|| {
-                                Error::InvalidInput(format!(
-                                    "gram {:?} exceeds the 3-codepoint term-encoding ceiling",
-                                    tok.borrow()
-                                ))
-                            })?
-                            .0;
-                        let tid = match local.get(&gkey) {
-                            Some(&t) => t,
-                            None => {
-                                if next_term == 0 || next_term > u32::MAX as u64 {
-                                    return Err(Error::corrupt("term id space exhausted"));
-                                }
-                                let t = next_term as TermId;
-                                next_term += 1;
-                                local.insert(gkey, t);
-                                t
-                            }
-                        };
-                        ids.push(tid);
+                    // Same lowering as the incremental path, but assigning dense ids from a
+                    // rebuild-local allocator (see `distinct_term_ids` / audit I4).
+                    let ids = self.distinct_term_ids(text, |term| {
+                        let gkey = term.0;
+                        if let Some(&t) = local.get(&gkey) {
+                            return Ok(t);
+                        }
+                        if next_term == 0 || next_term > u32::MAX as u64 {
+                            return Err(Error::corrupt("term id space exhausted"));
+                        }
+                        let t = next_term as TermId;
+                        next_term += 1;
+                        local.insert(gkey, t);
+                        Ok(t)
+                    })?;
+                    for &tid in &ids {
                         inverted.entry(tid).or_default().insert(seg_id as u32);
                     }
                     let bm: RoaringBitmap = ids.iter().copied().collect();

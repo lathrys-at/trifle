@@ -214,6 +214,23 @@ impl Effort {
     }
 }
 
+/// The hydration cost ladder: how much of a match to materialize, as an explicit
+/// ordered choice (not independent booleans), so a deeper join is never paid by accident
+/// in a hot loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[non_exhaustive]
+pub enum Hydration {
+    /// `(key, label)` only — no segment text is fetched ([`Match::text`] stays `None`).
+    Coordinates,
+    /// Also fetch the matched segment's text (a [`Stored`](StorageMode::Stored) field's
+    /// `seg.txt`, or the resolver for a `Resolver` field). The default.
+    #[default]
+    SegmentText,
+    /// Also fetch the document payload. Payload columns are a later phase; today this
+    /// behaves as [`SegmentText`](Hydration::SegmentText).
+    DocumentPayload,
+}
+
 /// Per-search options.
 ///
 /// Construct with [`SearchOpts::new`] and the builder setters, then set any of the public
@@ -235,16 +252,19 @@ pub struct SearchOpts<'a> {
     /// A per-query [`Ranker`]. `None` → the built-in [`OverlapRanker`] (when reranking is
     /// off) or [`Bm25Ranker`] (the [`Effort`] precision tier).
     pub ranker: Option<&'a dyn Ranker>,
-    /// A membership predicate `(doc_id, source, ref) -> keep` evaluated over
-    /// candidates in overlap order — never over the corpus. The walk continues until
-    /// `limit` predicate-passing results lock, so scoping needs no over-fetch. The
-    /// predicate must not call back into this index's writer.
+    /// A membership predicate `(key, label) -> keep` evaluated over candidates in
+    /// overlap order — never over the corpus. The walk continues until `limit`
+    /// predicate-passing results lock, so scoping needs no over-fetch. The predicate must
+    /// not call back into this index's writer.
     pub scope: Option<&'a ScopeFn<'a>>,
     /// How hard to rerank — the over-fetch [`Effort`]. Defaults to
     /// [`Medium`](Effort::Medium). [`None`](Effort::None) disables reranking and returns
     /// plain overlap order (cheapest). When `ranker` is also set, `effort` still chooses
     /// the pool depth but that custom ranker scores it.
     pub effort: Effort,
+    /// How much of a match to materialize — the [`Hydration`] cost ladder. Defaults to
+    /// [`SegmentText`](Hydration::SegmentText).
+    pub hydration: Hydration,
 }
 
 impl<'a> SearchOpts<'a> {
@@ -258,7 +278,14 @@ impl<'a> SearchOpts<'a> {
             ranker: None,
             scope: None,
             effort: Effort::default(),
+            hydration: Hydration::default(),
         }
+    }
+
+    /// Set the [`Hydration`] level (how much of each match to materialize).
+    pub fn hydrate(mut self, hydration: Hydration) -> Self {
+        self.hydration = hydration;
+        self
     }
 
     /// Set the match floor `m`.
@@ -450,94 +477,32 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(max_id.is_some_and(|m| m >= next))
     }
 
-    // ----- writes -------------------------------------------------------------
+    // ----- leases -------------------------------------------------------------
 
-    /// Replace all segments of the document keyed `key` with the given `(label, text)`
-    /// pairs, in one transaction (creating the document if absent).
-    ///
-    /// Each `label` must name a text field the [`Schema`] accepts (a declared field, or
-    /// any label when the schema has a default text mode).
+    /// Acquire the exclusive [`Writer`] lease: holds the single-writer lock for the
+    /// lease's lifetime and opens a transaction. The six write methods live on the
+    /// returned guard. Keep it **short-lived** — acquire → batch → [`commit`](Writer::commit)
+    /// → drop; never `.await` unrelated work while holding it. **Dropping without
+    /// committing rolls back the uncommitted tail** (so a partial batch never persists).
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] for a label the schema does not accept; otherwise an error
-    /// if the store write fails.
-    pub fn insert(&self, key: impl Into<Key>, segments: &[(&str, &str)]) -> Result<()> {
-        let key = key.into();
-        let mut guard = self.backend.write()?;
-        let ns = self.backend.namespace();
-        let tx = guard.transaction()?;
-        let mut stage = self.dict.stage();
-        let mut changes = TokenChanges::default();
-        self.replace_doc(&tx, ns, &key, segments, &mut changes, &mut stage)?;
-        let df_changes = changes.apply(&tx, ns)?;
-        tx.commit()?;
-        // Only after the transaction commits do the newly-interned grams enter the
-        // shared in-memory map (a rolled-back write leaves no orphan id); the class
-        // statistics then fold in the committed df changes.
-        stage.commit();
-        self.dict.apply_df_changes(&df_changes);
-        Ok(())
+    /// Returns an error if the write transaction cannot begin.
+    pub fn writer(&self) -> Result<Writer<'_, T, B>> {
+        Writer::begin(self)
     }
 
-    /// Insert many documents in one (atomic) transaction; each replaces any existing
-    /// segments under its key (the same semantics as [`insert`](Self::insert)).
+    /// Acquire a [`Reader`] lease for issuing searches. Each search runs under its own
+    /// consistent WAL snapshot; acquire a fresh reader to see newer writes.
     ///
     /// # Errors
     ///
-    /// Returns an error if the store write fails (rolling the whole batch back).
-    pub fn insert_batch(&self, batch: impl IntoIterator<Item = Document>) -> Result<()> {
-        let docs: Vec<Document> = batch.into_iter().collect();
-        if docs.is_empty() {
-            return Ok(());
-        }
-        let mut guard = self.backend.write()?;
-        let ns = self.backend.namespace();
-        let tx = guard.transaction()?;
-        let mut stage = self.dict.stage();
-        let mut changes = TokenChanges::default();
-        for d in &docs {
-            let pairs: Vec<(&str, &str)> = d
-                .segments
-                .iter()
-                .map(|(l, t)| (l.as_str(), t.as_str()))
-                .collect();
-            self.replace_doc(&tx, ns, &d.key, &pairs, &mut changes, &mut stage)?;
-        }
-        let df_changes = changes.apply(&tx, ns)?;
-        tx.commit()?;
-        stage.commit();
-        self.dict.apply_df_changes(&df_changes);
-        Ok(())
+    /// Returns an error if the lease cannot be set up.
+    pub fn reader(&self) -> Result<Reader<'_, T, B>> {
+        Ok(Reader { index: self })
     }
 
-    /// Remove the document keyed `key` and all its segments, in one transaction. A
-    /// nonexistent key is a no-op.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store write fails.
-    pub fn remove(&self, key: impl Into<Key>) -> Result<()> {
-        let key = key.into();
-        let mut guard = self.backend.write()?;
-        let ns = self.backend.namespace();
-        let tx = guard.transaction()?;
-        let mut changes = TokenChanges::default();
-        if let Some(doc) = self.doc_id_for(&tx, ns, &key, false)? {
-            for (id, tokens) in self.doc_segments(&tx, ns, doc)? {
-                changes.remove(id, &tokens);
-            }
-            self.delete_doc_rows(&tx, ns, doc)?;
-            tx.execute(
-                &format!("DELETE FROM {} WHERE id = ?1", ns.doc()),
-                rusqlite::params![doc],
-            )?;
-        }
-        let df_changes = changes.apply(&tx, ns)?;
-        tx.commit()?;
-        self.dict.apply_df_changes(&df_changes);
-        Ok(())
-    }
+    // ----- write internals (used by the `Writer` lease) -----------------------
 
     /// Find the internal doc id for `key`, creating a fresh `doc` row if absent and
     /// `create` is set (otherwise `None`).
@@ -610,59 +575,114 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
-    /// Replace all of a document's segments: find/create its `doc` row, drop its existing
-    /// segments (accumulating their removals into `changes`), then insert the new ones,
-    /// interning each segment's grams through `stage`. The `fwd` term-id set is stored for
-    /// every segment so delete never needs text; `seg.txt` is stored only for a `Stored`
-    /// field.
-    fn replace_doc(
+    /// Write one segment `(doc, label) = text`, interning its grams through `stage` and
+    /// storing the term-id set in `fwd` (so delete needs no text). `seg.txt` is stored
+    /// only for a `Stored` field. If a segment with this label already exists: with
+    /// `replace`, it is dropped first (its removals accumulated into `changes`); without
+    /// `replace`, this errors.
+    #[allow(clippy::too_many_arguments)]
+    fn write_segment(
         &self,
         conn: &Connection,
         ns: &Namespace,
-        key: &Key,
-        segments: &[(&str, &str)],
+        doc: i64,
+        label: &str,
+        text: &str,
         changes: &mut TokenChanges,
         stage: &mut dict::InternStage<'_>,
+        replace: bool,
     ) -> Result<()> {
-        let doc = self
-            .doc_id_for(conn, ns, key, true)?
-            .expect("create=true always yields a doc id");
-        // Removals: the old segments' ids and term-id sets, then drop their rows.
-        for (id, tokens) in self.doc_segments(conn, ns, doc)? {
-            changes.remove(id, &tokens);
-        }
-        self.delete_doc_rows(conn, ns, doc)?;
-
-        if segments.is_empty() {
-            return Ok(());
-        }
-        let first_id = schema::alloc_ids(conn, ns, segments.len() as u64)?;
-        let mut seg_ins = conn.prepare_cached(&format!(
-            "INSERT INTO {}(id, doc_id, label, txt) VALUES(?1, ?2, ?3, ?4)",
-            ns.seg()
-        ))?;
-        let mut fwd_ins =
-            conn.prepare_cached(&format!("INSERT INTO {}(id, tokens) VALUES(?1, ?2)", ns.fwd()))?;
-        for (i, (label, text)) in segments.iter().enumerate() {
-            let mode = self.schema.storage_for(label).ok_or_else(|| {
-                Error::InvalidInput(format!("label {label:?} is not a field of the schema"))
-            })?;
-            let id = first_id + i as i64;
-            let stored_txt = if mode == StorageMode::Stored {
-                Some(*text)
-            } else {
-                None
-            };
-            seg_ins.execute(rusqlite::params![id, doc, label, stored_txt])?;
-            // Intern this segment's distinct grams to term-ids (writer fault).
-            let tokens = self.distinct_tokens(text);
-            let mut ids: Vec<TermId> = Vec::with_capacity(tokens.len());
-            for t in &tokens {
-                ids.push(stage.intern(t, conn, ns)?);
+        let mode = self.schema.storage_for(label).ok_or_else(|| {
+            Error::InvalidInput(format!("label {label:?} is not a field of the schema"))
+        })?;
+        if let Some(seg_id) = self.find_segment(conn, ns, doc, label)? {
+            if !replace {
+                return Err(Error::InvalidInput(format!(
+                    "a segment with label {label:?} already exists for this key"
+                )));
             }
-            let bm: RoaringBitmap = ids.iter().copied().collect();
-            fwd_ins.execute(rusqlite::params![id, postings::serialize(&bm)?])?;
-            changes.add(id as u32, &ids);
+            self.drop_segment(conn, ns, seg_id, changes)?;
+        }
+        let id = schema::alloc_ids(conn, ns, 1)?;
+        let stored_txt = if mode == StorageMode::Stored {
+            Some(text)
+        } else {
+            None
+        };
+        conn.execute(
+            &format!(
+                "INSERT INTO {}(id, doc_id, label, txt) VALUES(?1, ?2, ?3, ?4)",
+                ns.seg()
+            ),
+            rusqlite::params![id, doc, label, stored_txt],
+        )?;
+        let tokens = self.distinct_tokens(text);
+        let mut ids: Vec<TermId> = Vec::with_capacity(tokens.len());
+        for t in &tokens {
+            ids.push(stage.intern(t, conn, ns)?);
+        }
+        let bm: RoaringBitmap = ids.iter().copied().collect();
+        conn.execute(
+            &format!("INSERT INTO {}(id, tokens) VALUES(?1, ?2)", ns.fwd()),
+            rusqlite::params![id, postings::serialize(&bm)?],
+        )?;
+        changes.add(id as u32, &ids);
+        Ok(())
+    }
+
+    /// The segment id for `(doc, label)`, if it exists.
+    fn find_segment(
+        &self,
+        conn: &Connection,
+        ns: &Namespace,
+        doc: i64,
+        label: &str,
+    ) -> Result<Option<i64>> {
+        Ok(conn
+            .query_row(
+                &format!("SELECT id FROM {} WHERE doc_id = ?1 AND label = ?2", ns.seg()),
+                rusqlite::params![doc, label],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Drop one segment by id: accumulate its term-id removals into `changes`, then
+    /// delete its `seg` and `fwd` rows.
+    fn drop_segment(
+        &self,
+        conn: &Connection,
+        ns: &Namespace,
+        seg_id: i64,
+        changes: &mut TokenChanges,
+    ) -> Result<()> {
+        let fwd = self.read_fwd(conn, ns, &[seg_id as u32])?;
+        if let Some(ids) = fwd.get(&(seg_id as u32)) {
+            changes.remove(seg_id as u32, ids);
+        }
+        conn.execute(
+            &format!("DELETE FROM {} WHERE id = ?1", ns.fwd()),
+            rusqlite::params![seg_id],
+        )?;
+        conn.execute(
+            &format!("DELETE FROM {} WHERE id = ?1", ns.seg()),
+            rusqlite::params![seg_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the segment `(doc, label)` if present (its removals into `changes`); a
+    /// no-op if absent. The `doc` row is left intact (it may have other segments).
+    fn remove_one_segment(
+        &self,
+        conn: &Connection,
+        ns: &Namespace,
+        doc: i64,
+        label: &str,
+        changes: &mut TokenChanges,
+    ) -> Result<()> {
+        if let Some(seg_id) = self.find_segment(conn, ns, doc, label)? {
+            self.drop_segment(conn, ns, seg_id, changes)?;
         }
         Ok(())
     }
@@ -858,32 +878,14 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         })
     }
 
-    // ----- reads --------------------------------------------------------------
+    // ----- reads (implementation; the public read surface is `Reader`) --------
 
-    /// Search for `query`, returning up to `opts.limit` ranked matches.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store read fails.
-    pub fn search(&self, query: &str, opts: SearchOpts<'_>) -> Result<Vec<Match>> {
-        Ok(self
-            .search_batch(&[query], opts)?
-            .into_iter()
-            .next()
-            .unwrap_or_default())
-    }
-
-    /// Search a batch of queries, one result list per query in order.
-    ///
-    /// Posting and frequency reads are shared across the batch, but each query's
-    /// selection and ranking derive only from its own token frequencies, so
-    /// `search_batch([…, q, …])` ranks `q` identically to `search(q)` (batch ==
-    /// serial).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store read fails.
-    pub fn search_batch(&self, queries: &[&str], opts: SearchOpts<'_>) -> Result<Vec<Vec<Match>>> {
+    /// Search a batch of queries, one result list per query in order. Invoked by a
+    /// [`Reader`]; not public on `Index` (reads go through a [`reader`](Self::reader)
+    /// lease). Each query's selection and ranking derive only from its own token
+    /// frequencies, so a batch ranks each query identically to a singleton search
+    /// (batch == serial).
+    fn search_batch(&self, queries: &[&str], opts: &SearchOpts<'_>) -> Result<Vec<Vec<Match>>> {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
@@ -994,7 +996,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                     self.schema.key_shape(),
                     opts.scope,
                 )?;
-                self.hydrate_text(conn, ns, &mut survivors)?;
+                if opts.hydration != Hydration::Coordinates {
+                    self.hydrate_text(conn, ns, &mut survivors)?;
+                }
 
                 out.push(self.rank_to_matches(
                     &survivors, &present, selected, query, min_shared, ranker, opts.limit,
@@ -1192,6 +1196,187 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 other => return other,
             }
         }
+    }
+}
+
+/// The exclusive write lease (§8): holding it **is** holding the single-writer lock, so
+/// the naive-uncoordinated-write bug is inexpressible — there is no top-level write
+/// method to misuse. One transaction is open for the lease; [`commit`](Writer::commit)
+/// decouples durability from the lease (commit-and-continue), and dropping without
+/// committing rolls the uncommitted tail back.
+///
+/// The six write methods are `batch ≡ atomic fold of single`: `insert`/`insert_segment`
+/// error on a `(key, label)` collision (and create the document if absent); `upsert`/
+/// `upsert_segment` replace without error and keep a key's other (unnamed) segments;
+/// `remove`/`remove_segment` drop a document or one of its segments.
+pub struct Writer<'a, T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
+    guard: B::WriteGuard<'a>,
+    index: &'a Index<T, B>,
+    /// The interning session, accumulated across the open transaction; merged into the
+    /// shared dictionary only on [`commit`](Self::commit), discarded on rollback.
+    stage: Option<dict::InternStage<'a>>,
+    /// `(term-id, old_df, new_df)` deltas to fold into the class stats on commit.
+    pending_df: Vec<(TermId, i64, i64)>,
+    /// Whether uncommitted work exists since the last `BEGIN`.
+    dirty: bool,
+}
+
+impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
+    /// Acquire the writer lock and open the first transaction.
+    fn begin(index: &'a Index<T, B>) -> Result<Self> {
+        let guard = index.backend.write()?;
+        guard.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(Writer {
+            guard,
+            index,
+            stage: Some(index.dict.stage()),
+            pending_df: Vec::new(),
+            dirty: false,
+        })
+    }
+
+    /// Add the given `(label, text)` segments to the document keyed `key` (creating it if
+    /// absent). Errors if any `(key, label)` already exists.
+    pub fn insert(&mut self, key: impl Into<Key>, segments: &[(&str, &str)]) -> Result<()> {
+        self.write_doc(key.into(), segments, false)
+    }
+
+    /// Add a single segment `(key, label) = text` (creating the document if absent).
+    /// Errors if `(key, label)` already exists.
+    pub fn insert_segment(&mut self, key: impl Into<Key>, label: &str, text: &str) -> Result<()> {
+        self.write_doc(key.into(), &[(label, text)], false)
+    }
+
+    /// Insert-or-replace the given `(label, text)` segments of the document keyed `key`
+    /// (creating it if absent). Never errors on collision; a key's other (unnamed)
+    /// segments are left intact.
+    pub fn upsert(&mut self, key: impl Into<Key>, segments: &[(&str, &str)]) -> Result<()> {
+        self.write_doc(key.into(), segments, true)
+    }
+
+    /// Insert-or-replace a single segment `(key, label) = text`.
+    pub fn upsert_segment(&mut self, key: impl Into<Key>, label: &str, text: &str) -> Result<()> {
+        self.write_doc(key.into(), &[(label, text)], true)
+    }
+
+    /// The shared body of the four insert/upsert methods.
+    fn write_doc(&mut self, key: Key, segments: &[(&str, &str)], replace: bool) -> Result<()> {
+        let ns = self.index.backend.namespace();
+        let conn: &Connection = &self.guard;
+        let stage = self.stage.as_mut().expect("writer stage present");
+        let mut changes = TokenChanges::default();
+        let doc = self
+            .index
+            .doc_id_for(conn, ns, &key, true)?
+            .expect("create=true always yields a doc id");
+        for (label, text) in segments {
+            self.index
+                .write_segment(conn, ns, doc, label, text, &mut changes, stage, replace)?;
+        }
+        let df = changes.apply(conn, ns)?;
+        self.pending_df.extend(df);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Remove the document keyed `key` and all its segments. A nonexistent key is a no-op.
+    pub fn remove(&mut self, key: impl Into<Key>) -> Result<()> {
+        let key = key.into();
+        let ns = self.index.backend.namespace();
+        let conn: &Connection = &self.guard;
+        let mut changes = TokenChanges::default();
+        if let Some(doc) = self.index.doc_id_for(conn, ns, &key, false)? {
+            for (id, tokens) in self.index.doc_segments(conn, ns, doc)? {
+                changes.remove(id, &tokens);
+            }
+            self.index.delete_doc_rows(conn, ns, doc)?;
+            conn.execute(
+                &format!("DELETE FROM {} WHERE id = ?1", ns.doc()),
+                rusqlite::params![doc],
+            )?;
+        }
+        let df = changes.apply(conn, ns)?;
+        self.pending_df.extend(df);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Remove the segment `(key, label)`. A nonexistent key or label is a no-op; the
+    /// document's other segments are left intact.
+    pub fn remove_segment(&mut self, key: impl Into<Key>, label: &str) -> Result<()> {
+        let key = key.into();
+        let ns = self.index.backend.namespace();
+        let conn: &Connection = &self.guard;
+        let mut changes = TokenChanges::default();
+        if let Some(doc) = self.index.doc_id_for(conn, ns, &key, false)? {
+            self.index
+                .remove_one_segment(conn, ns, doc, label, &mut changes)?;
+        }
+        let df = changes.apply(conn, ns)?;
+        self.pending_df.extend(df);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Commit the open transaction and continue under a fresh one (commit-and-continue),
+    /// keeping the lease. Only here do this batch's interned grams and class-stat changes
+    /// enter the shared in-memory state (after the durable commit), so a rolled-back tail
+    /// leaves no orphan id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the commit or the re-`BEGIN` fails.
+    pub fn commit(&mut self) -> Result<()> {
+        self.guard.execute_batch("COMMIT")?;
+        // Order matters: merge the staged interns first (advancing the shared high-water
+        // mark), then snapshot a fresh stage off the advanced mark.
+        if let Some(old) = self.stage.take() {
+            old.commit();
+        }
+        let df = std::mem::take(&mut self.pending_df);
+        self.index.dict.apply_df_changes(&df);
+        self.stage = Some(self.index.dict.stage());
+        self.dirty = false;
+        self.guard.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+}
+
+impl<T: Tokenizer, B: Backend> Drop for Writer<'_, T, B> {
+    fn drop(&mut self) {
+        // Roll back the uncommitted tail; the staged interns + df are dropped unmerged,
+        // so a write that was never committed leaves no trace (in-memory or on disk).
+        let _ = self.guard.execute_batch("ROLLBACK");
+    }
+}
+
+/// A read lease (§8): the surface for searches. Each search runs under its own consistent
+/// WAL snapshot; acquire a fresh reader to observe newer writes.
+pub struct Reader<'a, T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
+    index: &'a Index<T, B>,
+}
+
+impl<T: Tokenizer, B: Backend> Reader<'_, T, B> {
+    /// Search for `query`, returning up to `opts.limit` ranked matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store read fails.
+    pub fn search(&self, query: &str, opts: SearchOpts<'_>) -> Result<Vec<Match>> {
+        Ok(self
+            .search_batch(&[query], opts)?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
+    }
+
+    /// Search a batch of queries, one result list per query in order (`batch == serial`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store read fails.
+    pub fn search_batch(&self, queries: &[&str], opts: SearchOpts<'_>) -> Result<Vec<Vec<Match>>> {
+        self.index.search_batch(queries, &opts)
     }
 }
 

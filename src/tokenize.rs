@@ -1,117 +1,130 @@
-//! Tokenization: the one strategy a caller may supply, and the built-in n-gram
-//! tokenizer trifle ships.
+//! Tokenization: the one strategy a caller may supply, the script-aware tokenizer trifle
+//! defaults to, and the plain fixed-width n-gram tokenizers for single-script corpora.
 //!
-//! A [`Tokenizer`] turns text into a stream of tokens. The same tokenizer runs on
-//! indexed text, on the postings it maintains, and on queries — there is exactly
-//! one, so "the index agrees with the query" is true by construction. It is a
-//! *type* parameter of [`Index`](crate::Index), not a trait object: it sits on the
-//! hot path (called per window of every indexed and queried string), so it
-//! monomorphizes.
+//! A [`Tokenizer`] turns text into a stream of grams. The same tokenizer runs on indexed
+//! text, on the postings it maintains, and on queries — there is exactly one, so "the
+//! index agrees with the query" is true by construction. It is a *type* parameter of
+//! [`Index`](crate::Index), not a trait object: it sits on the hot path (called per window
+//! of every indexed and queried string), so it monomorphizes.
 //!
-//! The built-in [`NgramTokenizer`] (aliased [`TrigramTokenizer`], [`BigramTokenizer`],
-//! [`QuadgramTokenizer`]) slides an `N`-code-point window over a normalized form of
-//! the text, emitting a zero-allocation inline [`Ngram`] per window. Normalization
-//! is the tokenizer's job and is [configurable](TrigramTokenizer::builder).
+//! Tokenization is **online**: [`tokenize`](Tokenizer::tokenize) returns a lazy iterator
+//! that pulls normalized code points from streaming Unicode-normalization adaptors and
+//! slides a window over them — it never materializes an intermediate `Vec`.
+//!
+//! - [`DefaultTokenizer`] splits text into maximal same-script runs and slides a
+//!   script-appropriate window over each, emitting a variable-length [`Gram`] (a CJK run
+//!   takes bigrams, everything else trigrams). A mixed-script document therefore indexes
+//!   without manufacturing cross-script grams at the seams.
+//! - [`NgramTokenizer<N>`](NgramTokenizer) (aliased [`TrigramTokenizer`] /
+//!   [`BigramTokenizer`]) is the plain fixed-`N` sliding window — pick it when a corpus is
+//!   single-script and the script segmentation buys nothing.
+//!
+//! Normalization is the tokenizer's job and is configurable on either tokenizer.
 
 use std::borrow::Borrow;
+use std::str::Chars;
 
-use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::{Decompositions, Recompositions, UnicodeNormalization};
 use unicode_script::{Script, UnicodeScript};
 
-/// Turns text into tokens, for both indexing and querying.
-///
-/// The associated [`Token`](Tokenizer::Token) type must borrow as `&str` so that a
-/// token produced from a query keys the same posting bucket as one produced while
-/// indexing. It is `Ord` so selection can break document-frequency ties
-/// deterministically, and `Clone` (typically `Copy`) so the small inline tokens
-/// move freely on the hot path.
-pub trait Tokenizer: Send + Sync {
-    /// The token representation. The `Borrow<str>` bound lets a `HashMap<Token, _>`
-    /// be probed by `&str`; `Hash + Eq` make it a map key; `Ord` gives selection a
-    /// stable tie-break.
-    type Token: Borrow<str> + std::hash::Hash + Eq + Ord + Clone;
+use crate::term::IntoTerm;
 
-    /// Tokenize `text` into a stream of tokens. May yield duplicates (a repeated
-    /// n-gram appears once per occurrence); trifle deduplicates per segment where a
-    /// set is required.
+/// Turns text into grams, for both indexing and querying.
+///
+/// The associated [`Token`](Tokenizer::Token) type is bound to [`IntoTerm`] — which is
+/// itself `Borrow<str>` — so a token produced from a query keys the same posting bucket as
+/// one produced while indexing, *and* every token can be packed into the interned
+/// [`Term`](crate::Term) the dictionary keys on (a structural guarantee, not a
+/// convention). It is `Ord` so selection can break document-frequency ties
+/// deterministically, and `Clone` (typically `Copy`) so the small inline tokens move
+/// freely on the hot path.
+pub trait Tokenizer: Send + Sync {
+    /// The token representation. [`IntoTerm`] gives it both the `Borrow<str>` needed to
+    /// probe a `HashMap<Token, _>` by `&str` and the [`term`](IntoTerm::term) packing the
+    /// interning dictionary needs; `Hash + Eq` make it a map key; `Ord` gives selection a
+    /// stable tie-break.
+    type Token: IntoTerm + std::hash::Hash + Eq + Ord + Clone;
+
+    /// Tokenize `text` into a lazy stream of grams. May yield duplicates (a repeated gram
+    /// appears once per occurrence); trifle deduplicates per segment where a set is
+    /// required.
     fn tokenize<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Self::Token> + 'a;
 
-    /// A stable hash of this tokenizer's *behavior* (window size, normalization,
-    /// casefolding). It is stamped into the index and compared on open; a change
-    /// forces a [`rebuild`](crate::Index::rebuild), because the postings are keyed
-    /// by whatever this tokenizer produced at build time.
+    /// A stable hash of this tokenizer's *behavior* (window policy, normalization,
+    /// casefolding). It is stamped into the index and compared on open; a change forces a
+    /// [`rebuild`](crate::Index::rebuild), because the postings are keyed by whatever this
+    /// tokenizer produced at build time.
     ///
     /// A caller shipping a custom tokenizer owns changing this on *any* behavioral
-    /// change, including a bug-fix patch that alters the token stream — otherwise a
-    /// stale index would be served against new query tokenization.
+    /// change, including a bug-fix patch that alters the token stream — otherwise a stale
+    /// index would be served against new query tokenization.
     fn fingerprint(&self) -> u64;
 
-    /// Locate the byte span `[first, last)` within `text` (raw, original form) that
-    /// covers the first through last region producing one of `tokens`, for
+    /// Locate the byte span `[first, last)` within `text` (raw, original form) that covers
+    /// the first through last region producing one of `tokens`, for
     /// [`Match.span`](crate::Match::span).
     ///
-    /// The default returns `None` — a custom tokenizer that cannot cheaply map
-    /// tokens back to raw bytes simply yields no span, and the caller can locate
-    /// matches in [`Match.text`](crate::Match::text) itself. The built-in n-gram
-    /// tokenizer overrides this. Called only for the (≤ `limit`) survivors, so a
-    /// non-trivial implementation is affordable.
+    /// The default returns `None` — a custom tokenizer that cannot cheaply map tokens back
+    /// to raw bytes simply yields no span, and the caller can locate matches in
+    /// [`Match.text`](crate::Match::text) itself. The built-in tokenizers override this.
+    /// Called only for the (≤ `limit`) survivors, so a non-trivial implementation is
+    /// affordable.
     fn span(&self, text: &str, tokens: &[&str]) -> Option<(usize, usize)> {
         let _ = (text, tokens);
         None
     }
 }
 
-/// An inline, `Copy`, heap-free n-gram of up to `CAP` UTF-8 bytes.
+/// The byte capacity of an [`Ngram`]: three 4-byte code points. The term-encoding ceiling
+/// is 3 code points, so every window a built-in tokenizer emits fits.
+const GRAM_CAP: usize = 12;
+
+/// An inline, `Copy`, heap-free gram of up to `N` code points (`N ≤ 3`, the term-encoding
+/// ceiling). The const parameter is the window identity: [`Ngram<2>`] and [`Ngram<3>`] are
+/// distinct types, so a bigram tokenizer and a trigram tokenizer cannot be confused.
 ///
-/// The hot path materializes one per window of every indexed and queried string,
-/// so a heap `String` per window would dominate; `Ngram` lives on the stack and
-/// keys the posting maps directly. `Hash`/`Eq`/`Ord` delegate to the `str` slice,
-/// which is what makes the [`Borrow<str>`] impl sound — a `HashMap<Ngram, _>` can
-/// be probed with a plain `&str`.
+/// The hot path materializes one per window of every indexed and queried string, so a heap
+/// `String` per window would dominate; `Ngram` lives on the stack and keys the posting maps
+/// directly. The bytes are stored UTF-8-encoded, so `Hash`/`Eq`/`Ord`/`Borrow<str>` all
+/// delegate to the `str` slice — which is what makes a `HashMap<Ngram, _>` probe-able by a
+/// plain `&str` and gives it [`IntoTerm`] for free.
 ///
-/// `CAP` is a byte capacity (sidestepping the `N·4` const-expr problem of spelling
-/// the *code-point* count on stable Rust). Pick `CAP ≥ 4·N` so every `N`-code-point
-/// window fits; the provided aliases ([`Trigram`] = `Ngram<12>`, etc.) already do.
-/// `CAP` must be `≤ 255` (the length is stored in a `u8`).
+/// A run-length CJK bigram and a Latin trigram both come back from [`DefaultTokenizer`] as
+/// the variable-length alias [`Gram`] = `Ngram<3>` (a `Gram` holding two code points is a
+/// bigram); the fixed-`N` [`NgramTokenizer<N>`](NgramTokenizer) yields exactly-`N` grams.
 #[derive(Clone, Copy)]
-pub struct Ngram<const CAP: usize> {
+pub struct Ngram<const N: usize> {
     /// UTF-8 bytes, left-aligned; only `buf[..len]` is meaningful.
-    buf: [u8; CAP],
-    /// Number of meaningful bytes in `buf`. `CAP ≤ 255` keeps this exact.
+    buf: [u8; GRAM_CAP],
+    /// Number of meaningful bytes in `buf` (`≤ GRAM_CAP`, well within a `u8`).
     len: u8,
 }
 
-/// A 2-code-point n-gram (up to 8 UTF-8 bytes).
-pub type Bigram = Ngram<8>;
-/// A 3-code-point n-gram (up to 12 UTF-8 bytes) — the default token.
-pub type Trigram = Ngram<12>;
-/// A 4-code-point n-gram (up to 16 UTF-8 bytes).
-pub type Quadgram = Ngram<16>;
+/// A variable-length gram of up to three code points — the token [`DefaultTokenizer`]
+/// emits (a CJK bigram and a Latin trigram are both `Gram`s).
+pub type Gram = Ngram<3>;
 
-impl<const CAP: usize> Ngram<CAP> {
-    /// The n-gram as a string slice.
+impl<const N: usize> Ngram<N> {
+    /// The gram as a string slice.
     #[inline]
     pub fn as_str(&self) -> &str {
         // SAFETY: `buf[..len]` is only ever written from valid UTF-8 — `from_chars`
-        // encodes `char`s and `try_from_str` copies the bytes of an existing `&str`
-        // after a length check — so the slice is always valid UTF-8.
+        // encodes `char`s and `try_from_str` copies the bytes of an existing `&str` after
+        // a length check — so the slice is always valid UTF-8.
         unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len as usize]) }
     }
 
-    /// Build from a slice of code points, encoding them inline. Returns `None` if
-    /// the encoded bytes would exceed `CAP` (so a too-wide window is dropped rather
-    /// than truncated mid-code-point); with `CAP ≥ 4·N` this never happens.
+    /// Build from a slice of code points, encoding them inline. Returns `None` if the
+    /// encoded bytes would exceed [`GRAM_CAP`] (so a too-wide window is dropped rather than
+    /// truncated mid-code-point); a window of ≤3 code points always fits.
     #[inline]
     fn from_chars(chars: &[char]) -> Option<Self> {
-        // `len` is a `u8`, so `CAP` must fit one — enforced at compile time per
-        // monomorphization, turning the doc's "CAP must be ≤ 255" into a hard error.
-        const { assert!(CAP <= u8::MAX as usize, "Ngram CAP must be <= 255") };
-        let mut buf = [0u8; CAP];
+        let mut buf = [0u8; GRAM_CAP];
         let mut len = 0usize;
         for &c in chars {
             let need = c.len_utf8();
-            if len + need > CAP {
+            if len + need > GRAM_CAP {
                 return None;
             }
             len += c.encode_utf8(&mut buf[len..]).len();
@@ -122,15 +135,15 @@ impl<const CAP: usize> Ngram<CAP> {
         })
     }
 
-    /// Build from a string slice already known to be one n-gram. `None` if it is
-    /// longer than `CAP` bytes.
+    /// Build from a string slice already known to be one gram. `None` if it is longer than
+    /// [`GRAM_CAP`] bytes.
+    #[cfg(test)]
     fn try_from_str(s: &str) -> Option<Self> {
-        const { assert!(CAP <= u8::MAX as usize, "Ngram CAP must be <= 255") };
         let bytes = s.as_bytes();
-        if bytes.len() > CAP {
+        if bytes.len() > GRAM_CAP {
             return None;
         }
-        let mut buf = [0u8; CAP];
+        let mut buf = [0u8; GRAM_CAP];
         buf[..bytes.len()].copy_from_slice(bytes);
         Some(Self {
             buf,
@@ -139,7 +152,7 @@ impl<const CAP: usize> Ngram<CAP> {
     }
 }
 
-impl<const CAP: usize> std::ops::Deref for Ngram<CAP> {
+impl<const N: usize> std::ops::Deref for Ngram<N> {
     type Target = str;
     #[inline]
     fn deref(&self) -> &str {
@@ -147,29 +160,29 @@ impl<const CAP: usize> std::ops::Deref for Ngram<CAP> {
     }
 }
 
-impl<const CAP: usize> AsRef<str> for Ngram<CAP> {
+impl<const N: usize> AsRef<str> for Ngram<N> {
     #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-impl<const CAP: usize> Borrow<str> for Ngram<CAP> {
+impl<const N: usize> Borrow<str> for Ngram<N> {
     #[inline]
     fn borrow(&self) -> &str {
         self.as_str()
     }
 }
 
-impl<const CAP: usize> PartialEq for Ngram<CAP> {
+impl<const N: usize> PartialEq for Ngram<N> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.as_str() == other.as_str()
     }
 }
-impl<const CAP: usize> Eq for Ngram<CAP> {}
+impl<const N: usize> Eq for Ngram<N> {}
 
-impl<const CAP: usize> std::hash::Hash for Ngram<CAP> {
+impl<const N: usize> std::hash::Hash for Ngram<N> {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // Delegate to the `str` hash so an `Ngram` and an equal `&str` (probed via
@@ -178,49 +191,36 @@ impl<const CAP: usize> std::hash::Hash for Ngram<CAP> {
     }
 }
 
-impl<const CAP: usize> PartialOrd for Ngram<CAP> {
+impl<const N: usize> PartialOrd for Ngram<N> {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<const CAP: usize> Ord for Ngram<CAP> {
+impl<const N: usize> Ord for Ngram<N> {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.as_str().cmp(other.as_str())
     }
 }
 
-impl<const CAP: usize> std::fmt::Debug for Ngram<CAP> {
+impl<const N: usize> std::fmt::Debug for Ngram<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self.as_str(), f)
     }
 }
 
-impl<const CAP: usize> std::fmt::Display for Ngram<CAP> {
+impl<const N: usize> std::fmt::Display for Ngram<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-impl<const CAP: usize> rusqlite::ToSql for Ngram<CAP> {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        Ok(rusqlite::types::ToSqlOutput::from(self.as_str()))
-    }
-}
-
-impl<const CAP: usize> rusqlite::types::FromSql for Ngram<CAP> {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        let s = value.as_str()?;
-        Ngram::try_from_str(s).ok_or(rusqlite::types::FromSqlError::InvalidType)
-    }
-}
-
-/// How the tokenizer normalizes text before windowing it.
+/// How a tokenizer normalizes text before windowing it.
 ///
-/// Whatever is chosen applies identically to indexed text and queries (one
-/// tokenizer, both sides) — the single normalization invariant.
+/// Whatever is chosen applies identically to indexed text and queries (one tokenizer, both
+/// sides) — the single normalization invariant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Normalization {
     /// NFC (canonical composition). Safe and compact; the default.
@@ -228,12 +228,12 @@ pub enum Normalization {
     Nfc,
     /// NFD (canonical decomposition).
     Nfd,
-    /// NFD then drop combining marks — accent-insensitive. A query `cafe` then
-    /// shares trigrams with a stored `café`. Often the better choice for fuzzy
-    /// search when accent tolerance matters.
+    /// NFD then drop combining marks — accent-insensitive. A query `cafe` then shares grams
+    /// with a stored `café`. Often the better choice for fuzzy search when accent tolerance
+    /// matters.
     NfdStripMarks,
-    /// No normalization. Choose only when the caller guarantees a canonical form on
-    /// both writes and queries (see [`assume_normalized`](NgramTokenizerBuilder::assume_normalized)).
+    /// No normalization. Choose only when the caller guarantees a canonical form on both
+    /// writes and queries (see [`assume_normalized`](NgramTokenizerBuilder::assume_normalized)).
     None,
 }
 
@@ -249,214 +249,45 @@ impl Normalization {
     }
 }
 
-/// The built-in tokenizer: an `N`-code-point sliding window over a normalized,
-/// optionally case-folded form of the text, emitting an inline [`Ngram<CAP>`] per
-/// window. A string shorter than `N` code points yields no tokens.
-///
-/// Use the aliases — [`TrigramTokenizer`] is the default. Construct with
-/// [`new`](Self::new) for the defaults (NFC + Unicode lowercase) or
-/// [`builder`](Self::builder) to change normalization / casefolding.
-///
-/// ```
-/// use trifle::tokenize::{Tokenizer, TrigramTokenizer};
-///
-/// let tok = TrigramTokenizer::new();
-/// let grams: Vec<String> = tok.tokenize("Café").map(|g| g.to_string()).collect();
-/// assert_eq!(grams, ["caf", "afé"]);
-/// ```
+/// The normalization configuration shared by both built-in tokenizers. Owns the online
+/// normalized-char source and the per-cluster re-derivation that [`Tokenizer::span`] uses.
 #[derive(Clone, Debug)]
-pub struct NgramTokenizer<const N: usize, const CAP: usize> {
+struct Norm {
     normalization: Normalization,
     casefold: bool,
     assume_normalized: bool,
 }
 
-/// 3-code-point window tokenizer (the default), emitting [`Trigram`]s.
-pub type TrigramTokenizer = NgramTokenizer<3, 12>;
-/// 2-code-point window tokenizer, emitting [`Bigram`]s.
-pub type BigramTokenizer = NgramTokenizer<2, 8>;
-/// 4-code-point window tokenizer, emitting [`Quadgram`]s.
-pub type QuadgramTokenizer = NgramTokenizer<4, 16>;
-
-impl<const N: usize, const CAP: usize> Default for NgramTokenizer<N, CAP> {
+impl Default for Norm {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<const N: usize, const CAP: usize> NgramTokenizer<N, CAP> {
-    /// A tokenizer with the default behavior: NFC normalization + Unicode
-    /// lowercasing.
-    pub fn new() -> Self {
-        Self {
+        Norm {
             normalization: Normalization::Nfc,
             casefold: true,
             assume_normalized: false,
         }
     }
-
-    /// Start a [`builder`](NgramTokenizerBuilder) to customize normalization and
-    /// casefolding.
-    pub fn builder() -> NgramTokenizerBuilder<N, CAP> {
-        NgramTokenizerBuilder { inner: Self::new() }
-    }
-
-    /// The number of code points per window.
-    pub const fn window(&self) -> usize {
-        N
-    }
-
-    /// Normalize and (if enabled) case-fold `text` into the code points the window
-    /// slides over. One allocation per text, not per window.
-    fn prepare(&self, text: &str) -> Vec<char> {
-        prepare_chars(
-            text,
-            self.normalization,
-            self.casefold,
-            self.assume_normalized,
-        )
-    }
 }
 
-/// Normalize and (if enabled) case-fold `text` into the code points a window slides
-/// over — the shared front of both built-in tokenizers. `assume_normalized` trusts the
-/// caller and skips the transform; otherwise apply the chosen form (the quick-check
-/// inside `nfc`/`nfd` makes already-normal text near-free).
-fn prepare_chars(
-    text: &str,
-    normalization: Normalization,
-    casefold: bool,
-    assume_normalized: bool,
-) -> Vec<char> {
-    let normalized: Vec<char> = if assume_normalized {
-        match normalization {
-            // Stripping marks is not a normalized form the input could already be in, so
-            // honor it even under `assume_normalized`.
-            Normalization::NfdStripMarks => {
-                text.chars().filter(|c| !is_combining_mark(*c)).collect()
-            }
-            _ => text.chars().collect(),
-        }
-    } else {
-        match normalization {
-            Normalization::Nfc => text.nfc().collect(),
-            Normalization::Nfd => text.nfd().collect(),
-            Normalization::NfdStripMarks => text.nfd().filter(|c| !is_combining_mark(*c)).collect(),
-            Normalization::None => text.chars().collect(),
-        }
-    };
-    if casefold {
-        normalized
-            .into_iter()
-            .flat_map(|c| c.to_lowercase())
-            .collect()
-    } else {
-        normalized
-    }
-}
-
-impl<const N: usize, const CAP: usize> Tokenizer for NgramTokenizer<N, CAP> {
-    type Token = Ngram<CAP>;
-
-    fn tokenize<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Self::Token> + 'a {
-        NgramWindows::<N, CAP> {
-            chars: self.prepare(text),
-            pos: 0,
-        }
+impl Norm {
+    /// The online, allocation-free normalized + case-folded code-point stream for `text`.
+    fn prepared<'a>(&self, text: &'a str) -> PreparedChars<'a> {
+        PreparedChars::new(text, self)
     }
 
-    fn fingerprint(&self) -> u64 {
-        // A stable FNV-1a over a canonical encoding of the behavior — deterministic
-        // across Rust versions and machines, unlike the std default hasher, so the
-        // stamp only changes when behavior actually changes. `N` and `CAP` are hashed
-        // at full width (not narrowed to a byte), so two widths never collide.
-        let mut bytes = Vec::with_capacity(2 + 16 + 3);
-        bytes.extend_from_slice(b"ng");
-        bytes.extend_from_slice(&(N as u64).to_le_bytes());
-        bytes.extend_from_slice(&(CAP as u64).to_le_bytes());
-        bytes.push(self.normalization.code());
-        bytes.push(self.casefold as u8);
-        bytes.push(self.assume_normalized as u8);
-        fnv1a_64(&bytes)
+    /// Three fingerprint bytes: normalization form, casefold, assume-normalized.
+    fn fingerprint_bytes(&self) -> [u8; 3] {
+        [
+            self.normalization.code(),
+            self.casefold as u8,
+            self.assume_normalized as u8,
+        ]
     }
 
-    fn span(&self, text: &str, tokens: &[&str]) -> Option<(usize, usize)> {
-        // Re-derive the normalized + case-folded token stream and map a matched window
-        // back to raw bytes, **streaming** — O(N) stack state, zero heap allocation.
-        //
-        // Normalization runs per *cluster* — a starter plus its trailing combining marks
-        // and conjoining Hangul jamo — not per char: NFC composition and NFD canonical
-        // reordering both act within such a unit, so a per-cluster pass produces exactly
-        // the same tokens as `prepare`'s whole-string pass — fixing the spans a per-char
-        // pass would lose on decomposed, non-canonically-ordered, or jamo-composed input.
-        // Every char a cluster emits is mapped to the cluster's whole raw byte range, so
-        // the returned offsets are always raw char boundaries.
-        //
-        // The window holds the last N emitted chars and their raw ranges; a long
-        // document never materializes an O(text) buffer (span runs for the ≤ limit
-        // survivors, but a survivor can itself be large).
-        let mut first: Option<usize> = None;
-        let mut last = 0usize;
-        {
-            let mut win_ch = ['\0'; N];
-            let mut win_start = [0usize; N];
-            let mut win_end = [0usize; N];
-            let mut filled = 0usize;
-            let mut consider = |ch: char, cluster_start: usize, cluster_end: usize| {
-                if N > 1 {
-                    win_ch.copy_within(1..N, 0);
-                    win_start.copy_within(1..N, 0);
-                    win_end.copy_within(1..N, 0);
-                }
-                win_ch[N - 1] = ch;
-                win_start[N - 1] = cluster_start;
-                win_end[N - 1] = cluster_end;
-                filled += 1;
-                if filled >= N {
-                    if let Some(g) = Ngram::<CAP>::from_chars(&win_ch) {
-                        if tokens.contains(&g.as_str()) {
-                            first.get_or_insert(win_start[0]);
-                            last = win_end[N - 1];
-                        }
-                    }
-                }
-            };
-
-            // Walk the raw text in clusters without materializing it: a peekable
-            // `char_indices` finds each cluster's `[start, end)` byte range, and the
-            // cluster substring is normalized straight into the window.
-            let mut it = text.char_indices().peekable();
-            while let Some((cluster_start, _)) = it.next() {
-                while it
-                    .peek()
-                    .is_some_and(|&(_, c)| is_combining_mark(c) || is_conjoining_jamo(c))
-                {
-                    it.next();
-                }
-                let cluster_end = it.peek().map_or(text.len(), |&(off, _)| off);
-                self.normalize_cluster(&text[cluster_start..cluster_end], &mut |ch| {
-                    consider(ch, cluster_start, cluster_end)
-                });
-            }
-        }
-        first.map(|f| (f, last))
-    }
-}
-
-/// Conjoining Hangul Vowel/Trailing jamo (U+1161..=U+1175, U+11A8..=U+11C2). Like
-/// combining marks these attach to a preceding character — NFC composes a leading jamo
-/// plus these into one syllable — so [`span`](NgramTokenizer::span) keeps them in the
-/// same cluster; splitting the composition would lose the token for that region.
-fn is_conjoining_jamo(c: char) -> bool {
-    matches!(c, '\u{1161}'..='\u{1175}' | '\u{11A8}'..='\u{11C2}')
-}
-
-impl<const N: usize, const CAP: usize> NgramTokenizer<N, CAP> {
-    /// Apply this tokenizer's normalization + casefolding to one combining-sequence
-    /// cluster, emitting the resulting char(s) one at a time (no intermediate
-    /// buffer). Mirrors [`prepare`](Self::prepare) exactly (same normalization form,
+    /// Apply this normalization + casefolding to one combining-sequence cluster, emitting
+    /// the resulting char(s) one at a time. Mirrors [`PreparedChars`] exactly (same form,
     /// same casefold, same `assume_normalized` skip) but on a cluster substring, so
-    /// [`span`](Self::span) re-derives the same token stream while tracking offsets.
+    /// [`Norm::for_each_normalized_char`] re-derives the same token stream while tracking
+    /// raw byte offsets.
     fn normalize_cluster(&self, cluster: &str, push: &mut dyn FnMut(char)) {
         let casefold = self.casefold;
         let mut emit = |c: char| {
@@ -488,36 +319,265 @@ impl<const N: usize, const CAP: usize> NgramTokenizer<N, CAP> {
             }
         }
     }
-}
 
-/// Sliding-window iterator: yields one [`Ngram<CAP>`] per `N`-code-point window of
-/// the prepared char buffer. Owns the buffer, so it satisfies the `Tokenizer`
-/// lifetime without borrowing the source text.
-struct NgramWindows<const N: usize, const CAP: usize> {
-    chars: Vec<char>,
-    pos: usize,
-}
-
-impl<const N: usize, const CAP: usize> Iterator for NgramWindows<N, CAP> {
-    type Item = Ngram<CAP>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // A window of fewer-than-N code points yields nothing.
-        while self.pos + N <= self.chars.len() {
-            let window = &self.chars[self.pos..self.pos + N];
-            self.pos += 1;
-            // A window too wide for `CAP` is skipped (only possible when a caller
-            // aliases with `CAP < 4·N`); the provided aliases never hit this.
-            if let Some(g) = Ngram::<CAP>::from_chars(window) {
-                return Some(g);
+    /// Call `f(ch, cluster_start, cluster_end)` for each normalized code point, where the
+    /// `[start, end)` is the raw byte range of the cluster that produced it. Normalization
+    /// runs per *cluster* — a starter plus its trailing combining marks and conjoining
+    /// Hangul jamo — which produces the same code points as the whole-string streaming pass
+    /// (NFC composition and NFD canonical reordering both act within such a unit), so the
+    /// spans line up with the tokens on decomposed, reordered, or jamo-composed input.
+    /// Every code point a cluster emits maps to the cluster's whole raw range, so offsets
+    /// are always raw char boundaries.
+    fn for_each_normalized_char(&self, text: &str, mut f: impl FnMut(char, usize, usize)) {
+        let mut it = text.char_indices().peekable();
+        while let Some((cluster_start, _)) = it.next() {
+            while it
+                .peek()
+                .is_some_and(|&(_, c)| is_combining_mark(c) || is_conjoining_jamo(c))
+            {
+                it.next();
             }
+            let cluster_end = it.peek().map_or(text.len(), |&(off, _)| off);
+            self.normalize_cluster(&text[cluster_start..cluster_end], &mut |ch| {
+                f(ch, cluster_start, cluster_end)
+            });
         }
-        None
+    }
+}
+
+/// The online normalized-char source: a streaming Unicode-normalization adaptor plus an
+/// optional case-fold expansion, yielding one code point at a time with no buffering of the
+/// whole text.
+struct PreparedChars<'a> {
+    kind: NormKind<'a>,
+    /// Drop combining marks after normalization (the `NfdStripMarks` tail).
+    strip_marks: bool,
+    casefold: bool,
+    /// The in-flight lowercase expansion of the current source char (`to_lowercase` may
+    /// yield up to three code points, e.g. `İ` → `i̇`).
+    pending: Option<std::char::ToLowercase>,
+}
+
+/// The streaming normalization adaptor backing [`PreparedChars`] — one variant per form
+/// (`assume_normalized` collapses to [`NormKind::Raw`]). All yield `char`.
+enum NormKind<'a> {
+    Nfc(Recompositions<Chars<'a>>),
+    Nfd(Decompositions<Chars<'a>>),
+    Raw(Chars<'a>),
+}
+
+impl<'a> PreparedChars<'a> {
+    fn new(text: &'a str, norm: &Norm) -> Self {
+        let (kind, strip_marks) = if norm.assume_normalized {
+            // Trust the caller's form; only mark-stripping is still honored (it is not a
+            // normalized form the input could already be in).
+            match norm.normalization {
+                Normalization::NfdStripMarks => (NormKind::Raw(text.chars()), true),
+                _ => (NormKind::Raw(text.chars()), false),
+            }
+        } else {
+            match norm.normalization {
+                Normalization::Nfc => (NormKind::Nfc(text.nfc()), false),
+                Normalization::Nfd => (NormKind::Nfd(text.nfd()), false),
+                Normalization::NfdStripMarks => (NormKind::Nfd(text.nfd()), true),
+                Normalization::None => (NormKind::Raw(text.chars()), false),
+            }
+        };
+        PreparedChars {
+            kind,
+            strip_marks,
+            casefold: norm.casefold,
+            pending: None,
+        }
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = (self.chars.len() + 1).saturating_sub(self.pos + N);
-        (0, Some(remaining))
+    /// The next normalized (mark-stripped) char before casefolding.
+    fn raw_next(&mut self) -> Option<char> {
+        loop {
+            let c = match &mut self.kind {
+                NormKind::Nfc(it) => it.next(),
+                NormKind::Nfd(it) => it.next(),
+                NormKind::Raw(it) => it.next(),
+            }?;
+            if self.strip_marks && is_combining_mark(c) {
+                continue;
+            }
+            return Some(c);
+        }
+    }
+}
+
+impl Iterator for PreparedChars<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        loop {
+            if let Some(p) = &mut self.pending {
+                if let Some(c) = p.next() {
+                    return Some(c);
+                }
+                self.pending = None;
+            }
+            let c = self.raw_next()?;
+            if self.casefold {
+                let mut lc = c.to_lowercase();
+                // `to_lowercase` yields at least one char; return the first, stash the rest.
+                if let Some(first) = lc.next() {
+                    self.pending = Some(lc);
+                    return Some(first);
+                }
+            } else {
+                return Some(c);
+            }
+        }
+    }
+}
+
+/// Conjoining Hangul Vowel/Trailing jamo (U+1161..=U+1175, U+11A8..=U+11C2). Like combining
+/// marks these attach to a preceding character — NFC composes a leading jamo plus these into
+/// one syllable — so [`Norm::for_each_normalized_char`] keeps them in the same cluster;
+/// splitting the composition would lose the token for that region.
+fn is_conjoining_jamo(c: char) -> bool {
+    matches!(c, '\u{1161}'..='\u{1175}' | '\u{11A8}'..='\u{11C2}')
+}
+
+/// A plain fixed-width n-gram tokenizer: an `N`-code-point sliding window over a normalized,
+/// optionally case-folded form of the text, with no script segmentation. Pick it when a
+/// corpus is single-script; otherwise prefer [`DefaultTokenizer`].
+///
+/// `N` must be in `1..=3` (the term-encoding ceiling) — `NgramTokenizer<4>::new()` is a
+/// compile error. Use the aliases [`TrigramTokenizer`] (`N = 3`) and [`BigramTokenizer`]
+/// (`N = 2`).
+///
+/// ```
+/// use trifle::tokenize::{Tokenizer, TrigramTokenizer};
+///
+/// let tok = TrigramTokenizer::new();
+/// let grams: Vec<String> = tok.tokenize("Hello").map(|g| g.to_string()).collect();
+/// assert_eq!(grams, ["hel", "ell", "llo"]);
+/// ```
+#[derive(Clone, Debug)]
+pub struct NgramTokenizer<const N: usize> {
+    norm: Norm,
+}
+
+/// A 3-code-point sliding-window tokenizer (no script segmentation).
+pub type TrigramTokenizer = NgramTokenizer<3>;
+/// A 2-code-point sliding-window tokenizer (no script segmentation).
+pub type BigramTokenizer = NgramTokenizer<2>;
+
+impl<const N: usize> Default for NgramTokenizer<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> NgramTokenizer<N> {
+    /// A tokenizer with the default behavior: NFC normalization + Unicode lowercasing.
+    pub fn new() -> Self {
+        const {
+            assert!(
+                N >= 1 && N <= 3,
+                "NgramTokenizer supports N in 1..=3 (the 3-code-point term-encoding ceiling)"
+            )
+        }
+        NgramTokenizer {
+            norm: Norm::default(),
+        }
+    }
+
+    /// Start a [builder](NgramTokenizerBuilder) to customize normalization/casefolding.
+    pub fn builder() -> NgramTokenizerBuilder<N> {
+        NgramTokenizerBuilder { inner: Self::new() }
+    }
+
+    /// The number of code points per window.
+    pub const fn window(&self) -> usize {
+        N
+    }
+}
+
+impl<const N: usize> Tokenizer for NgramTokenizer<N> {
+    type Token = Ngram<N>;
+
+    fn tokenize<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Self::Token> + 'a {
+        NgramWindows::<N> {
+            chars: self.norm.prepared(text),
+            win: ['\0'; N],
+            filled: 0,
+        }
+    }
+
+    fn fingerprint(&self) -> u64 {
+        // FNV-1a over a canonical encoding of the behavior: a tag, the window width, and the
+        // normalization bytes. `N` is hashed at full width so two widths never collide.
+        let mut bytes = Vec::with_capacity(2 + 8 + 3);
+        bytes.extend_from_slice(b"ng");
+        bytes.extend_from_slice(&(N as u64).to_le_bytes());
+        bytes.extend_from_slice(&self.norm.fingerprint_bytes());
+        fnv1a_64(&bytes)
+    }
+
+    fn span(&self, text: &str, tokens: &[&str]) -> Option<(usize, usize)> {
+        let mut first: Option<usize> = None;
+        let mut last = 0usize;
+        let mut win_ch = ['\0'; N];
+        let mut win_start = [0usize; N];
+        let mut win_end = [0usize; N];
+        let mut filled = 0usize;
+        self.norm.for_each_normalized_char(text, |ch, cs, ce| {
+            if N > 1 {
+                win_ch.copy_within(1..N, 0);
+                win_start.copy_within(1..N, 0);
+                win_end.copy_within(1..N, 0);
+            }
+            win_ch[N - 1] = ch;
+            win_start[N - 1] = cs;
+            win_end[N - 1] = ce;
+            filled += 1;
+            if filled >= N {
+                if let Some(g) = Ngram::<N>::from_chars(&win_ch) {
+                    if tokens.contains(&g.as_str()) {
+                        first.get_or_insert(win_start[0]);
+                        last = win_end[N - 1];
+                    }
+                }
+            }
+        });
+        first.map(|f| (f, last))
+    }
+}
+
+/// Lazy fixed-`N` sliding window over a [`PreparedChars`] stream. Owns the source, so it
+/// satisfies the [`Tokenizer`] lifetime without a separate buffer.
+struct NgramWindows<'a, const N: usize> {
+    chars: PreparedChars<'a>,
+    /// The last up-to-`N` code points (a small ring shifted left as it fills).
+    win: [char; N],
+    /// How many of `win`'s slots are populated (saturates at `N`).
+    filled: usize,
+}
+
+impl<const N: usize> Iterator for NgramWindows<'_, N> {
+    type Item = Ngram<N>;
+
+    fn next(&mut self) -> Option<Ngram<N>> {
+        loop {
+            let c = self.chars.next()?;
+            if self.filled < N {
+                self.win[self.filled] = c;
+                self.filled += 1;
+            } else {
+                self.win.copy_within(1..N, 0);
+                self.win[N - 1] = c;
+            }
+            if self.filled == N {
+                // For N ≤ 3 a window is ≤ 12 bytes, so `from_chars` always succeeds.
+                if let Some(g) = Ngram::<N>::from_chars(&self.win) {
+                    return Some(g);
+                }
+            }
+        }
     }
 }
 
@@ -532,68 +592,67 @@ impl<const N: usize, const CAP: usize> Iterator for NgramWindows<N, CAP> {
 ///     .build();
 /// ```
 #[derive(Clone, Debug)]
-pub struct NgramTokenizerBuilder<const N: usize, const CAP: usize> {
-    inner: NgramTokenizer<N, CAP>,
+pub struct NgramTokenizerBuilder<const N: usize> {
+    inner: NgramTokenizer<N>,
 }
 
-impl<const N: usize, const CAP: usize> NgramTokenizerBuilder<N, CAP> {
+impl<const N: usize> NgramTokenizerBuilder<N> {
     /// Set the normalization form (default [`Normalization::Nfc`]).
     pub fn normalization(mut self, normalization: Normalization) -> Self {
-        self.inner.normalization = normalization;
+        self.inner.norm.normalization = normalization;
         self
     }
 
-    /// Enable or disable Unicode lowercasing (default `true`). Disabling skips the
-    /// casefold pass when the caller guarantees inputs are already folded.
+    /// Enable or disable Unicode lowercasing (default `true`).
     pub fn casefold(mut self, casefold: bool) -> Self {
-        self.inner.casefold = casefold;
+        self.inner.norm.casefold = casefold;
         self
     }
 
     /// Trust that input is already in the chosen normalization form and skip the
-    /// normalization pass (default `false`). Sound only if the guarantee holds for
-    /// *both* writes and queries.
+    /// normalization pass (default `false`). Sound only if the guarantee holds for *both*
+    /// writes and queries.
     pub fn assume_normalized(mut self, assume_normalized: bool) -> Self {
-        self.inner.assume_normalized = assume_normalized;
+        self.inner.norm.assume_normalized = assume_normalized;
         self
     }
 
     /// Finish building the tokenizer.
-    pub fn build(self) -> NgramTokenizer<N, CAP> {
+    pub fn build(self) -> NgramTokenizer<N> {
         self.inner
     }
 }
 
-/// A script-segmented n-gram tokenizer (§6): it splits text into maximal same-script
-/// runs and tokenizes each run with a script-appropriate window size, so a mixed-script
-/// document indexes correctly without manufacturing cross-script grams at the seams.
+/// The tokenizer trifle ships and defaults to: it splits a normalized, optionally
+/// case-folded form of the text into maximal same-script runs and slides a script-appropriate
+/// window over each run, emitting an inline [`Gram`] per window.
 ///
-/// `Common`/`Inherited` codepoints (digits, punctuation, combining marks) are
-/// transparent — they extend the current run rather than breaking it. The default
-/// [`WindowPolicy`] uses bigrams for the dense CJK scripts (Han / Hiragana / Katakana /
-/// Hangul) and trigrams elsewhere. Its [`Token`](Tokenizer::Token) is a [`Trigram`]
-/// (which also holds bigrams). Grams are capped at 3 codepoints (the term-encoding
-/// storage ceiling). [`span`](Tokenizer::span) currently returns `None`; the
-/// default-trigram tokenizer keeps its span support.
+/// `Common`/`Inherited` code points (digits, punctuation, combining marks) are transparent
+/// — they inherit the current run's script rather than breaking it, so no run boundary falls
+/// in the middle of a word; a leading run of only `Common` code points forms its own
+/// `Common`-class run. The default [`WindowPolicy`] uses bigrams for the dense CJK scripts
+/// (Han / Hiragana / Katakana / Hangul) and trigrams elsewhere.
+///
+/// Construct with [`new`](Self::new) for the defaults (NFC + Unicode lowercase) or
+/// [`builder`](Self::builder) to change normalization / casefolding.
 ///
 /// ```
-/// use trifle::tokenize::{ScriptTokenizer, Tokenizer};
+/// use trifle::tokenize::{DefaultTokenizer, Tokenizer};
 ///
-/// let tok = ScriptTokenizer::new();
-/// // "ab漢字" → Latin trigram-window run "ab" (too short, no gram) + Han bigram "漢字".
+/// let tok = DefaultTokenizer::new();
+/// // "ab漢字" → Latin trigram run "ab" (too short, no gram) + Han bigram "漢字".
 /// let grams: Vec<String> = tok.tokenize("ab漢字").map(|g| g.to_string()).collect();
 /// assert_eq!(grams, ["漢字"]);
 /// ```
 #[derive(Clone, Debug)]
-pub struct ScriptTokenizer {
-    normalization: Normalization,
-    casefold: bool,
-    assume_normalized: bool,
+pub struct DefaultTokenizer {
+    norm: Norm,
     policy: WindowPolicy,
 }
 
-/// Per-script-class window sizes for [`ScriptTokenizer`], indexed by the script-tag byte.
-/// The default is trigrams everywhere except the dense CJK scripts, which take bigrams.
+/// Per-script-class window sizes for [`DefaultTokenizer`], indexed by the script-class byte
+/// (`unicode_script::Script as u8`, the same byte the term encoding stores). The default is
+/// trigrams everywhere except the dense CJK scripts, which take bigrams.
 #[derive(Clone, Debug)]
 pub struct WindowPolicy {
     sizes: [u8; 256],
@@ -602,136 +661,208 @@ pub struct WindowPolicy {
 impl Default for WindowPolicy {
     fn default() -> Self {
         let mut sizes = [3u8; 256];
-        for tag in [
-            crate::term::TAG_HAN,
-            crate::term::TAG_HIRAGANA,
-            crate::term::TAG_KATAKANA,
-            crate::term::TAG_HANGUL,
+        for s in [
+            Script::Han,
+            Script::Hiragana,
+            Script::Katakana,
+            Script::Hangul,
         ] {
-            sizes[tag as usize] = 2;
+            sizes[s as usize] = 2;
         }
         WindowPolicy { sizes }
     }
 }
 
-impl Default for ScriptTokenizer {
+impl Default for DefaultTokenizer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ScriptTokenizer {
-    /// A script tokenizer with the default behavior: NFC + Unicode lowercasing and the
-    /// default (CJK-bigram, else-trigram) window policy.
+impl DefaultTokenizer {
+    /// A tokenizer with the default behavior: NFC + Unicode lowercasing and the default
+    /// (CJK-bigram, else-trigram) window policy.
     pub fn new() -> Self {
-        ScriptTokenizer {
-            normalization: Normalization::Nfc,
-            casefold: true,
-            assume_normalized: false,
+        DefaultTokenizer {
+            norm: Norm::default(),
             policy: WindowPolicy::default(),
         }
     }
 
-    /// Start a [builder](ScriptTokenizerBuilder) to customize normalization/casefolding.
-    pub fn builder() -> ScriptTokenizerBuilder {
-        ScriptTokenizerBuilder { inner: Self::new() }
-    }
-
-    /// Emit the windows of one same-script run into `out`. The window size is the run's
-    /// script-class policy; a `Common`-only run uses the common-class size.
-    fn emit_run(&self, out: &mut Vec<Trigram>, run: &[char], run_script: Option<Script>) {
-        let tag = match run_script {
-            Some(s) => crate::term::script_tag(s),
-            None => crate::term::TAG_COMMON,
-        };
-        let n = self.policy.sizes[tag as usize] as usize;
-        if n == 0 || run.len() < n {
-            return;
-        }
-        for w in run.windows(n) {
-            if let Some(g) = Trigram::from_chars(w) {
-                out.push(g);
-            }
-        }
+    /// Start a [builder](DefaultTokenizerBuilder) to customize normalization/casefolding.
+    pub fn builder() -> DefaultTokenizerBuilder {
+        DefaultTokenizerBuilder { inner: Self::new() }
     }
 }
 
-impl Tokenizer for ScriptTokenizer {
-    type Token = Trigram;
+impl Tokenizer for DefaultTokenizer {
+    type Token = Gram;
 
     fn tokenize<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Self::Token> + 'a {
-        let chars = prepare_chars(
-            text,
-            self.normalization,
-            self.casefold,
-            self.assume_normalized,
-        );
-        let mut out: Vec<Trigram> = Vec::new();
-        // Walk the chars, breaking a run only at a change of *strong* script;
-        // Common/Inherited codepoints are transparent and stay in the current run.
-        let mut start = 0usize;
-        let mut run_script: Option<Script> = None;
-        for (i, &c) in chars.iter().enumerate() {
-            match c.script() {
-                Script::Common | Script::Inherited => {}
-                s => match run_script {
-                    None => run_script = Some(s),
-                    Some(cur) if cur == s => {}
-                    Some(_) => {
-                        self.emit_run(&mut out, &chars[start..i], run_script);
-                        start = i;
-                        run_script = Some(s);
-                    }
-                },
-            }
+        GramTokens {
+            chars: self.norm.prepared(text),
+            sizes: self.policy.sizes,
+            win: ['\0'; 3],
+            win_len: 0,
+            class: None,
+            n: 0,
         }
-        self.emit_run(&mut out, &chars[start..], run_script);
-        out.into_iter()
     }
 
     fn fingerprint(&self) -> u64 {
-        // FNV-1a over a canonical encoding of the behavior: a tag, normalization,
-        // casefold, assume_normalized, the window policy, and a layout-version byte — so a
-        // change to segmentation/window sizing forces a rebuild.
+        // FNV-1a over a canonical encoding of the behavior: a tag, the normalization bytes,
+        // the window policy, and a layout-version byte — so a change to segmentation/window
+        // sizing forces a rebuild.
         let mut bytes = Vec::with_capacity(3 + 3 + 256 + 1);
         bytes.extend_from_slice(b"scr");
-        bytes.push(self.normalization.code());
-        bytes.push(self.casefold as u8);
-        bytes.push(self.assume_normalized as u8);
+        bytes.extend_from_slice(&self.norm.fingerprint_bytes());
         bytes.extend_from_slice(&self.policy.sizes);
         bytes.push(1); // encoding/layout version
         fnv1a_64(&bytes)
     }
+
+    fn span(&self, text: &str, tokens: &[&str]) -> Option<(usize, usize)> {
+        let sizes = self.policy.sizes;
+        let mut first: Option<usize> = None;
+        let mut last = 0usize;
+        let mut win_ch = ['\0'; 3];
+        let mut win_start = [0usize; 3];
+        let mut win_end = [0usize; 3];
+        let mut win_len = 0usize;
+        let mut class: Option<u8> = None;
+        let mut n = 0usize;
+        self.norm.for_each_normalized_char(text, |ch, cs, ce| {
+            let class_c = script_class_of(ch, class);
+            if Some(class_c) != class {
+                class = Some(class_c);
+                n = (sizes[class_c as usize] as usize).min(3);
+                win_len = 0;
+            }
+            if n == 0 {
+                return;
+            }
+            if win_len < n {
+                win_ch[win_len] = ch;
+                win_start[win_len] = cs;
+                win_end[win_len] = ce;
+                win_len += 1;
+            } else {
+                win_ch.copy_within(1..n, 0);
+                win_start.copy_within(1..n, 0);
+                win_end.copy_within(1..n, 0);
+                win_ch[n - 1] = ch;
+                win_start[n - 1] = cs;
+                win_end[n - 1] = ce;
+            }
+            if win_len == n {
+                if let Some(g) = Gram::from_chars(&win_ch[..n]) {
+                    if tokens.contains(&g.as_str()) {
+                        first.get_or_insert(win_start[0]);
+                        last = win_end[n - 1];
+                    }
+                }
+            }
+        });
+        first.map(|f| (f, last))
+    }
 }
 
-/// Builder for [`ScriptTokenizer`].
+/// The script class of `ch` for run segmentation: its strong script as `Script as u8`, or —
+/// for transparent `Common`/`Inherited` code points — the current run's class (or `Common`
+/// when no run has started yet).
+#[inline]
+fn script_class_of(ch: char, current: Option<u8>) -> u8 {
+    match ch.script() {
+        Script::Common | Script::Inherited => current.unwrap_or(Script::Common as u8),
+        s => s as u8,
+    }
+}
+
+/// Lazy script-segmented window over a [`PreparedChars`] stream. Maintains a sliding window
+/// that resets at every change of script class and whose width is that class's policy; a
+/// leading `Common` run uses the `Common` width. Owns the source (no separate buffer).
+struct GramTokens<'a> {
+    chars: PreparedChars<'a>,
+    /// The window policy, copied in (a `[u8; 256]` is `Copy`).
+    sizes: [u8; 256],
+    /// The current run's last up-to-`n` code points.
+    win: [char; 3],
+    win_len: usize,
+    /// The current run's script class, or `None` before the first code point.
+    class: Option<u8>,
+    /// The current run's window width (`1..=3`), `0` before the first code point.
+    n: usize,
+}
+
+impl Iterator for GramTokens<'_> {
+    type Item = Gram;
+
+    fn next(&mut self) -> Option<Gram> {
+        loop {
+            let c = self.chars.next()?;
+            let class_c = script_class_of(c, self.class);
+            if Some(class_c) != self.class {
+                // Run break: start a fresh window of the new class's width.
+                self.class = Some(class_c);
+                self.n = (self.sizes[class_c as usize] as usize).min(3);
+                self.win_len = 0;
+            }
+            if self.n == 0 {
+                continue;
+            }
+            if self.win_len < self.n {
+                self.win[self.win_len] = c;
+                self.win_len += 1;
+            } else {
+                self.win.copy_within(1..self.n, 0);
+                self.win[self.n - 1] = c;
+            }
+            if self.win_len == self.n {
+                if let Some(g) = Gram::from_chars(&self.win[..self.n]) {
+                    return Some(g);
+                }
+            }
+        }
+    }
+}
+
+/// Builder for [`DefaultTokenizer`].
+///
+/// ```
+/// use trifle::tokenize::{DefaultTokenizer, Normalization};
+///
+/// // Accent-insensitive, still lowercased.
+/// let tok = DefaultTokenizer::builder()
+///     .normalization(Normalization::NfdStripMarks)
+///     .build();
+/// ```
 #[derive(Clone, Debug)]
-pub struct ScriptTokenizerBuilder {
-    inner: ScriptTokenizer,
+pub struct DefaultTokenizerBuilder {
+    inner: DefaultTokenizer,
 }
 
-impl ScriptTokenizerBuilder {
+impl DefaultTokenizerBuilder {
     /// Set the normalization form (default [`Normalization::Nfc`]).
     pub fn normalization(mut self, normalization: Normalization) -> Self {
-        self.inner.normalization = normalization;
+        self.inner.norm.normalization = normalization;
         self
     }
 
     /// Enable or disable Unicode lowercasing (default `true`).
     pub fn casefold(mut self, casefold: bool) -> Self {
-        self.inner.casefold = casefold;
+        self.inner.norm.casefold = casefold;
         self
     }
 
     /// Trust that input is already in the chosen normalization form (default `false`).
     /// Sound only if the guarantee holds for *both* writes and queries.
     pub fn assume_normalized(mut self, assume_normalized: bool) -> Self {
-        self.inner.assume_normalized = assume_normalized;
+        self.inner.norm.assume_normalized = assume_normalized;
         self
     }
 
     /// Finish building the tokenizer.
-    pub fn build(self) -> ScriptTokenizer {
+    pub fn build(self) -> DefaultTokenizer {
         self.inner
     }
 }
@@ -758,6 +889,8 @@ mod tests {
         tok.tokenize(text).map(|g| g.borrow().to_string()).collect()
     }
 
+    // ----- NgramTokenizer (fixed width) ------------------------------------------
+
     #[test]
     fn trigram_windows_lowercased_nfc() {
         let tok = TrigramTokenizer::new();
@@ -773,17 +906,33 @@ mod tests {
     }
 
     #[test]
-    fn bigram_and_quadgram_aliases() {
+    fn bigram_alias() {
         assert_eq!(grams(&BigramTokenizer::new(), "abcd"), ["ab", "bc", "cd"]);
-        assert_eq!(grams(&QuadgramTokenizer::new(), "abcde"), ["abcd", "bcde"]);
     }
+
+    #[test]
+    fn ngram_does_not_script_segment() {
+        // The plain n-gram tokenizer windows straight across a script boundary (unlike
+        // DefaultTokenizer); a CJK + Latin trigram straddles by design.
+        let tok = TrigramTokenizer::new();
+        assert_eq!(grams(&tok, "ab漢"), ["ab漢"]);
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_width() {
+        assert_ne!(
+            TrigramTokenizer::new().fingerprint(),
+            BigramTokenizer::new().fingerprint()
+        );
+    }
+
+    // ----- shared normalization --------------------------------------------------
 
     #[test]
     fn nfc_and_nfd_query_share_grams_under_strip_marks() {
         let tok = TrigramTokenizer::builder()
             .normalization(Normalization::NfdStripMarks)
             .build();
-        // "café" (composed) and "cafe" should share the same trigram stream.
         assert_eq!(grams(&tok, "café"), grams(&tok, "cafe"));
         assert_eq!(grams(&tok, "café"), ["caf", "afe"]);
     }
@@ -809,81 +958,11 @@ mod tests {
     }
 
     #[test]
-    fn ngram_borrow_probes_hashmap_by_str() {
-        use std::collections::HashMap;
-        let mut m: HashMap<Trigram, i32> = HashMap::new();
-        m.insert(Trigram::try_from_str("abc").unwrap(), 7);
-        assert_eq!(m.get("abc"), Some(&7));
-    }
-
-    #[test]
-    fn ngram_ord_matches_str_ord() {
-        let a = Trigram::try_from_str("abc").unwrap();
-        let b = Trigram::try_from_str("abd").unwrap();
-        assert!(a < b);
-        assert_eq!(a.cmp(&b), "abc".cmp("abd"));
-    }
-
-    #[test]
-    fn fingerprint_changes_with_behavior_and_is_stable() {
-        let a = TrigramTokenizer::new().fingerprint();
-        let b = TrigramTokenizer::new().fingerprint();
-        assert_eq!(a, b, "same behavior -> same fingerprint");
-
-        let nfd = TrigramTokenizer::builder()
-            .normalization(Normalization::Nfd)
-            .build()
-            .fingerprint();
-        assert_ne!(a, nfd, "normalization change -> different fingerprint");
-
-        let no_fold = TrigramTokenizer::builder()
-            .casefold(false)
-            .build()
-            .fingerprint();
-        assert_ne!(a, no_fold, "casefold change -> different fingerprint");
-
-        // Window size is part of behavior too.
-        assert_ne!(a, BigramTokenizer::new().fingerprint());
-
-        // `assume_normalized` changes the token stream on non-normalized input, so it
-        // must change the fingerprint.
-        let assume = TrigramTokenizer::builder()
-            .assume_normalized(true)
-            .build()
-            .fingerprint();
-        assert_ne!(
-            a, assume,
-            "assume_normalized change -> different fingerprint"
-        );
-    }
-
-    #[test]
-    fn fingerprint_distinguishes_cap_at_equal_window() {
-        // Same window N=3, different byte capacity: must not collide (the old `as u8`
-        // encoding made CAP=12 and CAP=268 hash equal — but CAP=268 is now a compile
-        // error, so compare two *legal* widths that differ only in CAP).
-        let trigram = NgramTokenizer::<3, 12>::new().fingerprint();
-        let wide = NgramTokenizer::<3, 16>::new().fingerprint();
-        assert_ne!(trigram, wide, "CAP is part of the fingerprint");
-    }
-
-    #[test]
-    fn assume_normalized_matches_the_normalizing_path_on_conforming_input() {
-        // On input already in NFC, the skip must produce the SAME tokens as the
-        // normalizing path — proving it is a sound shortcut, not a behavior change.
-        let normalizing = TrigramTokenizer::new();
-        let assuming = TrigramTokenizer::builder().assume_normalized(true).build();
-        let nfc_input = "caf\u{e9} r\u{e9}sum\u{e9}"; // precomposed, already NFC
-        assert_eq!(grams(&normalizing, nfc_input), grams(&assuming, nfc_input));
-    }
-
-    #[test]
     fn length_changing_casefold_is_handled() {
-        // 'İ'.to_lowercase() == ['i', '\u{307}'] — one source char folds to two.
+        // 'İ'.to_lowercase() == ['i', '\u{307}'] — one source char folds to two; the online
+        // casefold expansion must thread both into the window stream.
         let tok = TrigramTokenizer::new();
-        let grams = grams(&tok, "İst");
-        // The fold expands, so the trigram stream starts at the folded form.
-        assert_eq!(grams, ["i\u{307}s", "\u{307}st"]);
+        assert_eq!(grams(&tok, "İst"), ["i\u{307}s", "\u{307}st"]);
     }
 
     #[test]
@@ -891,44 +970,135 @@ mod tests {
         let tok = TrigramTokenizer::builder()
             .normalization(Normalization::NfdStripMarks)
             .build();
-        // İ -> NFD [I, ̇ ] -> strip -> I -> fold -> i. So İ/I/i all collapse.
         assert_eq!(grams(&tok, "İab"), grams(&tok, "Iab"));
         assert_eq!(grams(&tok, "İab"), grams(&tok, "iab"));
         assert_eq!(grams(&tok, "İab"), ["iab"]);
     }
 
     #[test]
-    fn from_chars_rejects_a_window_wider_than_cap() {
-        // Three 4-byte code points = 12 bytes: fits Ngram<12>, not Ngram<9>.
-        let wide = ['🚀', '🎉', '😀'];
-        assert!(Ngram::<12>::from_chars(&wide).is_some());
-        assert!(Ngram::<9>::from_chars(&wide).is_none());
+    fn assume_normalized_matches_the_normalizing_path_on_conforming_input() {
+        let normalizing = TrigramTokenizer::new();
+        let assuming = TrigramTokenizer::builder().assume_normalized(true).build();
+        let nfc_input = "caf\u{e9} r\u{e9}sum\u{e9}"; // precomposed, already NFC
+        assert_eq!(grams(&normalizing, nfc_input), grams(&assuming, nfc_input));
     }
 
     #[test]
-    fn undersized_cap_alias_silently_drops_only_the_too_wide_window() {
-        // Ngram<9> can't hold a 3-emoji window (12 bytes); it is dropped, the rest kept.
-        let tok = NgramTokenizer::<3, 9>::new();
-        // "🚀🎉😀ab": windows [🚀🎉😀](dropped), [🎉😀a], [😀ab].
-        assert_eq!(grams(&tok, "🚀🎉😀ab"), ["🎉😀a", "😀ab"]);
+    fn assume_normalized_skips_transform_but_still_casefolds() {
+        let tok = TrigramTokenizer::builder().assume_normalized(true).build();
+        assert_eq!(grams(&tok, "ABC"), ["abc"]);
     }
+
+    #[test]
+    fn fingerprint_changes_with_behavior_and_is_stable() {
+        let a = DefaultTokenizer::new().fingerprint();
+        assert_eq!(a, DefaultTokenizer::new().fingerprint());
+        assert_ne!(
+            a,
+            DefaultTokenizer::builder()
+                .normalization(Normalization::Nfd)
+                .build()
+                .fingerprint()
+        );
+        assert_ne!(
+            a,
+            DefaultTokenizer::builder()
+                .casefold(false)
+                .build()
+                .fingerprint()
+        );
+        assert_ne!(
+            a,
+            DefaultTokenizer::builder()
+                .assume_normalized(true)
+                .build()
+                .fingerprint()
+        );
+        // The script tokenizer and the plain trigram tokenizer must not collide.
+        assert_ne!(a, TrigramTokenizer::new().fingerprint());
+    }
+
+    // ----- Ngram value type ------------------------------------------------------
+
+    #[test]
+    fn gram_borrow_probes_hashmap_by_str() {
+        use std::collections::HashMap;
+        let mut m: HashMap<Gram, i32> = HashMap::new();
+        m.insert(Gram::try_from_str("abc").unwrap(), 7);
+        assert_eq!(m.get("abc"), Some(&7));
+    }
+
+    #[test]
+    fn gram_ord_matches_str_ord() {
+        let a = Gram::try_from_str("abc").unwrap();
+        let b = Gram::try_from_str("abd").unwrap();
+        assert!(a < b);
+        assert_eq!(a.cmp(&b), "abc".cmp("abd"));
+    }
+
+    #[test]
+    fn gram_term_round_trips_through_into_term() {
+        // The blanket IntoTerm packs a token into a Term via its UTF-8 form; a Gram and the
+        // equal &str must pack to the same Term (so write-path interning by token agrees
+        // with query-path interning by string).
+        let g = Gram::try_from_str("abc").unwrap();
+        assert!(g.term().is_some());
+        assert_eq!(g.term(), "abc".term());
+    }
+
+    #[test]
+    fn from_chars_rejects_a_window_wider_than_cap() {
+        // Three 4-byte code points = 12 bytes: exactly fills the buffer; a fourth overflows.
+        assert!(Gram::from_chars(&['🚀', '🎉', '😀']).is_some());
+        assert!(Gram::from_chars(&['🚀', '🎉', '😀', '🔥']).is_none());
+    }
+
+    // ----- DefaultTokenizer (script segmentation) --------------------------------
+
+    #[test]
+    fn segments_by_script_with_no_cross_script_grams() {
+        let tok = DefaultTokenizer::new();
+        let g = grams(&tok, "hello漢字");
+        assert!(g.contains(&"hel".to_string()));
+        assert!(g.contains(&"llo".to_string()));
+        assert!(g.contains(&"漢字".to_string()));
+        assert!(g.iter().all(|t| !t.contains('漢') || t == "漢字"));
+    }
+
+    #[test]
+    fn common_codepoints_inherit_the_run_script() {
+        let tok = DefaultTokenizer::new();
+        // An interior digit is Common: it inherits the Latin run rather than splitting it.
+        assert_eq!(grams(&tok, "a1b"), ["a1b"]);
+    }
+
+    #[test]
+    fn leading_common_run_is_its_own_class() {
+        let tok = DefaultTokenizer::new();
+        // "12漢字": "12" is a leading Common (trigram) run — too short, no gram — then the
+        // Han bigram. No "2漢" gram straddles the Common→Han seam.
+        assert_eq!(grams(&tok, "12漢字"), ["漢字"]);
+    }
+
+    #[test]
+    fn uses_bigrams_for_cjk() {
+        let tok = DefaultTokenizer::new();
+        assert_eq!(grams(&tok, "漢字漢"), ["漢字", "字漢"]);
+    }
+
+    // ----- span -------------------------------------------------------------------
 
     #[test]
     fn span_brackets_first_through_last_occurrence() {
         let tok = TrigramTokenizer::new();
-        // "abc" occurs at byte 0 and byte 9; the span runs first-start..last-end.
         assert_eq!(tok.span("abcZZZZZZabc", &["abc"]), Some((0, 12)));
-        // Single occurrence is tight around the word.
         assert_eq!(tok.span("zz abc zz", &["abc"]), Some((3, 6)));
-        // No matching token -> no span.
         assert_eq!(tok.span("abcdef", &["zzz"]), None);
     }
 
     #[test]
     fn span_recovers_decomposed_input_under_nfc() {
-        // Stored decomposed; the index composes the token "afé". The cluster-based
-        // span must still bracket it (the old per-char span returned None here).
-        let tok = TrigramTokenizer::new();
+        let tok = DefaultTokenizer::new();
         let stored = "Xcafe\u{301}Y"; // X c a f e ́ Y
         let token: String = tok.tokenize(stored).map(|g| g.to_string()).nth(2).unwrap();
         assert_eq!(token, "af\u{e9}"); // afé (composed)
@@ -941,38 +1111,29 @@ mod tests {
 
     #[test]
     fn span_recovers_noncanonically_ordered_marks_under_nfd() {
-        let tok = TrigramTokenizer::builder()
+        let tok = DefaultTokenizer::builder()
             .normalization(Normalization::Nfd)
             .build();
-        // q + acute(ccc 230) + dot-below(ccc 220) — given in non-canonical order.
-        let stored = "Xq\u{0301}\u{0323}Y";
-        // The tokenizer canonically reorders to q, dot-below, acute.
+        let stored = "Xq\u{0301}\u{0323}Y"; // q + acute(ccc 230) + dot-below(ccc 220)
         let tokens: Vec<String> = tok.tokenize(stored).map(|g| g.to_string()).collect();
         assert!(tokens.iter().any(|t| t.starts_with('q')));
-        // Whichever token contains 'q', span must bracket it (per-char would miss it).
         let qtok = tokens.iter().find(|t| t.starts_with('q')).unwrap();
         assert!(tok.span(stored, &[qtok.as_str()]).is_some());
     }
 
     #[test]
     fn span_recovers_conjoining_hangul_jamo_under_nfc() {
-        // Stored as conjoining jamo ᄀ ᅡ ᆨ (U+1100 U+1161 U+11A8); NFC composes them into
-        // the single syllable "각". A per-cluster pass that split at each jamo (they are
-        // starters, not combining marks) would never re-derive the composed token and
-        // would return None — so this is the Hangul regression for the cluster walker.
-        let tok = TrigramTokenizer::new();
-        let stored = "\u{1100}\u{1161}\u{11A8}xy"; // composes to "각xy"
+        // Two syllables, each stored as conjoining jamo ᄀ ᅡ ᆨ; NFC composes each into "각",
+        // giving "각각" — a Hangul bigram (one syllable alone is too short). A per-cluster
+        // pass that split at each jamo (they are starters, not combining marks) would never
+        // re-derive the composed syllables and would return None.
+        let tok = DefaultTokenizer::new();
+        let stored = "\u{1100}\u{1161}\u{11A8}\u{1100}\u{1161}\u{11A8}"; // "각각"
         let tokens: Vec<String> = tok.tokenize(stored).map(|g| g.to_string()).collect();
-        assert!(
-            tokens.iter().any(|t| t.starts_with('\u{ac01}')),
-            "{tokens:?}"
-        );
+        assert_eq!(tokens, ["각각"], "{tokens:?}");
         let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-        let (lo, hi) = tok
-            .span(stored, &refs)
-            .expect("a span for the composed match");
+        let (lo, hi) = tok.span(stored, &refs).expect("a span for the match");
         assert!(stored.is_char_boundary(lo) && stored.is_char_boundary(hi));
-        // The match brackets the whole jamo run through "xy".
         assert_eq!((lo, hi), (0, stored.len()));
     }
 
@@ -985,7 +1146,7 @@ mod tests {
             Normalization::NfdStripMarks,
             Normalization::None,
         ] {
-            let tok = TrigramTokenizer::builder().normalization(norm).build();
+            let tok = DefaultTokenizer::builder().normalization(norm).build();
             for input in inputs {
                 let tokens: Vec<String> = tok.tokenize(input).map(|g| g.to_string()).collect();
                 let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
@@ -995,68 +1156,9 @@ mod tests {
                         "span ({lo},{hi}) not on char boundaries for {input:?} / {norm:?}"
                     );
                     assert!(lo < hi && hi <= input.len());
-                    // A caller WILL slice this — it must not panic.
                     let _ = &input[lo..hi];
                 }
             }
         }
-    }
-
-    #[test]
-    fn assume_normalized_skips_transform_but_still_casefolds() {
-        let tok = TrigramTokenizer::builder().assume_normalized(true).build();
-        assert_eq!(grams(&tok, "ABC"), ["abc"]);
-    }
-
-    #[test]
-    fn ngram_roundtrips_through_sql_value() {
-        use rusqlite::types::{FromSql, ToSql, ValueRef};
-        let g = Trigram::try_from_str("xyz").unwrap();
-        let out = g.to_sql().unwrap();
-        // Re-read the bound text back into an Ngram.
-        let parsed = Trigram::column_result(ValueRef::Text(b"xyz")).unwrap();
-        assert_eq!(parsed, g);
-        // The bound value is the trigram text.
-        match out {
-            rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(t)) => assert_eq!(t, b"xyz"),
-            other => panic!("unexpected ToSql output: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn script_tokenizer_segments_by_script_with_no_cross_script_grams() {
-        let tok = ScriptTokenizer::new();
-        let g = grams(&tok, "hello漢字");
-        // Latin run -> trigrams; Han run -> one bigram.
-        assert!(g.contains(&"hel".to_string()));
-        assert!(g.contains(&"llo".to_string()));
-        assert!(g.contains(&"漢字".to_string()));
-        // No gram straddles the script boundary.
-        assert!(g.iter().all(|t| !t.contains('漢') || t == "漢字"));
-    }
-
-    #[test]
-    fn script_tokenizer_common_codepoints_are_transparent() {
-        let tok = ScriptTokenizer::new();
-        // A digit is Common: it stays in the Latin run rather than splitting it.
-        assert_eq!(grams(&tok, "a1b"), ["a1b"]);
-    }
-
-    #[test]
-    fn script_tokenizer_uses_bigrams_for_cjk() {
-        let tok = ScriptTokenizer::new();
-        assert_eq!(grams(&tok, "漢字漢"), ["漢字", "字漢"]);
-    }
-
-    #[test]
-    fn script_tokenizer_fingerprint_differs_from_ngram_and_is_stable() {
-        assert_eq!(
-            ScriptTokenizer::new().fingerprint(),
-            ScriptTokenizer::new().fingerprint()
-        );
-        assert_ne!(
-            ScriptTokenizer::new().fingerprint(),
-            TrigramTokenizer::new().fingerprint()
-        );
     }
 }

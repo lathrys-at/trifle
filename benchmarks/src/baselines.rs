@@ -17,7 +17,7 @@ use std::path::Path;
 use rusqlite::Connection;
 use trifle::store::Sidecar;
 use trifle::tokenize::TrigramTokenizer;
-use trifle::{Config, Effort, Index, SearchOpts};
+use trifle::{Config, Document, Effort, Index, Schema, SearchOpts};
 
 use crate::corpus::Corpus;
 
@@ -58,14 +58,23 @@ pub struct Trifle {
 impl Trifle {
     pub fn build(corpus: &Corpus, tuning: Tuning) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let index = Index::open_at(&dir.path().join("trifle.db"), Config::default()).unwrap();
-        let segs = corpus
+        // The bench corpora are single-script (Latin), so the plain trigram tokenizer is the
+        // right baseline; open with it explicitly rather than the script-segmenting default.
+        let backend = Sidecar::open(dir.path().join("trifle.db")).unwrap();
+        let index = Index::open(
+            backend,
+            TrigramTokenizer::new(),
+            Schema::flat(),
+            Config::default(),
+        )
+        .unwrap();
+        let docs = corpus
             .docs
             .iter()
-            .map(|d| trifle::Segment::new(d.id, "field", "body", d.text.clone()));
+            .map(|d| Document::new(d.id, vec![("body".to_string(), d.text.clone())]));
         // Bulk-load via rebuild (roaring accumulation, folded bases): the steady-state
-        // read shape, and far more memory-efficient than insert_batch at million-doc N.
-        index.rebuild(segs).unwrap();
+        // read shape, and far more memory-efficient than per-doc writes at million-doc N.
+        index.rebuild(docs).unwrap();
         Trifle {
             index,
             tuning,
@@ -105,10 +114,12 @@ impl Trifle {
     /// Search at an explicit [`Effort`] (rest of the tuning unchanged), best-first doc ids.
     pub fn search_effort(&self, query: &str, k: usize, effort: Effort) -> Vec<i64> {
         self.index
+            .reader()
+            .unwrap()
             .search(query, self.opts_effort(k, effort))
             .unwrap()
             .into_iter()
-            .map(|m| m.doc_id)
+            .map(|m| m.key.as_i64().unwrap())
             .collect()
     }
 
@@ -117,10 +128,12 @@ impl Trifle {
     /// is identical either way; this is the form the latency command times and scores.
     pub fn search_batch_effort(&self, queries: &[&str], k: usize, effort: Effort) -> Vec<Vec<i64>> {
         self.index
+            .reader()
+            .unwrap()
             .search_batch(queries, self.opts_effort(k, effort))
             .unwrap()
             .into_iter()
-            .map(|ms| ms.into_iter().map(|m| m.doc_id).collect())
+            .map(|ms| ms.into_iter().map(|m| m.key.as_i64().unwrap()).collect())
             .collect()
     }
 
@@ -138,10 +151,12 @@ impl Trifle {
             o = o.t_max(t);
         }
         self.index
+            .reader()
+            .unwrap()
             .search(query, o)
             .unwrap()
             .into_iter()
-            .map(|m| m.doc_id)
+            .map(|m| m.key.as_i64().unwrap())
             .collect()
     }
 
@@ -158,10 +173,12 @@ impl Trifle {
             o = o.min_shared(m);
         }
         self.index
+            .reader()
+            .unwrap()
             .search(query, o)
             .unwrap()
             .into_iter()
-            .map(|m| m.doc_id)
+            .map(|m| m.key.as_i64().unwrap())
             .collect()
     }
 }
@@ -172,18 +189,22 @@ impl Engine for Trifle {
     }
     fn search(&self, query: &str, k: usize) -> Vec<i64> {
         self.index
+            .reader()
+            .unwrap()
             .search(query, self.opts(k))
             .unwrap()
             .into_iter()
-            .map(|m| m.doc_id)
+            .map(|m| m.key.as_i64().unwrap())
             .collect()
     }
     fn search_batch(&self, queries: &[&str], k: usize) -> Vec<Vec<i64>> {
         self.index
+            .reader()
+            .unwrap()
             .search_batch(queries, self.opts(k))
             .unwrap()
             .into_iter()
-            .map(|ms| ms.into_iter().map(|m| m.doc_id).collect())
+            .map(|ms| ms.into_iter().map(|m| m.key.as_i64().unwrap()).collect())
             .collect()
     }
 }

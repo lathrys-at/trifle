@@ -5,18 +5,42 @@ mod common;
 use common::*;
 use std::path::Path;
 use trifle::store::Sidecar;
-use trifle::tokenize::{Normalization, TrigramTokenizer};
-use trifle::{Config, Index, SearchOpts};
+use trifle::tokenize::{DefaultTokenizer, Normalization};
+use trifle::{Config, Document, Index, Schema, SearchOpts};
 
-fn open_default(path: &Path, data_version: u64) -> Index<TrigramTokenizer, Sidecar> {
+fn open_default(path: &Path, data_version: u64) -> Index<DefaultTokenizer, Sidecar> {
     let backend = Sidecar::open(path).unwrap();
-    Index::open(backend, TrigramTokenizer::new(), Config::new(data_version)).unwrap()
+    Index::open(
+        backend,
+        DefaultTokenizer::new(),
+        Schema::flat(),
+        Config::new(data_version),
+    )
+    .unwrap()
 }
 
-fn segments() -> impl Iterator<Item = trifle::Segment> {
+/// Search a raw index handle (limit 5) via a reader lease.
+fn finds(idx: &Index<DefaultTokenizer, Sidecar>, query: &str) -> bool {
+    let hits = idx
+        .reader()
+        .unwrap()
+        .search(query, SearchOpts::new(5))
+        .unwrap();
+    hits.iter().any(|m| m.key.as_i64() == Some(1))
+}
+
+fn is_empty(idx: &Index<DefaultTokenizer, Sidecar>, query: &str) -> bool {
+    idx.reader()
+        .unwrap()
+        .search(query, SearchOpts::new(5))
+        .unwrap()
+        .is_empty()
+}
+
+fn documents() -> impl Iterator<Item = Document> {
     FIXTURE
         .iter()
-        .map(|(doc, text)| trifle::Segment::new(*doc, "field", "body", *text))
+        .map(|(doc, text)| Document::new(*doc, vec![("body".to_string(), (*text).to_string())]))
 }
 
 #[test]
@@ -26,10 +50,7 @@ fn reopen_with_same_versions_is_warm() {
     let path = h.db_path();
     drop(h.index);
     let idx = open_default(&path, 7);
-    assert!(hit(
-        &idx.search("quick brown fox", SearchOpts::new(5)).unwrap(),
-        1
-    ));
+    assert!(finds(&idx, "quick brown fox"));
     drop(h.dir);
 }
 
@@ -42,28 +63,17 @@ fn bumping_data_version_empties_the_cache() {
 
     let bumped = open_default(&path, 2);
     assert!(
-        bumped
-            .search("quick brown fox", SearchOpts::new(5))
-            .unwrap()
-            .is_empty(),
+        is_empty(&bumped, "quick brown fox"),
         "a data_version bump drops the cache to empty"
     );
     assert_eq!(bumped.stats().unwrap().segments, 0);
 
     // The caller repopulates via rebuild; afterwards a same-version reopen is warm.
-    bumped.rebuild(segments()).unwrap();
-    assert!(hit(
-        &bumped
-            .search("quick brown fox", SearchOpts::new(5))
-            .unwrap(),
-        1
-    ));
+    bumped.rebuild(documents()).unwrap();
+    assert!(finds(&bumped, "quick brown fox"));
     drop(bumped);
     let warm = open_default(&path, 2);
-    assert!(hit(
-        &warm.search("quick brown fox", SearchOpts::new(5)).unwrap(),
-        1
-    ));
+    assert!(finds(&warm, "quick brown fox"));
     drop(h.dir);
 }
 
@@ -76,14 +86,12 @@ fn changing_the_tokenizer_empties_the_cache() {
 
     // Reopen with a behaviorally-different tokenizer (different fingerprint).
     let backend = Sidecar::open(&path).unwrap();
-    let tok = TrigramTokenizer::builder()
+    let tok = DefaultTokenizer::builder()
         .normalization(Normalization::NfdStripMarks)
         .build();
-    let idx = Index::open(backend, tok, Config::default()).unwrap();
+    let idx = Index::open(backend, tok, Schema::flat(), Config::default()).unwrap();
     assert!(
-        idx.search("quick brown fox", SearchOpts::new(5))
-            .unwrap()
-            .is_empty(),
+        is_empty(&idx, "quick brown fox"),
         "a tokenizer change drops the cache (postings are keyed by the old tokenizer)"
     );
     drop(h.dir);
@@ -95,6 +103,25 @@ fn schema_version_is_stamped_and_observable() {
     let s = h.index.stats().unwrap();
     assert_eq!(s.schema_version, 2);
     assert_eq!(s.data_version, 0);
+}
+
+#[test]
+fn changing_the_schema_empties_the_cache() {
+    // A schema with the same tables but different *semantics* (a declared field instead
+    // of the flat default) has a different fingerprint, so it drops the cache.
+    let h = Harness::new();
+    load_fixture(&h);
+    let path = h.db_path();
+    drop(h.index);
+
+    let backend = Sidecar::open(&path).unwrap();
+    let schema = Schema::chunked().text("body").build().unwrap();
+    let idx = Index::open(backend, DefaultTokenizer::new(), schema, Config::default()).unwrap();
+    assert!(
+        is_empty(&idx, "quick brown fox"),
+        "a schema-fingerprint change drops the cache"
+    );
+    drop(h.dir);
 }
 
 #[test]
@@ -115,9 +142,7 @@ fn reverting_the_data_version_does_not_resurrect_data() {
     drop(open_default(&path, 2));
     let back = open_default(&path, 1);
     assert!(
-        back.search("quick brown fox", SearchOpts::new(5))
-            .unwrap()
-            .is_empty(),
+        is_empty(&back, "quick brown fox"),
         "reverting the data_version cannot bring the dropped cache back"
     );
     drop(h.dir);
@@ -130,7 +155,7 @@ fn a_partial_stamp_is_treated_as_drift() {
     let path = h.db_path();
     drop(h.index);
 
-    // Simulate a crash mid-stamp: delete one of the three version rows.
+    // Simulate a crash mid-stamp: delete one of the version rows.
     let raw = trifle::rusqlite::Connection::open(&path).unwrap();
     raw.execute("DELETE FROM meta WHERE key = 'data_version'", [])
         .unwrap();
@@ -138,10 +163,7 @@ fn a_partial_stamp_is_treated_as_drift() {
 
     let reopened = open_default(&path, 0);
     assert!(
-        reopened
-            .search("quick brown fox", SearchOpts::new(5))
-            .unwrap()
-            .is_empty(),
+        is_empty(&reopened, "quick brown fox"),
         "a half-written stamp must rebuild, never half-trust"
     );
     drop(h.dir);

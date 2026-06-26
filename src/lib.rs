@@ -106,7 +106,8 @@ use rank::{Bm25Ranker, Candidates, OverlapRanker, QueryContext, Ranker, Survivor
 use schema::SCHEMA_VERSION;
 use select::{SelectParams, select};
 use store::{Backend, Namespace, Sidecar, TextResolver};
-use tokenize::{Tokenizer, TrigramTokenizer};
+pub use term::{IntoTerm, Term};
+use tokenize::{DefaultTokenizer, Tokenizer};
 use welford::ClassSnap;
 
 /// Default match floor `m` — shared rare tokens required for a hit.
@@ -405,7 +406,7 @@ pub struct CompactStats {
 /// All methods are synchronous and thread-safe (`&self`): a single internal writer
 /// is serialized, reads run on a pooled connection concurrently with the writer
 /// under WAL. A caller on an async runtime dispatches calls to a blocking pool.
-pub struct Index<T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
+pub struct Index<T: Tokenizer = DefaultTokenizer, B: Backend = Sidecar> {
     backend: B,
     tokenizer: T,
     data_version: u64,
@@ -418,7 +419,7 @@ pub struct Index<T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
     dict: Dictionary,
 }
 
-impl Index<TrigramTokenizer, Sidecar> {
+impl Index<DefaultTokenizer, Sidecar> {
     /// Open (creating if absent) an index at `path` with the given [`Schema`], the
     /// default trigram tokenizer, and an owned [`Sidecar`] file. The common case.
     ///
@@ -428,7 +429,7 @@ impl Index<TrigramTokenizer, Sidecar> {
     /// initialized.
     pub fn open_at(path: &Path, schema: Schema, config: Config) -> Result<Self> {
         let backend = Sidecar::open(path)?;
-        Index::open(backend, TrigramTokenizer::new(), schema, config)
+        Index::open(backend, DefaultTokenizer::new(), schema, config)
     }
 }
 
@@ -661,10 +662,18 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             ),
             rusqlite::params![id, doc, label, stored_txt],
         )?;
-        let tokens = self.distinct_tokens(text);
-        let mut ids: Vec<TermId> = Vec::with_capacity(tokens.len());
-        for t in &tokens {
-            ids.push(stage.intern(t, conn, ns)?);
+        // Intern straight from the tokens (`token.term()`), not via stringified grams — the
+        // blanket `IntoTerm` packs each token with no per-token `String` allocation.
+        let distinct: HashSet<T::Token> = self.tokenizer.tokenize(text).collect();
+        let mut ids: Vec<TermId> = Vec::with_capacity(distinct.len());
+        for tok in &distinct {
+            let term = tok.term().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "gram {:?} exceeds the 3-codepoint term-encoding ceiling",
+                    tok.borrow()
+                ))
+            })?;
+            ids.push(stage.intern_term(term, conn, ns)?);
         }
         let bm: RoaringBitmap = ids.iter().copied().collect();
         conn.execute(
@@ -874,13 +883,15 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                         None
                     };
                     seg_ins.execute(rusqlite::params![seg_id, doc_id, label, stored_txt])?;
-                    let tokens = self.distinct_tokens(text);
-                    let mut ids: Vec<TermId> = Vec::with_capacity(tokens.len());
-                    for tok in tokens {
-                        let gkey = term::encode_term(&tok)
+                    let distinct: HashSet<T::Token> = self.tokenizer.tokenize(text).collect();
+                    let mut ids: Vec<TermId> = Vec::with_capacity(distinct.len());
+                    for tok in &distinct {
+                        let gkey = tok
+                            .term()
                             .ok_or_else(|| {
                                 Error::InvalidInput(format!(
-                                    "gram {tok:?} exceeds the 3-codepoint term-encoding ceiling"
+                                    "gram {:?} exceeds the 3-codepoint term-encoding ceiling",
+                                    tok.borrow()
                                 ))
                             })?
                             .0;
@@ -1326,6 +1337,16 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     }
 }
 
+/// Whether `segments` names any label more than once — a caller-contract violation for the
+/// insert/upsert methods (a document holds each label at most once). Used only by a
+/// `debug_assert`; `O(n²)` over a tiny slice, debug-only.
+fn has_duplicate_label(segments: &[(&str, &str)]) -> bool {
+    segments
+        .iter()
+        .enumerate()
+        .any(|(i, (label, _))| segments[..i].iter().any(|(prev, _)| prev == label))
+}
+
 /// The exclusive write lease (§8): holding it **is** holding the single-writer lock, so
 /// the naive-uncoordinated-write bug is inexpressible — there is no top-level write
 /// method to misuse. One transaction is open for the lease; [`commit`](Writer::commit)
@@ -1336,7 +1357,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
 /// error on a `(key, label)` collision (and create the document if absent); `upsert`/
 /// `upsert_segment` replace without error and keep a key's other (unnamed) segments;
 /// `remove`/`remove_segment` drop a document or one of its segments.
-pub struct Writer<'a, T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
+pub struct Writer<'a, T: Tokenizer = DefaultTokenizer, B: Backend = Sidecar> {
     guard: B::WriteGuard<'a>,
     index: &'a Index<T, B>,
     /// The interning session, accumulated across the open transaction; merged into the
@@ -1364,6 +1385,10 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
 
     /// Add the given `(label, text)` segments to the document keyed `key` (creating it if
     /// absent). Errors if any `(key, label)` already exists.
+    ///
+    /// The labels in `segments` must be distinct (a document holds each label at most once);
+    /// passing a duplicate label in one call is a contract violation asserted in debug
+    /// builds.
     pub fn insert(&mut self, key: impl Into<Key>, segments: &[(&str, &str)]) -> Result<()> {
         self.write_doc(key.into(), segments, false)
     }
@@ -1377,6 +1402,10 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
     /// Insert-or-replace the given `(label, text)` segments of the document keyed `key`
     /// (creating it if absent). Never errors on collision; a key's other (unnamed)
     /// segments are left intact.
+    ///
+    /// The labels in `segments` must be distinct (a document holds each label at most once);
+    /// passing a duplicate label in one call is a contract violation asserted in debug
+    /// builds.
     pub fn upsert(&mut self, key: impl Into<Key>, segments: &[(&str, &str)]) -> Result<()> {
         self.write_doc(key.into(), segments, true)
     }
@@ -1396,6 +1425,16 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
             .index
             .doc_id_for(conn, ns, &key, true)?
             .expect("create=true always yields a doc id");
+        // A document holds each label at most once, so the caller must pass distinct labels
+        // in one call. A repeat would insert a segment and then replace it in the *same*
+        // transaction — putting one seg id in both the add and remove sets of a term and
+        // drifting `df` (caught downstream by the disjointness `debug_assert`). Defend it
+        // cheaply at the boundary with a clearer message; it is a caller contract, not a
+        // recoverable input error, so it is debug-only.
+        debug_assert!(
+            !has_duplicate_label(segments),
+            "write_doc requires distinct labels within one call (a document holds each label once)"
+        );
         for (label, text) in segments {
             self.index
                 .write_segment(conn, ns, doc, label, text, &mut changes, stage, replace)?;
@@ -1498,7 +1537,7 @@ impl<T: Tokenizer, B: Backend> Drop for Writer<'_, T, B> {
 
 /// A read lease (§8): the surface for searches. Each search runs under its own consistent
 /// WAL snapshot; acquire a fresh reader to observe newer writes.
-pub struct Reader<'a, T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
+pub struct Reader<'a, T: Tokenizer = DefaultTokenizer, B: Backend = Sidecar> {
     index: &'a Index<T, B>,
 }
 
@@ -1536,7 +1575,7 @@ impl<T: Tokenizer, B: Backend> Reader<'_, T, B> {
 /// index data-version) and **Layer 2** (an incremental count vector) are documented
 /// follow-ups; this type is their home — it already owns the warm connection they cache
 /// against.
-pub struct SearchSession<'a, T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
+pub struct SearchSession<'a, T: Tokenizer = DefaultTokenizer, B: Backend = Sidecar> {
     index: &'a Index<T, B>,
     conn: B::ReadGuard<'a>,
 }

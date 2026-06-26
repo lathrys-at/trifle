@@ -21,7 +21,7 @@ fn finds(target: &str, query: &str) -> bool {
         "f",
         "another different sentence regarding mountain trails",
     );
-    let hits = h.index.search(query, SearchOpts::new(5)).unwrap();
+    let hits = h.search(query, SearchOpts::new(5)).unwrap();
     hit(&hits, 1)
 }
 
@@ -69,7 +69,7 @@ fn noise_floor_rejects_below_min_shared() {
     // Query "wxyz" has trigrams {wxy, xyz}.
     h.put(1, "field", "f", "wxy"); // shares only {wxy} -> overlap 1
     h.put(2, "field", "f", "wxyz"); // shares {wxy, xyz} -> overlap 2
-    let hits = h.index.search("wxyz", SearchOpts::new(5)).unwrap();
+    let hits = h.search("wxyz", SearchOpts::new(5)).unwrap();
     assert!(!hit(&hits, 1), "one shared trigram is below the m=2 floor");
     assert!(hit(&hits, 2), "two shared trigrams meets the floor");
 }
@@ -82,14 +82,8 @@ fn min_shared_controls_strictness_when_both_trigrams_are_present() {
     h.put(1, "field", "f", "wxy"); // shares {wxy}
     h.put(2, "field", "f", "xyz"); // shares {xyz}
     // Query "wxyz" -> {wxy, xyz}; each doc overlaps exactly 1.
-    let strict = h
-        .index
-        .search("wxyz", SearchOpts::new(5).min_shared(2))
-        .unwrap();
-    let lenient = h
-        .index
-        .search("wxyz", SearchOpts::new(5).min_shared(1))
-        .unwrap();
+    let strict = h.search("wxyz", SearchOpts::new(5).min_shared(2)).unwrap();
+    let lenient = h.search("wxyz", SearchOpts::new(5).min_shared(1)).unwrap();
     assert!(strict.is_empty(), "m=2 needs two shared; each doc has one");
     assert!(hit(&lenient, 1) && hit(&lenient, 2), "m=1 admits both");
 }
@@ -101,8 +95,8 @@ fn wider_t_max_never_loses_a_narrow_hit() {
     // A query at the typo floor (t_max=6) provably matches several fixture docs — no
     // vacuous guard.
     let q = "quick brown";
-    let narrow = h.index.search(q, SearchOpts::new(10).t_max(6)).unwrap();
-    let wide = h.index.search(q, SearchOpts::new(10).t_max(12)).unwrap();
+    let narrow = h.search(q, SearchOpts::new(10).t_max(6)).unwrap();
+    let wide = h.search(q, SearchOpts::new(10).t_max(12)).unwrap();
     assert!(
         !narrow.is_empty(),
         "narrow must hit something for this to be meaningful"
@@ -123,9 +117,10 @@ fn ranking_prefers_the_higher_overlap_document() {
     let h = Harness::new();
     h.put(1, "field", "f", "quick brown fox"); // many shared trigrams
     h.put(2, "field", "f", "quick"); // fewer
-    let hits = h
-        .index
-        .search("quick brown fox", SearchOpts::new(5))
-        .unwrap();
-    assert_eq!(hits[0].doc_id, 1, "the fuller overlap ranks first");
+    let hits = h.search("quick brown fox", SearchOpts::new(5)).unwrap();
+    assert_eq!(
+        hits[0].key.as_i64(),
+        Some(1),
+        "the fuller overlap ranks first"
+    );
 }

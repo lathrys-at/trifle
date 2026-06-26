@@ -9,8 +9,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use trifle::store::Sidecar;
-use trifle::tokenize::TrigramTokenizer;
-use trifle::{Config, Index, SearchOpts, Segment};
+use trifle::tokenize::DefaultTokenizer;
+use trifle::{Config, Document, Index, Schema, SearchOpts};
+
+/// Insert one `(label, text)` segment under `doc`, committed.
+fn put_one(idx: &Index<DefaultTokenizer, Sidecar>, doc: i64, label: &str, text: &str) {
+    let mut w = idx.writer().unwrap();
+    w.insert(doc, &[(label, text)]).unwrap();
+    w.commit().unwrap();
+}
 
 /// Queries crafted to break a naive implementation (SQL injection, quoting, control
 /// bytes, bidi/zero-width). None may panic or error.
@@ -31,19 +38,14 @@ fn hostile_queries_never_panic_or_error() {
     let h = Harness::new();
     load_fixture(&h);
     for q in HOSTILE {
-        let r = h.index.search(q, SearchOpts::new(10));
+        let r = h.search(q, SearchOpts::new(10));
         assert!(r.is_ok(), "query {q:?} errored: {:?}", r.err());
     }
-    // Pathological lengths: a wall of emoji and a 12k-char query. Selection caps the
-    // kept tokens, so the work stays bounded.
+    // Pathological lengths: a wall of emoji and a 12k-char query. Selection caps the kept
+    // tokens, so the work stays bounded.
+    assert!(h.search(&"🚀".repeat(500), SearchOpts::new(10)).is_ok());
     assert!(
-        h.index
-            .search(&"🚀".repeat(500), SearchOpts::new(10))
-            .is_ok()
-    );
-    assert!(
-        h.index
-            .search(&"lorem ipsum ".repeat(1000), SearchOpts::new(10))
+        h.search(&"lorem ipsum ".repeat(1000), SearchOpts::new(10))
             .is_ok()
     );
 }
@@ -52,15 +54,13 @@ fn hostile_queries_never_panic_or_error() {
 fn an_injection_query_cannot_alter_the_store() {
     let h = Harness::new();
     h.put(1, "field", "f", "survivor document content");
-    let _ = h.index.search(
+    let _ = h.search(
         "'; DROP TABLE seg; DELETE FROM term; --",
         SearchOpts::new(10),
     );
     // The store is intact and still answers.
     assert!(hit(
-        &h.index
-            .search("survivor document", SearchOpts::new(10))
-            .unwrap(),
+        &h.search("survivor document", SearchOpts::new(10)).unwrap(),
         1
     ));
     assert_eq!(h.index.stats().unwrap().segments, 1);
@@ -69,27 +69,29 @@ fn an_injection_query_cannot_alter_the_store() {
 #[test]
 fn hostile_text_is_indexed_and_searchable_verbatim() {
     let h = Harness::new();
-    // Provenance and text with quotes/semicolons must round-trip untouched.
+    // A label and text with quotes/semicolons must round-trip untouched.
     h.put(
         1,
         "field's",
         "a\"b;c",
         "value with 'quotes' and ; semicolons",
     );
-    let m = &h
-        .index
-        .search("quotes semicolons", SearchOpts::new(5))
-        .unwrap()[0];
-    assert_eq!(m.source, "field's");
-    assert_eq!(m.ref_, "a\"b;c");
+    let m = &h.search("quotes semicolons", SearchOpts::new(5)).unwrap()[0];
+    assert_eq!(m.label, "a\"b;c");
 }
 
-/// Open an `Arc`-shareable index without the harness (so the temp dir outlives the
-/// threads via the returned guard).
-fn shared_index() -> (Arc<Index<TrigramTokenizer, Sidecar>>, tempfile::TempDir) {
+/// Open an `Arc`-shareable index without the harness (so the temp dir outlives the threads
+/// via the returned guard).
+fn shared_index() -> (Arc<Index<DefaultTokenizer, Sidecar>>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let backend = Sidecar::open(dir.path().join("t.db")).unwrap();
-    let idx = Index::open(backend, TrigramTokenizer::new(), Config::default()).unwrap();
+    let idx = Index::open(
+        backend,
+        DefaultTokenizer::new(),
+        Schema::flat(),
+        Config::default(),
+    )
+    .unwrap();
     (Arc::new(idx), dir)
 }
 
@@ -97,12 +99,7 @@ fn shared_index() -> (Arc<Index<TrigramTokenizer, Sidecar>>, tempfile::TempDir) 
 fn concurrent_reads_run_alongside_writes() {
     let (idx, _dir) = shared_index();
     for doc in 1..=20 {
-        idx.insert(
-            doc,
-            "field",
-            &[("f", "quick brown fox shared phrase content")],
-        )
-        .unwrap();
+        put_one(&idx, doc, "f", "quick brown fox shared phrase content");
     }
     let stop = Arc::new(AtomicBool::new(false));
     let readers: Vec<_> = (0..6)
@@ -111,23 +108,25 @@ fn concurrent_reads_run_alongside_writes() {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    let hits = idx.search("quick brown fox", SearchOpts::new(10)).unwrap();
+                    let hits = idx
+                        .reader()
+                        .unwrap()
+                        .search("quick brown fox", SearchOpts::new(10))
+                        .unwrap();
                     assert!(!hits.is_empty());
-                    // No phantom: every returned doc is one actually inserted (1..=120),
-                    // so concurrent writes never corrupt a read into a bogus doc id.
-                    assert!(hits.iter().all(|m| (1..=120).contains(&m.doc_id)));
+                    // No phantom: every returned doc is one actually inserted (1..=120), so
+                    // concurrent writes never corrupt a read into a bogus key.
+                    assert!(
+                        hits.iter()
+                            .all(|m| (1..=120).contains(&m.key.as_i64().unwrap()))
+                    );
                 }
             })
         })
         .collect();
     // Writer churns while the readers run.
     for doc in 21..=120 {
-        idx.insert(
-            doc,
-            "field",
-            &[("f", "quick brown fox shared phrase content")],
-        )
-        .unwrap();
+        put_one(&idx, doc, "f", "quick brown fox shared phrase content");
     }
     stop.store(true, Ordering::Relaxed);
     for r in readers {
@@ -138,15 +137,15 @@ fn concurrent_reads_run_alongside_writes() {
 #[test]
 fn reads_continue_across_a_rebuild_swap() {
     let (idx, _dir) = shared_index();
-    // A token present in BOTH the old and the new corpus, so a correct read always
-    // finds it (complete-old or complete-new, never partial).
+    // A token present in BOTH the old and the new corpus, so a correct read always finds it
+    // (complete-old or complete-new, never partial).
     for doc in 1..=10 {
-        idx.insert(
+        put_one(
+            &idx,
             doc,
-            "field",
-            &[("f", "persistent token across the rebuild boundary")],
-        )
-        .unwrap();
+            "f",
+            "persistent token across the rebuild boundary",
+        );
     }
     let stop = Arc::new(AtomicBool::new(false));
     let readers: Vec<_> = (0..4)
@@ -158,10 +157,14 @@ fn reads_continue_across_a_rebuild_swap() {
                 while !stop.load(Ordering::Relaxed) {
                     // A read must never error across the swap: the rename keeps the same
                     // table names/shape so rusqlite re-prepares transparently, and
-                    // read_retry absorbs any transient SQLITE_SCHEMA/BUSY. And because
-                    // the token is in BOTH corpora, every consistent read finds it —
-                    // the swap is complete-old or complete-new, never partial.
-                    let hits = idx.search("persistent token", SearchOpts::new(10)).unwrap();
+                    // read_retry absorbs any transient SQLITE_SCHEMA/BUSY. And because the
+                    // token is in BOTH corpora, every consistent read finds it — the swap is
+                    // complete-old or complete-new, never partial.
+                    let hits = idx
+                        .reader()
+                        .unwrap()
+                        .search("persistent token", SearchOpts::new(10))
+                        .unwrap();
                     assert!(
                         !hits.is_empty(),
                         "the always-present token vanished mid-swap"
@@ -174,13 +177,14 @@ fn reads_continue_across_a_rebuild_swap() {
         .collect();
     // Rebuild many times to widen the window the readers race against the swap.
     for _ in 0..40 {
-        let corpus: Vec<Segment> = (1..=10)
+        let corpus: Vec<Document> = (1..=10)
             .map(|doc| {
-                Segment::new(
+                Document::new(
                     doc,
-                    "field",
-                    "body",
-                    "persistent token across the rebuild boundary",
+                    vec![(
+                        "body".to_string(),
+                        "persistent token across the rebuild boundary".to_string(),
+                    )],
                 )
             })
             .collect();

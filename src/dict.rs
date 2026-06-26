@@ -4,7 +4,7 @@
 //!
 //! Postings (`post`/`delta`/`term`-df/`fwd`) are keyed by the `u32` id, not the gram —
 //! narrow integer B-trees, fast point seeks, a smaller index. The gram's encoding (its
-//! [`Term`](crate::term::Term) `u128`, stored 16-byte big-endian) lives only in the
+//! [`Term`](crate::Term) `u128`, stored 16-byte big-endian) lives only in the
 //! `dict` table. Ids are **monotonic and permanent**: a gram keeps its id until a
 //! [`rebuild`](crate::Index::rebuild) reassigns the whole space (bumping the generation).
 //!
@@ -12,7 +12,7 @@
 //! - A reader calls [`Dictionary::resolve`] — a read that returns `None` on a miss (the
 //!   gram is absent, an empty posting). It never mutates, allocates, or writes.
 //! - A writer takes an [`InternStage`] (only reachable on a write path, which holds the
-//!   single-writer lease) and calls [`InternStage::intern`], which allocates an id and
+//!   single-writer lease) and calls [`InternStage::intern_term`], which allocates an id and
 //!   persists a `dict` row inside the write transaction. Staged grams enter the shared
 //!   in-memory map only via [`InternStage::commit`], called **after** the transaction
 //!   commits — so a rolled-back write leaves no orphan id.
@@ -29,18 +29,11 @@ use rusqlite::Connection;
 use crate::error::Result;
 use crate::schema;
 use crate::store::Namespace;
-use crate::term::encode_term;
+use crate::term::{Term, encode_term};
 use crate::welford::{ClassSnap, ClassStats};
 
 /// An interned term identifier. `0` is reserved as "none"; ids start at `1`.
 pub(crate) type TermId = u32;
-
-/// The packed `u128` dictionary key for a gram, or `None` if it exceeds the
-/// 3-codepoint storage ceiling.
-#[inline]
-fn gram_key(gram: &str) -> Option<u128> {
-    encode_term(gram).map(|t| t.0)
-}
 
 /// Decode a stored 16-byte `dict.gram` BLOB back to its `u128` key.
 fn decode_key(bytes: &[u8]) -> Result<u128> {
@@ -204,26 +197,28 @@ pub(crate) struct InternStage<'a> {
 }
 
 impl InternStage<'_> {
-    /// Writer fault: resolve `gram`, allocating + persisting a new id on a miss. Lookup
-    /// order: committed map → this-txn allocations → allocate. The `dict` row is written
-    /// inside the caller's transaction; the shared in-memory map is *not* touched here.
+    /// Writer fault from an already-packed [`Term`] — the hot-path entry point. The write
+    /// path interns straight from a tokenizer token (`token.term()`), skipping a
+    /// `Token → String → re-encode` round-trip: resolve the term, allocating + persisting a
+    /// new id on a miss. Lookup order: committed map → this-txn allocations → allocate. The
+    /// `dict` row is written inside the caller's transaction; the shared in-memory map is
+    /// *not* touched here.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`](crate::Error::InvalidInput) if the gram exceeds the
-    /// 3-codepoint storage ceiling (e.g. a quad-gram tokenizer — incompatible with
-    /// interning); [`Error::Corrupt`](crate::Error::Corrupt) if the id space is exhausted.
-    pub(crate) fn intern(
+    /// [`Error::Corrupt`](crate::Error::Corrupt) if the id space is exhausted.
+    pub(crate) fn intern_term(
         &mut self,
-        gram: &str,
+        term: Term,
         conn: &Connection,
         ns: &Namespace,
     ) -> Result<TermId> {
-        let key = gram_key(gram).ok_or_else(|| {
-            crate::Error::InvalidInput(format!(
-                "gram {gram:?} exceeds the 3-codepoint term-encoding ceiling"
-            ))
-        })?;
+        self.intern_key(term.0, conn, ns)
+    }
+
+    /// The shared body of [`intern_term`](Self::intern_term): resolve `key`, allocating +
+    /// persisting a new id on a miss.
+    fn intern_key(&mut self, key: u128, conn: &Connection, ns: &Namespace) -> Result<TermId> {
         if let Some(id) = self.dict.resolve_key(key) {
             return Ok(id);
         }

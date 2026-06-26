@@ -15,9 +15,17 @@ A ground-up rework. **Breaking across the board, and a hard cache reset:** the o
   needs neither the text nor the tokenizer** regardless of storage mode.
 - **`u128` term encoding.** A gram (≤3 codepoints) + script tag packs big-endian into a
   `u128`; the script byte is the most-significant byte (script-contiguous order).
-- **Script-segmented tokenizer.** New `ScriptTokenizer` splits text into maximal
-  same-script runs and tokenizes each with a script-appropriate window (CJK bigrams, else
-  trigrams), emitting no cross-script grams. The default `TrigramTokenizer` is unchanged.
+- **Script-segmenting default tokenizer.** `DefaultTokenizer` is now what trifle ships:
+  it splits text into maximal same-script runs and tokenizes each with a
+  script-appropriate window (CJK bigrams, else trigrams), emitting no cross-script grams.
+  `NgramTokenizer<N>` (aliases `TrigramTokenizer = NgramTokenizer<3>` /
+  `BigramTokenizer = NgramTokenizer<2>`) is the plain fixed-width tokenizer for
+  single-script corpora. Both yield the inline `Ngram<N>` token (`Gram = Ngram<3>`), and
+  tokenization is **online** — `tokenize()` streams windows off the Unicode-normalization
+  adaptors with no intermediate `Vec`. The old `Ngram<N, CAP>` value type is gone.
+- **`IntoTerm`.** Blanket-implemented for every `Borrow<str>` and required of a
+  tokenizer's `Token`, so a token packs into its interned `Term` directly; the write path
+  interns via `token.term()`, with no per-token `String` allocation.
 - **Class-normalized pruning.** The rarest-first pruner ranks by a per-script-class
   Welford z-score (log space), falling back to raw DF for sparse classes.
 
@@ -32,7 +40,9 @@ A ground-up rework. **Breaking across the board, and a hard cache reset:** the o
 - **Lease-based access.** `Index` shrinks to lifecycle (`open`/`rebuild`/`compact`/
   `stats`/`reader`/`writer`/`session`). Writes go through a `Writer` lease (the exclusive
   single-writer lock; six methods `insert`/`upsert`/`remove` × whole/segment;
-  `commit()` is commit-and-continue; drop rolls back). Reads go through a `Reader`;
+  `commit()` is commit-and-continue; drop rolls back). The labels in one
+  `insert`/`upsert` call must be distinct (a document holds each label once; debug-asserted).
+  Reads go through a `Reader`;
   `SearchSession` holds a warm connection for as-you-type. `SearchOpts` gains a
   `Hydration` cost ladder.
 - **`Index::open` now takes a `Schema`**: `Index::open_at(path, schema, config)` /

@@ -3,40 +3,45 @@
 mod common;
 use common::*;
 use std::collections::HashSet;
-use trifle::SearchOpts;
 use trifle::rank::{Candidates, QueryContext, Ranked, Ranker};
-use trifle::tokenize::{Tokenizer, TrigramTokenizer};
+use trifle::tokenize::{DefaultTokenizer, Tokenizer};
+use trifle::{Key, SearchOpts};
 
 // ----- scope predicate --------------------------------------------------------
 
 #[test]
-fn scope_filters_by_doc_id() {
+fn scope_filters_by_key() {
     let h = Harness::new();
     load_fixture(&h);
-    let even = |doc_id: i64, _s: &str, _r: &str| doc_id % 2 == 0;
+    let even = |key: &Key, _label: &str| key.as_i64().is_some_and(|d| d % 2 == 0);
     let hits = h
         .index
+        .reader()
+        .unwrap()
         .search("quick", SearchOpts::new(10).scope(&even))
         .unwrap();
     assert!(!hits.is_empty());
-    assert!(hits.iter().all(|m| m.doc_id % 2 == 0));
+    assert!(hits.iter().all(|m| m.key.as_i64().unwrap() % 2 == 0));
 }
 
 #[test]
-fn scope_filters_by_source() {
+fn scope_filters_by_label() {
     let h = Harness::new();
+    // Two segments of doc 1 under different labels; the scope keeps only one label.
     h.put(1, "field", "f", "diplomatic negotiations concluded");
     h.put(1, "ocr", "scan", "diplomatic negotiations concluded");
     h.put(2, "field", "f", "diplomatic negotiations resumed");
-    let only_ocr = |_d: i64, source: &str, _r: &str| source == "ocr";
+    let only_scan = |_k: &Key, label: &str| label == "scan";
     let hits = h
         .index
+        .reader()
+        .unwrap()
         .search(
             "diplomatic negotiations",
-            SearchOpts::new(10).scope(&only_ocr),
+            SearchOpts::new(10).scope(&only_scan),
         )
         .unwrap();
-    assert!(hits.iter().all(|m| m.source == "ocr"));
+    assert!(hits.iter().all(|m| m.label == "scan"));
     assert!(hit(&hits, 1));
 }
 
@@ -48,13 +53,15 @@ fn scope_walk_fills_limit_with_passing_docs() {
     for doc in 1..=6 {
         h.put(doc, "field", "f", "common shared searchable phrase content");
     }
-    let keep_high = |doc_id: i64, _s: &str, _r: &str| doc_id >= 4;
+    let keep_high = |key: &Key, _label: &str| key.as_i64().is_some_and(|d| d >= 4);
     let hits = h
         .index
+        .reader()
+        .unwrap()
         .search("searchable phrase", SearchOpts::new(3).scope(&keep_high))
         .unwrap();
     assert_eq!(hits.len(), 3, "limit filled despite rejecting docs 1-3");
-    assert!(hits.iter().all(|m| m.doc_id >= 4));
+    assert!(hits.iter().all(|m| m.key.as_i64().unwrap() >= 4));
 }
 
 // ----- custom rankers ---------------------------------------------------------
@@ -75,12 +82,11 @@ fn custom_ranker_controls_order() {
     let h = Harness::new();
     h.put(1, "field", "f", "quick brown fox runs");
     h.put(2, "field", "f", "quick"); // lower overlap -> default-last
-    let default = h
-        .index
-        .search("quick brown fox", SearchOpts::new(10))
-        .unwrap();
+    let default = h.search("quick brown fox", SearchOpts::new(10)).unwrap();
     let reversed = h
         .index
+        .reader()
+        .unwrap()
         .search("quick brown fox", SearchOpts::new(10).ranker(&Reversed))
         .unwrap();
     assert_eq!(
@@ -111,6 +117,8 @@ fn ranker_can_read_text_and_drop_candidates() {
     h.put(2, "field", "f", "a quick brown hare appears"); // has "quick brown"
     let hits = h
         .index
+        .reader()
+        .unwrap()
         .search("quick brown", SearchOpts::new(10).ranker(&LiteralOnly))
         .unwrap();
     assert!(hit(&hits, 2));
@@ -124,7 +132,7 @@ fn ranker_can_read_text_and_drop_candidates() {
 struct InvariantChecker;
 impl Ranker for InvariantChecker {
     fn rank(&self, candidates: &Candidates<'_>, q: &QueryContext<'_>) -> Vec<Ranked> {
-        let tok = TrigramTokenizer::new();
+        let tok = DefaultTokenizer::new();
         for c in candidates.iter() {
             let matched = c.matched_tokens();
             // The count agrees with the bit-sliced overlap.
@@ -159,6 +167,8 @@ fn matched_tokens_are_real_segment_tokens_counting_overlap() {
     load_fixture(&h);
     let hits = h
         .index
+        .reader()
+        .unwrap()
         .search(
             "quick brown fox",
             SearchOpts::new(10).ranker(&InvariantChecker),
@@ -180,9 +190,9 @@ fn search_batch_matches_serial_search_exactly() {
         "quick lazy",  // overlapping vocabulary with the others (shared reads)
         "nonexistent zzqqx",
     ];
-    let batched = h.index.search_batch(&queries, SearchOpts::new(10)).unwrap();
+    let batched = h.search_batch(&queries, SearchOpts::new(10)).unwrap();
     for (i, q) in queries.iter().enumerate() {
-        let serial = h.index.search(q, SearchOpts::new(10)).unwrap();
+        let serial = h.search(q, SearchOpts::new(10)).unwrap();
         // Full Match equality (provenance, span, text, order) — not just doc ids — so
         // a batch hydration that picked a different segment would be caught.
         assert_eq!(
@@ -196,10 +206,5 @@ fn search_batch_matches_serial_search_exactly() {
 fn empty_batch_returns_empty() {
     let h = Harness::new();
     load_fixture(&h);
-    assert!(
-        h.index
-            .search_batch(&[], SearchOpts::new(10))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(h.search_batch(&[], SearchOpts::new(10)).unwrap().is_empty());
 }

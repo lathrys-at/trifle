@@ -23,9 +23,11 @@
 
 use unicode_script::{Script, UnicodeScript};
 
-/// A packed term: `[ script:8 | c0:32 | c1:32 | c2:32 | reserved:24=0 ]` (MSB→LSB).
+/// A packed term: a gram (≤3 codepoints) plus a script tag, `[ script:8 | c0:32 | c1:32
+/// | c2:32 | reserved:24=0 ]` (MSB→LSB). Produced by [`IntoTerm::term`]; opaque to
+/// callers (the encoding is an internal detail).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub(crate) struct Term(pub(crate) u128);
+pub struct Term(pub(crate) u128);
 
 /// Pack three codepoints (zero = absent) and a script tag into the term layout.
 #[inline]
@@ -47,9 +49,10 @@ pub(crate) fn unpack(t: u128) -> (u32, u32, u32, u8) {
 }
 
 impl Term {
-    /// The script class byte (the Welford class id) — the most-significant byte.
+    /// The script class byte (the Welford class id) — the most-significant byte, equal
+    /// to the gram's strong script as `unicode_script::Script as u8`.
     #[inline]
-    pub(crate) fn class(self) -> u8 {
+    pub fn class(self) -> u8 {
         (self.0 >> 120) as u8
     }
 
@@ -81,56 +84,39 @@ pub(crate) fn encode_term(gram: &str) -> Option<Term> {
     Some(Term(pack(cps[0], cps[1], cps[2], script)))
 }
 
-/// The script tag for a gram: the script of its first *strong*-script codepoint
-/// (`Common`/`Inherited` are transparent; an all-common gram is [`TAG_COMMON`]).
-/// Scripts trifle distinguishes get a stable byte; everything else collapses to
-/// [`TAG_OTHER`] — sound because two scripts collide only if their codepoints also
-/// match (they do not), so terms never collide; it merely widens one Welford class.
+/// The script class byte for a gram: the script of its first *strong*-script codepoint
+/// as `unicode_script::Script as u8` (`Common`/`Inherited` are transparent; an all-common
+/// gram is `Script::Common`). The `Script` enum is `#[repr(u8)]` with explicit, distinct
+/// discriminants for every script, so this is complete (no hand table) and is the same
+/// byte the Welford pruner uses as its class id.
+///
+/// **On-disk identity:** this byte is stored in the term encoding, so it ties identity to
+/// `unicode_script`'s discriminants. They are explicit (intentional), and the crate is
+/// pinned; a version that renumbered scripts would need a rebuild (bump the tokenizer
+/// fingerprint).
 pub(crate) fn script_of(gram: &str) -> u8 {
     for ch in gram.chars() {
         match ch.script() {
             Script::Common | Script::Inherited => continue,
-            s => return script_tag(s),
+            s => return s as u8,
         }
     }
-    TAG_COMMON
+    Script::Common as u8
 }
 
-// Stable script-tag bytes — part of on-disk term identity (never renumber without a
-// schema-version bump + rebuild). `OTHER` is the catch-all for everything else. The CJK
-// tags are `pub(crate)` so the script-segmented tokenizer's default window policy can
-// pick them out (they take bigrams, not trigrams).
-pub(crate) const TAG_COMMON: u8 = 0;
-const TAG_LATIN: u8 = 1;
-const TAG_CYRILLIC: u8 = 2;
-const TAG_GREEK: u8 = 3;
-pub(crate) const TAG_HAN: u8 = 4;
-pub(crate) const TAG_HIRAGANA: u8 = 5;
-pub(crate) const TAG_KATAKANA: u8 = 6;
-pub(crate) const TAG_HANGUL: u8 = 7;
-const TAG_ARABIC: u8 = 8;
-const TAG_HEBREW: u8 = 9;
-const TAG_DEVANAGARI: u8 = 10;
-const TAG_THAI: u8 = 11;
-const TAG_OTHER: u8 = 255;
-
-/// The script-tag byte for a strong [`Script`] (the window-policy / Welford-class index).
-pub(crate) fn script_tag(s: Script) -> u8 {
-    match s {
-        Script::Latin => TAG_LATIN,
-        Script::Cyrillic => TAG_CYRILLIC,
-        Script::Greek => TAG_GREEK,
-        Script::Han => TAG_HAN,
-        Script::Hiragana => TAG_HIRAGANA,
-        Script::Katakana => TAG_KATAKANA,
-        Script::Hangul => TAG_HANGUL,
-        Script::Arabic => TAG_ARABIC,
-        Script::Hebrew => TAG_HEBREW,
-        Script::Devanagari => TAG_DEVANAGARI,
-        Script::Thai => TAG_THAI,
-        _ => TAG_OTHER,
+/// Conversion of a gram-like value into its packed [`Term`]. Blanket-implemented for
+/// every `Borrow<str>`, so a string-backed tokenizer token gets it for free; the default
+/// derives the script and packs the gram's code points. The
+/// [`Tokenizer`](crate::tokenize::Tokenizer) token type is bound to this, so interning a
+/// token into a term goes through the token itself rather than back through a `&str`.
+pub trait IntoTerm: std::borrow::Borrow<str> {
+    /// The packed term for this gram, or `None` if it exceeds the 3-codepoint ceiling.
+    fn term(&self) -> Option<Term> {
+        encode_term(self.borrow())
     }
 }
+
+impl<T: std::borrow::Borrow<str>> IntoTerm for T {}
 
 #[cfg(test)]
 mod tests {
@@ -138,8 +124,9 @@ mod tests {
 
     #[test]
     fn pack_unpack_round_trips() {
-        let t = pack('a' as u32, 'b' as u32, 'c' as u32, TAG_LATIN);
-        assert_eq!(unpack(t), ('a' as u32, 'b' as u32, 'c' as u32, TAG_LATIN));
+        let latin = Script::Latin as u8;
+        let t = pack('a' as u32, 'b' as u32, 'c' as u32, latin);
+        assert_eq!(unpack(t), ('a' as u32, 'b' as u32, 'c' as u32, latin));
         // Low 24 bits (reserved) are zero.
         assert_eq!(t & 0xFF_FFFF, 0);
     }
@@ -161,20 +148,28 @@ mod tests {
     }
 
     #[test]
-    fn script_tag_is_derived_and_stable() {
-        assert_eq!(encode_term("abc").unwrap().class(), TAG_LATIN);
-        assert_eq!(encode_term("日本").unwrap().class(), TAG_HAN);
+    fn script_class_is_derived_and_stable() {
+        assert_eq!(encode_term("abc").unwrap().class(), Script::Latin as u8);
+        assert_eq!(encode_term("日本").unwrap().class(), Script::Han as u8);
         // Digits / punctuation are Common.
-        assert_eq!(encode_term("123").unwrap().class(), TAG_COMMON);
+        assert_eq!(encode_term("123").unwrap().class(), Script::Common as u8);
         // A leading common codepoint is transparent: the strong script wins.
-        assert_eq!(encode_term("1ab").unwrap().class(), TAG_LATIN);
+        assert_eq!(encode_term("1ab").unwrap().class(), Script::Latin as u8);
     }
 
     #[test]
     fn terms_sort_script_contiguously() {
-        // Han (tag 4) sorts after Latin (tag 1) as a u128 value.
-        let latin = encode_term("abc").unwrap();
+        // The script byte is the MSB, so same-script grams order by codepoints and a
+        // script change dominates the ordering (which direction depends on the script
+        // discriminants — we assert the structure, not a specific cross-script order).
+        let ab = encode_term("abc").unwrap();
+        let abd = encode_term("abd").unwrap();
+        assert!(ab < abd, "same script -> ordered by codepoints");
         let han = encode_term("日本").unwrap();
-        assert!(latin < han);
+        assert_ne!(
+            ab.class(),
+            han.class(),
+            "different scripts -> different MSB"
+        );
     }
 }

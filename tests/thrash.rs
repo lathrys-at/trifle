@@ -1,21 +1,22 @@
-//! Property-based thrashing: randomized op sequences (insert / remove / compact /
-//! rebuild) applied in lockstep to the real index and an in-memory oracle, with
+//! Property-based thrashing: randomized op sequences (upsert / remove / remove-segment /
+//! compact / rebuild) applied in lockstep to the real index and an in-memory oracle, with
 //! strong invariants checked after **every** op.
 //!
-//! This is the one deliberately expensive integration test. The oracle is the model
-//! of expected state — `(doc_id, source) -> [(ref, text)]` — and the invariants are
-//! the ones an independent model can verify without reimplementing ranking:
+//! This is the one deliberately expensive integration test. The oracle is the model of
+//! expected state — `key -> {label -> text}`, mirroring trifle's v0.2 document/segment
+//! model — and the invariants are the ones an independent model can verify without
+//! reimplementing ranking:
 //!
 //! - segment count matches the oracle exactly (catches lost/leaked/double writes);
-//! - `compact()` clears the delta backlog and changes no result (fold correctness);
-//! - every returned match is *faithful* — its `(doc, source, ref, text)` is a real
-//!   segment currently in the oracle (catches phantom docs, stale text, monotonic-id
-//!   reuse, swap/rebuild corruption);
+//! - `compact()` clears the delta backlog (fold correctness);
+//! - every returned match is *faithful* — its `(key, label, text)` is a real segment
+//!   currently in the oracle (catches phantom docs, stale text, monotonic-id reuse,
+//!   swap/rebuild corruption);
 //! - a segment's own text re-finds its doc (recall survives churn + compaction);
 //! - every span is a valid char boundary into the returned text.
 //!
-//! Fixtures stay tiny on purpose (≤ 6 docs, short texts) — a small state space hit
-//! from many random angles finds interleaving bugs that a big corpus would not.
+//! Fixtures stay tiny on purpose (≤ 6 docs, ≤ 3 labels each, short texts) — a small state
+//! space hit from many random angles finds interleaving bugs a big corpus would not.
 
 mod common;
 use common::*;
@@ -24,62 +25,66 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use trifle::store::Sidecar;
-use trifle::tokenize::TrigramTokenizer;
-use trifle::{SearchOpts, Segment};
+use trifle::tokenize::DefaultTokenizer;
+use trifle::{Document, SearchOpts};
 
 /// Real overlapping vocabulary, so searches actually match across docs.
 const WORDS: &[&str] = &[
     "quick", "brown", "foxes", "jumps", "lazy", "dogs", "river", "mount", "quartz", "sphinx",
     "wizard", "vortex", "puzzle", "cipher", "amber", "cobalt",
 ];
-const SOURCES: &[&str] = &["field", "ocr", "caption"];
-const REFS: &[&str] = &["a", "b", "c"];
+const LABELS: &[&str] = &["a", "b", "c"];
 
-/// `(doc_id, source) -> [(ref, text)]`, mirroring trifle's segment model.
-type Oracle = BTreeMap<(i64, String), Vec<(String, String)>>;
-type Idx = trifle::Index<TrigramTokenizer, Sidecar>;
+/// `key -> {label -> text}`, mirroring trifle's v0.2 segment model (labels unique per doc).
+type Oracle = BTreeMap<i64, BTreeMap<String, String>>;
+type Idx = trifle::Index<DefaultTokenizer, Sidecar>;
 
 #[derive(Debug, Clone)]
 enum Op {
-    Insert {
+    /// Insert-or-replace the named labels (keeps a doc's other labels).
+    Upsert {
         doc: i64,
-        source: String,
         segs: Vec<(String, String)>,
     },
+    /// Drop a whole document.
     Remove {
         doc: i64,
     },
-    RemoveSource {
+    /// Drop one `(doc, label)` segment.
+    RemoveSegment {
         doc: i64,
-        source: String,
+        label: String,
     },
     Compact,
     Rebuild {
-        corpus: Vec<(i64, String, String, String)>,
+        corpus: Vec<(i64, String, String)>,
     },
 }
 
 fn text() -> impl Strategy<Value = String> {
     prop::collection::vec(prop::sample::select(WORDS), 1..4).prop_map(|ws| ws.join(" "))
 }
-fn source() -> impl Strategy<Value = String> {
-    prop::sample::select(SOURCES).prop_map(String::from)
+fn label() -> impl Strategy<Value = String> {
+    prop::sample::select(LABELS).prop_map(String::from)
 }
-fn refid() -> impl Strategy<Value = String> {
-    prop::sample::select(REFS).prop_map(String::from)
-}
+/// A non-empty set of **distinct** labels, each with its own text — `insert`/`upsert`
+/// require distinct labels within one call (a doc holds each label once).
 fn segs() -> impl Strategy<Value = Vec<(String, String)>> {
-    // 0 is allowed: an empty group means `insert(doc, source, &[])`, which wipes the pair.
-    prop::collection::vec((refid(), text()), 0..4)
+    prop::sample::subsequence(LABELS.to_vec(), 1..=LABELS.len())
+        .prop_flat_map(|labels| {
+            let n = labels.len();
+            (Just(labels), prop::collection::vec(text(), n))
+        })
+        .prop_map(|(labels, texts)| labels.into_iter().map(String::from).zip(texts).collect())
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
-        6 => (1i64..=6, source(), segs()).prop_map(|(doc, source, segs)| Op::Insert { doc, source, segs }),
+        6 => (1i64..=6, segs()).prop_map(|(doc, segs)| Op::Upsert { doc, segs }),
         2 => (1i64..=6).prop_map(|doc| Op::Remove { doc }),
-        2 => (1i64..=6, source()).prop_map(|(doc, source)| Op::RemoveSource { doc, source }),
+        2 => (1i64..=6, label()).prop_map(|(doc, label)| Op::RemoveSegment { doc, label }),
         2 => Just(Op::Compact),
-        1 => prop::collection::vec((1i64..=6, source(), refid(), text()), 0..6)
+        1 => prop::collection::vec((1i64..=6, label(), text()), 0..6)
                 .prop_map(|corpus| Op::Rebuild { corpus }),
     ]
 }
@@ -87,24 +92,34 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 /// Apply one op to both the index and the oracle, keeping them in lockstep.
 fn apply(idx: &Idx, oracle: &mut Oracle, op: Op) {
     match op {
-        Op::Insert { doc, source, segs } => {
+        Op::Upsert { doc, segs } => {
             let pairs: Vec<(&str, &str)> =
-                segs.iter().map(|(r, t)| (r.as_str(), t.as_str())).collect();
-            idx.insert(doc, &source, &pairs).unwrap();
-            // Upsert replaces the whole (doc, source) group; an empty group wipes it.
-            if segs.is_empty() {
-                oracle.remove(&(doc, source));
-            } else {
-                oracle.insert((doc, source), segs);
+                segs.iter().map(|(l, t)| (l.as_str(), t.as_str())).collect();
+            let mut w = idx.writer().unwrap();
+            w.upsert(doc, &pairs).unwrap();
+            w.commit().unwrap();
+            // Upsert replaces named labels (last-wins within the batch) and keeps the rest.
+            let entry = oracle.entry(doc).or_default();
+            for (l, t) in &segs {
+                entry.insert(l.clone(), t.clone());
             }
         }
         Op::Remove { doc } => {
-            idx.remove(doc).unwrap();
-            oracle.retain(|(d, _), _| *d != doc);
+            let mut w = idx.writer().unwrap();
+            w.remove(doc).unwrap();
+            w.commit().unwrap();
+            oracle.remove(&doc);
         }
-        Op::RemoveSource { doc, source } => {
-            idx.remove_source(doc, &source).unwrap();
-            oracle.remove(&(doc, source));
+        Op::RemoveSegment { doc, label } => {
+            let mut w = idx.writer().unwrap();
+            w.remove_segment(doc, &label).unwrap();
+            w.commit().unwrap();
+            if let Some(labels) = oracle.get_mut(&doc) {
+                labels.remove(&label);
+                if labels.is_empty() {
+                    oracle.remove(&doc);
+                }
+            }
         }
         Op::Compact => {
             idx.compact().unwrap();
@@ -115,28 +130,35 @@ fn apply(idx: &Idx, oracle: &mut Oracle, op: Op) {
             );
         }
         Op::Rebuild { corpus } => {
-            let segments: Vec<Segment> = corpus
-                .iter()
-                .map(|(d, s, r, t)| Segment::new(*d, s, r, t))
-                .collect();
-            idx.rebuild(segments).unwrap();
-            // Rebuild is verbatim: every corpus item is a segment under its pair.
-            oracle.clear();
-            for (d, s, r, t) in corpus {
-                oracle.entry((d, s)).or_default().push((r, t));
+            // Rebuild is verbatim, but labels are unique per doc and keys unique per doc:
+            // collapse the corpus to one Document per doc (last-wins per label).
+            let mut model = Oracle::new();
+            for (d, l, t) in &corpus {
+                model.entry(*d).or_default().insert(l.clone(), t.clone());
             }
+            let docs: Vec<Document> = model
+                .iter()
+                .map(|(d, labels)| {
+                    Document::new(
+                        *d,
+                        labels.iter().map(|(l, t)| (l.clone(), t.clone())).collect(),
+                    )
+                })
+                .collect();
+            idx.rebuild(docs).unwrap();
+            *oracle = model;
         }
     }
 }
 
 /// Is `m` a real segment currently in the oracle? (snapshot mode -> text matches.)
 fn faithful(oracle: &Oracle, m: &trifle::Match) -> bool {
-    oracle
-        .get(&(m.doc_id, m.source.clone()))
-        .is_some_and(|segs| {
-            segs.iter()
-                .any(|(r, t)| *r == m.ref_ && Some(t.as_str()) == m.text.as_deref())
-        })
+    m.key
+        .as_i64()
+        .and_then(|d| oracle.get(&d))
+        .and_then(|labels| labels.get(&m.label))
+        .map(|t| t.as_str())
+        == m.text.as_deref()
 }
 
 /// Check every invariant against the oracle.
@@ -148,13 +170,14 @@ fn check(idx: &Idx, oracle: &Oracle) {
         "segment count"
     );
 
-    // Sample a few existing segments (deterministic BTreeMap order) and verify recall
-    // + that every returned match is faithful and well-formed.
-    for ((doc, _source), segs) in oracle.iter().take(4) {
-        let Some((_, txt)) = segs.first() else {
+    // Sample a few existing docs (deterministic BTreeMap order) and verify recall + that
+    // every returned match is faithful and well-formed.
+    let reader = idx.reader().unwrap();
+    for (doc, labels) in oracle.iter().take(4) {
+        let Some((_, txt)) = labels.iter().next() else {
             continue;
         };
-        let hits = idx.search(txt, SearchOpts::new(100)).unwrap();
+        let hits = reader.search(txt, SearchOpts::new(100)).unwrap();
         assert!(
             hit(&hits, *doc),
             "a segment's own text must re-find its doc"

@@ -92,7 +92,7 @@ mod welford;
 use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use roaring::RoaringBitmap;
@@ -123,6 +123,10 @@ const TYPO_DAMAGE: u32 = 4;
 const DEFAULT_T_MAX: usize = 12;
 /// Default `D` — df-doublings per IDF weight step in the overlap counter.
 const DEFAULT_WEIGHT_STEP: f64 = 1.0;
+/// Buckets in the per-query band-spread histogram (the [`Stats`] weight-step hint).
+const HINT_BUCKETS: usize = 13;
+/// Width of each band-spread histogram bucket, in df-doublings (`log2` units).
+const HINT_BUCKET_WIDTH: f64 = 0.5;
 /// How many times a read retries a transient `SQLITE_BUSY`/`LOCKED`/`SCHEMA`.
 const RETRY_MAX: usize = 5;
 
@@ -262,7 +266,8 @@ pub struct SearchOpts<'a> {
     /// `D` — df-doublings per IDF weight step in the overlap counter (the lone rarity-weighting
     /// knob). `1.0` (the default) means each weight level is one more halving of df relative to
     /// the query's commonest survivor. Larger `D` widens the steps (more grams share a tier).
-    /// `N`-invariant, so it does not go stale on insert.
+    /// `N`-invariant, so it does not go stale on insert. [`Stats::weight_step_hint`] suggests a
+    /// corpus-fitted value.
     pub weight_step: f64,
     /// An optional [`Filter`] over the schema's **filterable** fields (Tier 2). Applied as
     /// a doc-id intersection during candidate generation — it prunes before the ranker and
@@ -336,7 +341,9 @@ impl Default for SearchOpts<'_> {
 }
 
 /// A read-only snapshot of the index's observable state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Not `Eq` because [`weight_step_hint`](Stats::weight_step_hint) carries floats.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Stats {
     /// Number of indexed segments (`N`).
     pub segments: u64,
@@ -356,6 +363,31 @@ pub struct Stats {
     /// The schema fingerprint currently stamped — the semantic identity of the declared
     /// data model (folded into the drift check).
     pub schema_fingerprint: u64,
+    /// A corpus-derived suggestion for [`SearchOpts::weight_step`] `D`, accumulated from the
+    /// band-spreads of the searches run since this index was opened. `None` until at least one
+    /// search has run. See [`WeightStepHint`].
+    pub weight_step_hint: Option<WeightStepHint>,
+}
+
+/// A suggested [`SearchOpts::weight_step`] `D`, with the band-spread distribution it came from
+/// so a caller can judge whether a single `D` fits the corpus.
+///
+/// Built from the per-query band-spreads (`log2(df_max/df_min)`) observed since the index was
+/// opened. `suggested ≈ median / 3` (so a median-width band spans ~3 tier steps → uses
+/// weights 1–4). The `iqr` is the confidence signal: a tight IQR means one `D` fits; a wide
+/// or bimodal one means the corpus has multiple query regimes and no single `D` is ideal.
+/// Spreads are bucketed at `0.5`-doubling granularity, so these are bucket-midpoint estimates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WeightStepHint {
+    /// The suggested `D` (`max(0.5, median_spread / 3)`).
+    pub suggested: f64,
+    /// Median per-query band-spread, in df-doublings.
+    pub median_spread: f64,
+    /// The interquartile range `(Q1, Q3)` of band-spreads, in df-doublings — the spread of
+    /// the spreads (the confidence signal).
+    pub iqr: (f64, f64),
+    /// How many searches contributed (the sample size behind the suggestion).
+    pub samples: u64,
 }
 
 /// What a [`compact`](Index::compact) reclaimed.
@@ -396,6 +428,11 @@ pub struct Index<T: Tokenizer = DefaultTokenizer, B: Backend = Sidecar> {
     /// Every lease then fails closed until the caller reopens (or a later `rebuild` succeeds
     /// and clears it) — far better than silently serving from a stale dictionary (audit C2-FB-C1).
     poisoned: AtomicBool,
+    /// In-memory per-query band-spread histogram: each search adds one sample,
+    /// `log2(df_max/df_min)` over its present postings, bucketed in `HINT_BUCKET_WIDTH`
+    /// df-doublings. [`stats`](Self::stats) derives a suggested [`weight_step`](SearchOpts::weight_step)
+    /// `D` from it. Telemetry only — process-local, never persisted, reset by reopening.
+    band_spread_hist: [AtomicU64; HINT_BUCKETS],
 }
 
 impl Index<DefaultTokenizer, Sidecar> {
@@ -432,6 +469,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             schema,
             dict: Dictionary::empty(),
             poisoned: AtomicBool::new(false),
+            band_spread_hist: std::array::from_fn(|_| AtomicU64::new(0)),
         };
         index.init()?;
         // Hydrate the in-memory dictionary from the (possibly just-reset) `dict` table.
@@ -483,6 +521,26 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             ));
         }
         Ok(())
+    }
+
+    /// Record one query's band-spread (`log2(df_max/df_min)` over its present postings) into
+    /// the in-memory histogram that backs the [`Stats`] weight-step hint. A no-op for a query
+    /// with no present postings. Cheap: one `log2` + one atomic increment per query.
+    fn observe_band_spread(&self, present: &[(&str, &RoaringBitmap)]) {
+        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        for (_, bm) in present {
+            let df = bm.len();
+            if df > 0 {
+                lo = lo.min(df);
+                hi = hi.max(df);
+            }
+        }
+        if hi == 0 {
+            return; // no present postings — nothing to sample
+        }
+        let spread = (hi as f64 / lo.max(1) as f64).log2();
+        let bucket = ((spread / HINT_BUCKET_WIDTH) as usize).min(HINT_BUCKETS - 1);
+        self.band_spread_hist[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     /// A cheap consistency probe: the monotonic-id invariant `max(seg.id) < next_id`.
@@ -1042,6 +1100,40 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             schema_fingerprint: stamps
                 .schema_fingerprint
                 .unwrap_or_else(|| self.schema.fingerprint()),
+            weight_step_hint: self.weight_step_hint(),
+        })
+    }
+
+    /// Derive a [`WeightStepHint`] from the in-memory band-spread histogram (the searches run
+    /// since open). `None` until at least one search has contributed.
+    fn weight_step_hint(&self) -> Option<WeightStepHint> {
+        let hist: [u64; HINT_BUCKETS] =
+            std::array::from_fn(|b| self.band_spread_hist[b].load(Ordering::Relaxed));
+        let total: u64 = hist.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        // Nearest-rank quantile over the bucketed spreads, reported at the bucket midpoint.
+        let quantile = |p: f64| -> f64 {
+            let target = (p * total as f64).ceil().max(1.0) as u64;
+            let mut cum = 0u64;
+            for (b, &count) in hist.iter().enumerate() {
+                cum += count;
+                if cum >= target {
+                    return b as f64 * HINT_BUCKET_WIDTH + HINT_BUCKET_WIDTH / 2.0;
+                }
+            }
+            (HINT_BUCKETS - 1) as f64 * HINT_BUCKET_WIDTH + HINT_BUCKET_WIDTH / 2.0
+        };
+        let median_spread = quantile(0.5);
+        // A median band spanning ~3 tier steps uses weights 1–4, so D ≈ median / 3; floor it
+        // at a sane sharpest practical value so the suggestion is always a usable `D > 0`.
+        let suggested = (median_spread / 3.0).max(0.5);
+        Some(WeightStepHint {
+            suggested,
+            median_spread,
+            iqr: (quantile(0.25), quantile(0.75)),
+            samples: total,
         })
     }
 
@@ -1176,6 +1268,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                         .map(|bm| (t.as_str(), bm))
                 })
                 .collect();
+            // Telemetry for the weight-step hint (df-only; no corpus read).
+            self.observe_band_spread(&present);
 
             let mut survivors = overlap_search(
                 conn,

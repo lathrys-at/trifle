@@ -2,7 +2,8 @@
 //! - C2-RA-1: `remove_segment` emptying a document must reap its `doc` row so its
 //!   filterable payload can't leak into a later insert under the same key.
 //! - Ranking: IDF-weighted overlap surfaces rare-gram matches; presence-not-frequency; the
-//!   `D` weight-step knob; and a custom [`Ranker`] scoring from the public signals.
+//!   `D` weight-step knob; a custom [`Ranker`] scoring from the public signals; and the
+//!   corpus-derived `D` hint surfaced through `stats()`.
 
 mod common;
 use common::*;
@@ -337,5 +338,42 @@ fn custom_ranker_can_score_from_public_signals() {
         hits[0].key.as_i64(),
         Some(50),
         "a custom idf ranker reads per-term df and ranks the rare match first"
+    );
+}
+
+// ----- the weight-step (D) hint surfaced through stats() -----
+
+#[test]
+fn stats_suggests_a_weight_step_from_observed_band_spreads() {
+    let h = Harness::new();
+    for doc in 1..=20 {
+        h.put(doc, "field", "f", "commonword"); // df 20 for its grams
+    }
+    h.put(50, "field", "f", "rarezzq"); // df 1 for its grams
+
+    // No searches yet → no hint to give.
+    assert!(h.index.stats().unwrap().weight_step_hint.is_none());
+
+    // Run searches whose survivors span a wide band (df 20 vs df 1 ≈ 4.3 doublings).
+    for _ in 0..5 {
+        let _ = h.search("rarezzq commonword", SearchOpts::new(5)).unwrap();
+    }
+    let hint = h
+        .index
+        .stats()
+        .unwrap()
+        .weight_step_hint
+        .expect("a hint after some searches");
+    assert_eq!(hint.samples, 5, "one band-spread sample per search");
+    assert!(
+        hint.median_spread > 3.0 && hint.median_spread < 6.0,
+        "median band-spread ≈ log2(20) doublings, got {}",
+        hint.median_spread
+    );
+    // suggested = max(0.5, median/3).
+    assert!((hint.suggested - (hint.median_spread / 3.0).max(0.5)).abs() < 1e-9);
+    assert!(
+        hint.iqr.0 <= hint.median_spread && hint.median_spread <= hint.iqr.1,
+        "median lies within the IQR"
     );
 }

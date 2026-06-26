@@ -273,6 +273,46 @@ fn rebuild_indexes_all_labels_of_a_doc() {
     assert!(finds(&h, "first cat", 1) && finds(&h, "second dog", 1) && finds(&h, "third bird", 1));
 }
 
+// T1 (I-N1): rebuild folds the filterable payload into the doc INSERT (one write per
+// doc). Assert the payload survives the rebuild and is usable as a Tier-2 filter, and that
+// a doc with no payload binds a NULL column (doesn't crash, and is excluded by the filter).
+#[test]
+fn rebuild_preserves_filterable_payload() {
+    use trifle::rusqlite::types::Value;
+    use trifle::{Filter, FilterType};
+    let schema = Schema::chunked()
+        .text("body")
+        .filterable("deck", FilterType::Int)
+        .build()
+        .unwrap();
+    let h = Harness::with_schema(schema, Config::default());
+    h.index
+        .rebuild([
+            Document::new(1, vec![("body".into(), "alpha bravo charlie".into())])
+                .with_payload(vec![("deck".into(), Value::Integer(7))]),
+            // No payload → NULL deck column (exercises the absent-field bind).
+            Document::new(2, vec![("body".into(), "alpha bravo delta".into())]),
+        ])
+        .unwrap();
+
+    // Both docs are findable without a filter.
+    let all = h.search("alpha bravo", SearchOpts::new(10)).unwrap();
+    assert!(
+        hit(&all, 1) && hit(&all, 2),
+        "both rebuilt docs are searchable"
+    );
+
+    // The payload survives the rebuild and is usable as a filter; the NULL-deck doc is excluded.
+    let deck7 = h
+        .search(
+            "alpha bravo",
+            SearchOpts::new(10).filter(&Filter::eq("deck", 7i64)),
+        )
+        .unwrap();
+    assert!(hit(&deck7, 1), "deck=7 doc is filterable after rebuild");
+    assert!(!hit(&deck7, 2), "the NULL-deck doc is excluded by deck=7");
+}
+
 #[test]
 fn rebuild_on_an_empty_corpus_empties_and_stays_usable() {
     let h = Harness::new();

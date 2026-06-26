@@ -961,11 +961,29 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let mut next_doc: i64 = 1;
         let mut next_seg: i64 = 1;
         let mut total_seg_len: i64 = 0;
+        // The shadow `doc` schema is known here, so fold the filterable columns straight into
+        // the INSERT column list and bind their values inline — one write per document instead
+        // of a bare `doc` INSERT plus a separate per-payload `UPDATE` (`set_doc_fields`) on the
+        // heaviest path (audit T1 / I-N1). Columns are in declaration order; an absent payload
+        // field binds NULL (the column's implicit default), so the result matches the old
+        // insert-then-update path exactly.
+        let filt_cols: Vec<&str> = self
+            .schema
+            .filterable_columns()
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let doc_ins_sql = {
+            let mut cols = String::from("id, key");
+            let mut binds = String::from("?1, ?2");
+            for (i, col) in filt_cols.iter().enumerate() {
+                cols.push_str(&format!(", \"{col}\"")); // double-quoted: keyword-safe column
+                binds.push_str(&format!(", ?{}", i + 3));
+            }
+            format!("INSERT INTO {}({cols}) VALUES({binds})", ns.doc_shadow())
+        };
         {
-            let mut doc_ins = tx.prepare_cached(&format!(
-                "INSERT INTO {}(id, key) VALUES(?1, ?2)",
-                ns.doc_shadow()
-            ))?;
+            let mut doc_ins = tx.prepare_cached(&doc_ins_sql)?;
             let mut seg_ins = tx.prepare_cached(&format!(
                 "INSERT INTO {}(id, doc_id, label, txt, len) VALUES(?1, ?2, ?3, ?4, ?5)",
                 ns.seg_shadow()
@@ -977,10 +995,19 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             for doc in corpus {
                 let doc_id = next_doc;
                 next_doc += 1;
-                doc_ins.execute(rusqlite::params![doc_id, doc.key.to_value()])?;
-                if !doc.payload.is_empty() {
-                    self.set_doc_fields(&tx, ns.doc_shadow(), doc_id, &doc.payload)?;
+                let mut doc_params: Vec<Value> = Vec::with_capacity(2 + filt_cols.len());
+                doc_params.push(Value::Integer(doc_id));
+                doc_params.push(doc.key.to_value());
+                for &col in &filt_cols {
+                    let v = doc
+                        .payload
+                        .iter()
+                        .find(|(n, _)| n.as_str() == col)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null);
+                    doc_params.push(v);
                 }
+                doc_ins.execute(rusqlite::params_from_iter(doc_params))?;
                 for (label, text) in &doc.segments {
                     if !self.schema.accepts_label(label) {
                         return Err(Error::InvalidInput(format!(

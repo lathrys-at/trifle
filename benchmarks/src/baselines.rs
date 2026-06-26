@@ -137,13 +137,11 @@ impl Trifle {
             .collect()
     }
 
-    /// Search the top-`pool` overlap candidates, reranked by the BM25 precision tier,
-    /// returning doc ids best-first. Exact pool control for the `ranksweep` calibration:
-    /// `Effort::None` disables the √(kN) auto-pool (so pool == `limit`), while the
-    /// explicit ranker still reranks. recall@k for any `k <= pool` is `id in result[..k]`.
+    /// Search the top-`pool` candidates by IDF-weighted overlap, returning doc ids best-first.
+    /// Exact pool control for the `ranksweep` calibration: `Effort::None` disables the √(kN)
+    /// auto-pool (so pool == `limit`). recall@k for any `k <= pool` is `id in result[..k]`.
     pub fn search_pool(&self, query: &str, pool: usize) -> Vec<i64> {
-        let ranker = trifle::rank::Bm25Ranker;
-        let mut o = SearchOpts::new(pool).ranker(&ranker).rerank(Effort::None);
+        let mut o = SearchOpts::new(pool).rerank(Effort::None);
         if let Some(m) = self.tuning.min_shared {
             o = o.min_shared(m);
         }
@@ -164,11 +162,7 @@ impl Trifle {
     /// so the rarest `t_max` query trigrams are kept — selection is the swept variable
     /// while the pool is held generous. Backs the t_max knee sweep (`tools/tmax_knee.py`).
     pub fn search_pool_tmax(&self, query: &str, pool: usize, t_max: usize) -> Vec<i64> {
-        let ranker = trifle::rank::Bm25Ranker;
-        let mut o = SearchOpts::new(pool)
-            .ranker(&ranker)
-            .rerank(Effort::None)
-            .t_max(t_max);
+        let mut o = SearchOpts::new(pool).rerank(Effort::None).t_max(t_max);
         if let Some(m) = self.tuning.min_shared {
             o = o.min_shared(m);
         }

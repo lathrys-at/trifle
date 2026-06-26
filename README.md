@@ -66,9 +66,9 @@ has a **key** and one or more named **segments**:
   locatable) a byte `span`.
 - **segment** — a `(label, text)` pair under a key. `label` is a free-form name returned on
   a match so you know which segment matched; a document holds each label at most once. Every
-  indexed text field is **stored** and returned on a match (and surfaced to the reranker).
-  The segment is the ranking unit (BM25+ over its terms); fuse across a key's segments with
-  a custom `Ranker`.
+  indexed text field is **stored** and returned on a match (and surfaced to a custom ranker).
+  The segment is the ranking unit (IDF-weighted overlap over its grams); fuse across a key's
+  segments above trifle (aggregate across your keys).
 - `Schema::flat()` is the simplest shape: an integer key and one default text field that
   accepts any label. `Schema::chunked()` / the builder declare named text fields and
   **filterable** columns (stored, indexed, used only for filtering — never reranked).
@@ -93,12 +93,14 @@ This covers two common patterns:
   fixed-width tokenizer for single-script corpora.
 - **Configurable normalization** — NFC (default), NFD, accent-insensitive
   (`NfdStripMarks`), or none. Unicode casefolding is on by default.
-- **Reranking** — bit-sliced posting-list overlap generates candidates; the default
-  `Effort::Medium` reranks a pool of ~`c·√(k·N)` with **BM25+** over the matched terms (idf,
-  length normalization against the online mean segment length, the `δ` lower bound). Tune
-  via `SearchOpts::rerank(Effort)` (`None` through `Max`), or supply a custom `Ranker`.
+- **Ranking** — **IDF-weighted bit-sliced overlap**, computed in the counter itself: each
+  selected gram is weighted by rarity (a per-query, df-anchored 4-tier scheme, weights
+  `{1,2,3,4}`; knob `D` via `SearchOpts::weight_step`), so a rare shared gram outweighs a
+  common one. This is a fuzzy lexical overlap engine, **not** a relevance engine — there is no
+  BM25 tier. For a domain-specific reorder, supply a custom `Ranker` and over-fetch a pool with
+  `SearchOpts::rerank(Effort)` (`None` through `Max`; default `None`).
 - **Filtering** — declare `filterable` columns and pass a structured `Filter` (comparisons,
-  `In`/`Between`/`IsNull`/`Like`, `And`/`Or`) to cut the rerank set; plus a `scope`
+  `In`/`Between`/`IsNull`/`Like`, `And`/`Or`) to cut the candidate set; plus a `scope`
   predicate evaluated over candidates only.
 
 ## Usage
@@ -162,7 +164,7 @@ when choosing one:
 
 | | embedded (no server)? | updates | scales to 1M+ small docs? | provenance | matching semantics | storage |
 |---|---|---|---|---|---|---|
-| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | key / label | trigram overlap + BM25+ rerank | disk (SQLite) |
+| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | key / label | IDF-weighted trigram overlap | disk (SQLite) |
 | **[SQLite FTS5](https://www.sqlite.org/fts5.html#the_trigram_tokenizer)** | yes | incremental | yes | rowid | trigram substring (`MATCH` / `LIKE`) | disk (SQLite) |
 | **[pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html)** | no (server) | incremental (GIN / GiST) | yes | table rows | trigram similarity | disk (server) |
 | **[Tantivy](https://github.com/quickwit-oss/tantivy)** | yes | incremental (segments) | yes | stored fields | Levenshtein automaton (≤ 2 edits) | disk (segments) |
@@ -174,8 +176,8 @@ RAM-resident and is rebuilt each run, but they keep no durable index. pg_trgm fi
 already run Postgres; Tantivy is the fuller embedded library — field schemas, stored
 documents, edit-distance term queries — when you want Lucene-shaped search. FTS5 and Trifle
 both live in a SQLite file: FTS5 matches substrings against its trigram index through
-`MATCH`/`LIKE`, while Trifle generates candidates by trigram overlap and reranks them with a
-BM25-shaped scorer.
+`MATCH`/`LIKE`, while Trifle ranks by IDF-weighted trigram overlap (rarer shared grams weigh
+more) — a fuzzy lexical engine, not a relevance engine.
 
 ## Non-goals
 

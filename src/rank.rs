@@ -1,13 +1,23 @@
-//! Ranking — bit-sliced overlap counting (fixed candidate generation) and the
-//! pluggable [`Ranker`] that orders the survivors.
+//! Ranking — IDF-weighted bit-sliced overlap counting (the candidate generator *is* the
+//! ranking) and the pluggable [`Ranker`] for an optional custom reorder.
 //!
-//! Candidate generation is fixed and fast: read each selected token's posting (no
-//! decode — an owned roaring posting *is* the bitmap) and count overlap with a
-//! **bit-sliced counter**. Each id's count is held in binary across bitmap "bit
-//! planes"; adding a posting is a ripple-carry binary add at the bitmap level
-//! (XOR = sum bit, AND = carry), so the whole accumulation is `O(k·log k)` bitmap
-//! ops — independent of posting size. A high→low bucket walk hydrates provenance
-//! bucket-by-bucket and early-stops once `limit` results lock.
+//! trifle is a **fuzzy lexical overlap engine, not a relevance engine**. It ranks by
+//! IDF-weighted token overlap, computed in one pass: read each selected token's posting (no
+//! decode — an owned roaring posting *is* the bitmap) and accumulate it into a **bit-sliced
+//! counter**, weighted by the token's rarity. Each id's running count is held in binary
+//! across bitmap "bit planes"; adding `w` copies of a posting injects a carry at each set bit
+//! of `w` and ripples it up (XOR = sum bit, AND = carry), so the accumulation stays
+//! `O(k·log k)` bitmap ops (popcount(w) ≤ 2 ripples per token for weights in 1..=4),
+//! independent of posting size. A high→low bucket walk hydrates provenance bucket-by-bucket
+//! and early-stops once `limit` results lock.
+//!
+//! **The weights** are a per-query, df-anchored 4-tier scheme (weights `{1,2,3,4}`): for the
+//! query's survivors, the most-common (least discriminative) gram gets weight 1 and rarer
+//! grams get more, spaced in absolute df-doublings (`log2(df_max/df_i)`). Because IDF *gaps*
+//! are `N`-independent (`log(N/df_i) − log(N/df_j) = log(df_j/df_i)`), this needs no corpus
+//! size, nothing stored, and nothing precomputed — just the survivor df's already fetched for
+//! pruning, and one knob `D` (df-doublings per weight step;
+//! [`weight_step`](crate::SearchOpts::weight_step)).
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -23,43 +33,84 @@ use crate::store::Namespace;
 
 /// One ranked segment that survived candidate generation: its provenance (the caller
 /// key and the segment label), the internal doc id it dedups on, the segment id used for
-/// hydration, its overlap count, and (once hydrated) its text.
+/// hydration, its IDF-weighted score and raw overlap count, and (once hydrated) its text.
 pub(crate) struct Survivor {
     pub key: Key,
     pub label: String,
     /// Internal document id — the dedup unit (one survivor per document).
     pub doc: u32,
     pub seg_id: u32,
+    /// The IDF-weighted overlap score (the bit-sliced bucket value) — the ordering key.
+    pub score: u32,
+    /// The raw count of distinct selected tokens shared (unweighted); the `min_shared`
+    /// floor is enforced against this, and [`Candidate::overlap`] returns it.
     pub overlap: u32,
     /// The matched segment's text — empty until [`hydrate_text`](crate::Index) fills it
     /// (every indexed field is stored, so a survivor's text is always populated before
     /// ranking).
     pub text: String,
-    /// The segment's gram length (`|d|`) for BM25+ length normalization — `0` until
-    /// hydrated alongside the text.
+    /// The segment's gram length (`|d|`), kept for a custom [`Ranker`] — `0` until hydrated
+    /// alongside the text.
     pub len: u32,
 }
 
-/// Bit-sliced overlap counting. Returns the count "bit planes" `acc` where a given
-/// id's overlap count is `Σ_b 2^b · [id ∈ acc[b]]`. Adds each input bitmap with a
-/// ripple-carry across the planes, so the per-id overlap for *every* id is computed
-/// in `O(k·log k)` bitmap ops — `O(containers)`, independent of posting size.
-fn bitsliced_overlap(bitmaps: &[&RoaringBitmap]) -> Vec<RoaringBitmap> {
-    let mut acc: Vec<RoaringBitmap> = Vec::new();
-    for &b in bitmaps {
-        let mut carry = b.clone();
-        let mut level = 0usize;
-        while !carry.is_empty() {
-            if level == acc.len() {
-                acc.push(RoaringBitmap::new());
+/// Add `w` copies of `posting` into the bit-sliced planes `acc` (BSI weighted
+/// accumulation): inject a carry at each set bit of `w` and ripple it up
+/// (XOR = sum bit, AND = carry). Cost is `popcount(w)` ripples — for `w` in `1..=4` that
+/// is ≤ 2, vs 1 for an unweighted add.
+fn add_weighted(acc: &mut Vec<RoaringBitmap>, posting: &RoaringBitmap, w: u32) {
+    let mut bit = 0u32;
+    while (w >> bit) != 0 {
+        if (w >> bit) & 1 == 1 {
+            // Inject 2^bit · posting at plane `bit` and ripple the carry upward. `bit` can
+            // start past the current top plane, so grow the planes up to `level` (not just by
+            // one) before indexing.
+            let mut carry = posting.clone();
+            let mut level = bit as usize;
+            while !carry.is_empty() {
+                while acc.len() <= level {
+                    acc.push(RoaringBitmap::new());
+                }
+                let new_carry = &acc[level] & &carry; // carry-out = already-set AND incoming
+                acc[level] ^= &carry; // sum bit at this plane
+                carry = new_carry;
+                level += 1;
             }
-            let new_carry = &acc[level] & &carry; // carry-out = already-set AND incoming
-            acc[level] ^= &carry; // sum bit at this plane
-            carry = new_carry;
-            level += 1;
         }
+        bit += 1;
+    }
+}
+
+/// IDF-weighted bit-sliced overlap counting. Returns the count "bit planes" `acc` where a
+/// given id's weighted score is `Σ_b 2^b · [id ∈ acc[b]]`. Each posting contributes its
+/// IDF-tier weight (`weights[i]`), accumulated via [`add_weighted`], so the per-id weighted
+/// overlap for *every* id is computed in `O(k·log k)` bitmap ops — `O(containers)`,
+/// independent of posting size. `weights` is parallel to `bitmaps`.
+fn weighted_overlap(bitmaps: &[&RoaringBitmap], weights: &[u32]) -> Vec<RoaringBitmap> {
+    let mut acc: Vec<RoaringBitmap> = Vec::new();
+    for (b, &w) in bitmaps.iter().zip(weights) {
+        add_weighted(&mut acc, b, w);
     }
     acc
+}
+
+/// The per-query, df-anchored IDF tier weight `{1,2,3,4}` for each posting, from the
+/// survivors' df (posting cardinality). The most-common survivor (`df_max`) gets weight 1;
+/// rarer grams get more, spaced in df-doublings: `1 + min(3, round(log2(df_max/df_i) / D))`.
+/// `D` (> 0) is the df-doublings per weight step; `weights[i]` is parallel to `bitmaps`.
+/// `N`-free by construction — IDF *gaps* don't depend on corpus size.
+fn tier_weights(bitmaps: &[&RoaringBitmap], d: f64) -> Vec<u32> {
+    let d = if d > 0.0 { d } else { 1.0 };
+    let df_max = bitmaps.iter().map(|b| b.len()).max().unwrap_or(1).max(1) as f64;
+    bitmaps
+        .iter()
+        .map(|b| {
+            let df = b.len().max(1) as f64;
+            // df ≤ df_max ⇒ ratio ≥ 1 ⇒ steps ≥ 0; cap at 3 so weight ∈ 1..=4.
+            let steps = ((df_max / df).log2() / d).round().max(0.0) as u32;
+            1 + steps.min(3)
+        })
+        .collect()
 }
 
 /// The ids whose bit-sliced overlap count is exactly `c`: AND the planes `c` has
@@ -89,16 +140,21 @@ fn count_eq(acc: &[RoaringBitmap], c: u32) -> RoaringBitmap {
     out
 }
 
-/// Generate and rank candidates by overlap, hydrating only as deep as the top-`limit`
-/// needs.
+/// Generate and rank candidates by IDF-weighted overlap, hydrating only as deep as the
+/// top-`limit` needs.
 ///
-/// Walks the overlap-count buckets high → low; each bucket hydrates its ids'
-/// provenance in one batched read, applies the scope predicate, and records the best
-/// segment per doc (highest count; lowest id as the tie-break). Once `limit` docs are
-/// locked at a count, no lower bucket can displace them, so the walk stops — bounding
-/// hydration to the high-overlap head. An id present in a posting but with no `seg`
-/// row (a monotonic-id segment deleted since the last fold) simply does not hydrate,
-/// so it never ranks.
+/// Weights each selected token by rarity ([`tier_weights`], knob `D = weight_step`),
+/// accumulates the weighted bit-sliced counter, then walks the weighted-score buckets
+/// high → low. Each bucket hydrates its ids' provenance in one batched read, applies the
+/// Tier-2 filter and scope predicate, and records the best segment per doc (highest weighted
+/// score; lowest id as the tie-break). Once `limit` docs lock at a score, no lower bucket can
+/// displace them, so the walk stops — bounding hydration to the high-score head. An id in a
+/// posting with no `seg` row (a monotonic-id segment deleted since the last fold) does not
+/// hydrate, so it never ranks.
+///
+/// The `min_shared` floor stays a **raw** token count: since every weight ≥ 1, a candidate's
+/// weighted score is ≥ its raw overlap, so the walk can stop at weighted score `floor` and
+/// still need only a per-candidate raw-count check to drop high-weight/low-overlap ids.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn overlap_search(
     conn: &Connection,
@@ -106,6 +162,7 @@ pub(crate) fn overlap_search(
     present: &[(&str, &RoaringBitmap)],
     limit: usize,
     min_shared: u32,
+    weight_step: f64,
     key_shape: KeyShape,
     filter_docs: Option<&RoaringBitmap>,
     scope: Option<&crate::ScopeFn<'_>>,
@@ -115,11 +172,15 @@ pub(crate) fn overlap_search(
         return Ok(Vec::new());
     }
     // The per-query overlap floor: a candidate must share at least `min(m, |present|)`
-    // selected tokens. Basing it on the postings actually present (not the raw
-    // selection) means appended absent tokens never inflate it, so a query whose only
+    // selected tokens (raw, unweighted). Basing it on the postings actually present (not the
+    // raw selection) means appended absent tokens never inflate it, so a query whose only
     // present token is a single n-gram still ranks at overlap 1.
     let floor = (min_shared as usize).min(bitmaps.len()).max(1) as u32;
-    let max_count = bitmaps.len() as u32;
+    let weights = tier_weights(&bitmaps, weight_step);
+    let max_score = weights.iter().sum::<u32>();
+    // Raw overlap of `id` — how many present postings contain it (the unweighted count the
+    // `min_shared` floor is enforced against).
+    let raw_overlap = |id: u32| -> u32 { bitmaps.iter().filter(|b| b.contains(id)).count() as u32 };
 
     // The `Σ kept-posting cardinality` instrumentation: computed only when
     // the `tracing` feature is on (the macro does not evaluate its arguments
@@ -128,24 +189,31 @@ pub(crate) fn overlap_search(
         postings = bitmaps.len(),
         sum_cardinality = bitmaps.iter().map(|b| b.len()).sum::<u64>(),
         floor,
-        "trifle: overlap candidate generation"
+        max_score,
+        "trifle: weighted overlap candidate generation"
     );
 
-    let acc = bitsliced_overlap(&bitmaps);
+    let acc = weighted_overlap(&bitmaps, &weights);
 
-    // internal doc id -> its best (highest-count, lowest-seg-id) segment.
+    // internal doc id -> its best (highest weighted score, lowest-seg-id) segment.
     let mut best: HashMap<u32, Survivor> = HashMap::new();
-    for c in (floor..=max_count).rev() {
+    for c in (floor..=max_score).rev() {
         let bucket = count_eq(&acc, c);
         if !bucket.is_empty() {
             let ids: Vec<u32> = bucket.iter().collect();
             let provenance = hydrate_provenance(conn, ns, &ids, key_shape)?;
             // `ids` is ascending (bitmap order), so the first segment recorded for a
-            // doc is its lowest id at this — its highest — count.
+            // doc is its lowest id at this — its highest — score.
             for id in ids {
                 let Some((doc, key, label)) = provenance.get(&id) else {
                     continue; // posting id with no live segment row — skip
                 };
+                // A high-weight rare gram alone can reach score ≥ floor with raw overlap
+                // below the floor; enforce the raw `min_shared` floor per candidate.
+                let overlap = raw_overlap(id);
+                if overlap < floor {
+                    continue;
+                }
                 // Tier-2 filter: keep only docs passing the structured filter.
                 if let Some(fd) = filter_docs {
                     if !fd.contains(*doc) {
@@ -162,7 +230,8 @@ pub(crate) fn overlap_search(
                     label: label.clone(),
                     doc: *doc,
                     seg_id: id,
-                    overlap: c,
+                    score: c,
+                    overlap,
                     text: String::new(),
                     len: 0,
                 });
@@ -174,12 +243,12 @@ pub(crate) fn overlap_search(
     }
 
     let mut survivors: Vec<Survivor> = best.into_values().collect();
-    // Overlap descending, then internal doc id ascending — stable, deterministic.
-    survivors.sort_by(|a, b| b.overlap.cmp(&a.overlap).then(a.doc.cmp(&b.doc)));
+    // Weighted score descending, then internal doc id ascending — stable, deterministic.
+    survivors.sort_by(|a, b| b.score.cmp(&a.score).then(a.doc.cmp(&b.doc)));
     survivors.truncate(limit);
     trace_debug!(
         survivors = survivors.len(),
-        "trifle: overlap survivors locked"
+        "trifle: weighted overlap survivors locked"
     );
     Ok(survivors)
 }
@@ -219,15 +288,16 @@ fn hydrate_provenance(
     Ok(out)
 }
 
-/// Reorders the overlap-counted candidates into the final result order.
+/// Optionally reorders the IDF-weighted-overlap survivors into a different final order.
 ///
-/// The default [`OverlapRanker`] orders by overlap (free — it reads only counts).
-/// A richer ranker spends more for quality — the built-in [`Bm25Ranker`] (idf + BM25+
-/// length normalization over terms), or a custom one doing proximity, true term-frequency,
-/// or exact-substring promotion — over the segment text each candidate carries. The inputs a
-/// BM25-style custom ranker needs are public: [`Candidate::matched_terms`] (each matched
-/// token with its `df`), [`Candidate::seg_len`] (`|d|`), and [`QueryContext::n_segments`] /
-/// [`QueryContext::avgdl`].
+/// trifle ranks by IDF-weighted lexical overlap in the counter itself, so the **default**
+/// [`OverlapRanker`] just preserves that order — there is no built-in relevance/BM25 tier.
+/// A custom ranker can reorder for a domain need (proximity, true term-frequency,
+/// exact-substring promotion, …) over the segment text each candidate carries. The signals
+/// it can read are public: [`Candidate::overlap`] / [`Candidate::score`],
+/// [`Candidate::matched_terms`] (each matched token with its `df`), [`Candidate::seg_len`],
+/// and [`QueryContext::n_segments`] / [`QueryContext::avgdl`]. Over-fetch a deeper pool with
+/// [`Effort`](crate::Effort) so the reorder has candidates to pull up.
 ///
 /// **The unit is the segment.** Candidate generation reduces each document to its single
 /// best-matching segment before the ranker runs, so a ranker sees one candidate per document
@@ -239,9 +309,9 @@ pub trait Ranker: Send + Sync {
     fn rank(&self, candidates: &Candidates<'_>, query: &QueryContext<'_>) -> Vec<Ranked>;
 }
 
-/// The default ranker when [`Effort`](crate::Effort) reranking is **off**: order by
-/// overlap count. Reads only the counts the bit-sliced pass already produced, so it is
-/// effectively free — the candidates arrive overlap-descending and this preserves it.
+/// The default ranker: preserve the IDF-weighted-overlap order the bit-sliced counter
+/// already produced. Reads nothing — the candidates arrive weighted-score-descending and
+/// this is the identity over them, so it is effectively free.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OverlapRanker;
 
@@ -249,93 +319,6 @@ impl Ranker for OverlapRanker {
     fn rank(&self, candidates: &Candidates<'_>, _query: &QueryContext<'_>) -> Vec<Ranked> {
         (0..candidates.len())
             .map(|candidate| Ranked { candidate })
-            .collect()
-    }
-}
-
-/// BM25 idf for a token present in `df` of `n` segments, clamped at zero. For `df <= n`
-/// the value is already non-negative; the clamp only guards the `df > n` case a desynced
-/// posting could produce, so a match can never score *negative*.
-///
-/// Public so a custom [`Ranker`] can weight by the same idf the built-in [`Bm25Ranker`]
-/// uses, fed from [`Candidate::matched_terms`] and [`QueryContext::n_segments`].
-pub fn idf(df: u64, n: u64) -> f64 {
-    let (df, n) = (df as f64, n as f64);
-    (1.0 + (n - df + 0.5) / (df + 0.5)).ln().max(0.0)
-}
-
-/// The precision-tier reranker run over an over-fetched pool when
-/// [`Effort`](crate::Effort) reranking is on (the default): **real BM25+** over the index's
-/// **terms** (the n-grams), with the segment as the unit ("document"):
-///
-/// `score(seg) = Σ_{t ∈ query ∩ seg} idf(t) · [ (k1+1)·tf / (tf + k1·(1 − b + b·|d|/avgdl)) + δ ]`
-///
-/// - **idf(t)** is the BM25 idf from the term's `df` (segments containing it) over `N`
-///   segments — rare shared terms count far more than common ones.
-/// - **length normalization** uses the segment's gram length `|d|` against `avgdl` (the
-///   online mean segment length), so a long segment doesn't win on incidental overlap. The
-///   `δ` lower bound is BM25+'s fix for BM25 over-penalizing long documents.
-/// - **tf is binary** (`tf = 1` for a present term): the bit-sliced index records presence,
-///   not per-term counts, and for short n-gram segments a gram's tf is almost always 1, so
-///   a presence-frequency BM25+ is the faithful-and-cheap form. (An application that needs
-///   true tf can recompute it from each candidate's segment text in a custom [`Ranker`];
-///   cross-segment fusion is not a ranker concern — the ranker sees one best segment per
-///   document — so fuse above trifle.)
-///
-/// The ad-hoc literal/substring tier of the previous scorer is **gone** — verifying exact
-/// substrings is the frontend's job (highlighting/annotation), not the ranker's. Reads only
-/// posting cardinalities and the (already-hydrated) segment length — no extra store reads.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Bm25Ranker;
-
-impl Ranker for Bm25Ranker {
-    fn rank(&self, candidates: &Candidates<'_>, query: &QueryContext<'_>) -> Vec<Ranked> {
-        // BM25 saturation (k1) and length-normalization (b) parameters; BM25+ lower bound δ.
-        const K1: f64 = 1.2;
-        const B: f64 = 0.75;
-        const DELTA: f64 = 1.0;
-        let n = query.n_segments.max(1);
-        let avgdl = query.avgdl;
-        // idf is invariant across candidates for a given present term — compute it once
-        // (audit I19), not per (candidate × term).
-        let idfs: Vec<f64> = candidates
-            .present
-            .iter()
-            .map(|(_, bm)| idf(bm.len(), n))
-            .collect();
-
-        let mut scored: Vec<(usize, f64, u32)> = (0..candidates.len())
-            .map(|i| {
-                let s = &candidates.survivors[i];
-                // Length-normalized tf component (binary tf = 1), shared by all of this
-                // segment's present terms. avgdl == 0 (empty corpus) → no length norm.
-                let dl = (s.len as f64).max(1.0);
-                let norm = if avgdl > 0.0 {
-                    1.0 - B + B * dl / avgdl
-                } else {
-                    1.0
-                };
-                let tf_component = (K1 + 1.0) / (1.0 + K1 * norm) + DELTA;
-                let mut idf_sum = 0.0;
-                for (j, (_, bm)) in candidates.present.iter().enumerate() {
-                    if bm.contains(s.seg_id) {
-                        idf_sum += idfs[j];
-                    }
-                }
-                (i, idf_sum * tf_component, s.overlap)
-            })
-            .collect();
-
-        // Best score first; tie-break by raw overlap, then original (overlap) order.
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(b.2.cmp(&a.2))
-                .then(a.0.cmp(&b.0))
-        });
-        scored
-            .into_iter()
-            .map(|(candidate, _, _)| Ranked { candidate })
             .collect()
     }
 }
@@ -348,10 +331,11 @@ pub struct QueryContext<'a> {
     pub selected: &'a [String],
     /// The match floor `m` in effect for this query.
     pub min_shared: u32,
-    /// Total live segments `N` (the BM25 corpus size), for idf (`idf(t) ∝ ln(N/df(t))`).
+    /// Total live segments `N`. Not used by the default overlap ranking (IDF *gaps* are
+    /// `N`-independent); provided for a custom [`Ranker`] that wants a corpus-relative score.
     pub n_segments: u64,
-    /// Mean segment gram length (`avgdl`), for BM25+ length normalization. `0.0` only on an
-    /// empty corpus (the ranker then skips length normalization).
+    /// Mean segment gram length (`avgdl`). Not used by the default overlap ranking; provided
+    /// for a custom [`Ranker`] doing length normalization. `0.0` on an empty corpus.
     pub avgdl: f64,
 }
 
@@ -391,15 +375,14 @@ impl<'a> Candidates<'a> {
         })
     }
 
-    /// Iterate the candidates in overlap order.
+    /// Iterate the candidates in weighted-overlap order.
     pub fn iter(&self) -> impl Iterator<Item = Candidate<'_>> {
         (0..self.len()).map(move |i| self.get(i).expect("index in range"))
     }
 
     /// The query's selected tokens that have a posting, each paired with its document
-    /// frequency `df` (the number of segments containing it). These are the idf inputs a
-    /// custom [`Ranker`] needs — the same the built-in [`Bm25Ranker`] uses — without any
-    /// store read (the postings are already in hand).
+    /// frequency `df` (the number of segments containing it) — the rarity inputs a custom
+    /// [`Ranker`] needs, without any store read (the postings are already in hand).
     pub fn present_terms(&self) -> impl Iterator<Item = (&str, u64)> {
         self.present.iter().map(|(t, bm)| (*t, bm.len()))
     }
@@ -425,18 +408,24 @@ impl Candidate<'_> {
     pub fn label(&self) -> &str {
         &self.s.label
     }
-    /// How many selected tokens this candidate shares.
+    /// How many selected tokens this candidate shares (the **raw**, unweighted count).
     pub fn overlap(&self) -> u32 {
         self.s.overlap
+    }
+    /// This candidate's IDF-weighted overlap score — the value trifle ranks by (the
+    /// bit-sliced bucket it locked in). Weighted by per-query gram rarity; see the module
+    /// docs for the tiering.
+    pub fn score(&self) -> u32 {
+        self.s.score
     }
     /// The matched segment's text. Every indexed field is stored, so this is always the
     /// segment's full text.
     pub fn text(&self) -> &str {
         &self.s.text
     }
-    /// The matched segment's gram length `|d|` (token count with repetition) — the BM25+
-    /// length-normalization input, the same value the built-in [`Bm25Ranker`] uses. `0` only
-    /// for a sub-n-gram segment that produced no tokens.
+    /// The matched segment's gram length `|d|` (token count with repetition). Not used by the
+    /// default overlap ranking; provided for a custom [`Ranker`] doing length normalization.
+    /// `0` only for a sub-n-gram segment that produced no tokens.
     pub fn seg_len(&self) -> u32 {
         self.s.len
     }
@@ -449,10 +438,9 @@ impl Candidate<'_> {
             .collect()
     }
     /// Which selected tokens this candidate's segment contains, each paired with its document
-    /// frequency `df` (segments containing it) — everything a custom [`Ranker`] needs to
-    /// compute an idf-weighted score, exactly as the built-in [`Bm25Ranker`] does (combine
-    /// with [`QueryContext::n_segments`] for idf and [`seg_len`](Self::seg_len) /
-    /// [`QueryContext::avgdl`] for length normalization).
+    /// frequency `df` (segments containing it) — the signals a custom [`Ranker`] needs to
+    /// compute its own rarity-weighted score (combine with [`QueryContext::n_segments`] /
+    /// [`seg_len`](Self::seg_len) / [`QueryContext::avgdl`] as wanted).
     pub fn matched_terms(&self) -> impl Iterator<Item = (&str, u64)> {
         self.present
             .iter()
@@ -477,13 +465,20 @@ mod tests {
         ids.iter().copied().collect()
     }
 
+    /// Unweighted accumulation (every weight 1) — exercises the counter + `count_eq` the same
+    /// way the old `bitsliced_overlap` did, so the plane/boundary invariants stay covered.
+    fn unweighted(bitmaps: &[&RoaringBitmap]) -> Vec<RoaringBitmap> {
+        let weights = vec![1u32; bitmaps.len()];
+        weighted_overlap(bitmaps, &weights)
+    }
+
     #[test]
     fn bitsliced_counts_match_naive_accumulation() {
         // ids: 1 in three postings, 2 in two, 3 in one.
         let a = bm(&[1, 2, 3]);
         let b = bm(&[1, 2]);
         let c = bm(&[1]);
-        let acc = bitsliced_overlap(&[&a, &b, &c]);
+        let acc = unweighted(&[&a, &b, &c]);
         assert_eq!(count_eq(&acc, 3).iter().collect::<Vec<_>>(), [1]);
         assert_eq!(count_eq(&acc, 2).iter().collect::<Vec<_>>(), [2]);
         assert_eq!(count_eq(&acc, 1).iter().collect::<Vec<_>>(), [3]);
@@ -496,7 +491,7 @@ mod tests {
         // Five postings all containing id 7 -> count 5 (binary 101, three planes).
         let posts: Vec<RoaringBitmap> = (0..5).map(|_| bm(&[7])).collect();
         let refs: Vec<&RoaringBitmap> = posts.iter().collect();
-        let acc = bitsliced_overlap(&refs);
+        let acc = unweighted(&refs);
         assert_eq!(count_eq(&acc, 5).iter().collect::<Vec<_>>(), [7]);
         for c in [1, 2, 3, 4, 6] {
             assert!(count_eq(&acc, c).is_empty(), "count {c} should be empty");
@@ -507,7 +502,7 @@ mod tests {
     fn count_eq_is_exact_membership_not_at_least() {
         let a = bm(&[1, 2]);
         let b = bm(&[2, 3]);
-        let acc = bitsliced_overlap(&[&a, &b]);
+        let acc = unweighted(&[&a, &b]);
         // id 2 has count 2; ids 1,3 have count 1.
         assert_eq!(count_eq(&acc, 2).iter().collect::<Vec<_>>(), [2]);
         assert_eq!(count_eq(&acc, 1).iter().collect::<Vec<_>>(), [1, 3]);
@@ -530,7 +525,7 @@ mod tests {
             posts.push(p);
         }
         let refs: Vec<&RoaringBitmap> = posts.iter().collect();
-        let acc = bitsliced_overlap(&refs);
+        let acc = unweighted(&refs);
         assert_eq!(count_eq(&acc, 8).iter().collect::<Vec<_>>(), [100]);
         assert_eq!(count_eq(&acc, 7).iter().collect::<Vec<_>>(), [200]);
         assert_eq!(count_eq(&acc, 4).iter().collect::<Vec<_>>(), [300]);
@@ -545,7 +540,7 @@ mod tests {
         // 7 postings sharing id 1 -> count 7, three planes (0b111).
         let posts: Vec<RoaringBitmap> = (0..7).map(|_| bm(&[1])).collect();
         let refs: Vec<&RoaringBitmap> = posts.iter().collect();
-        let acc = bitsliced_overlap(&refs);
+        let acc = unweighted(&refs);
         assert_eq!(acc.len(), 3);
         assert_eq!(count_eq(&acc, 7).iter().collect::<Vec<_>>(), [1]);
         // 8 needs a 4th plane that doesn't exist -> the guard returns empty (no panic).
@@ -558,7 +553,7 @@ mod tests {
         // 8 postings sharing id 1 -> count 8 (0b1000), exactly four planes.
         let posts: Vec<RoaringBitmap> = (0..8).map(|_| bm(&[1])).collect();
         let refs: Vec<&RoaringBitmap> = posts.iter().collect();
-        let acc = bitsliced_overlap(&refs);
+        let acc = unweighted(&refs);
         assert_eq!(acc.len(), 4);
         assert_eq!(count_eq(&acc, 8).iter().collect::<Vec<_>>(), [1]);
     }
@@ -566,14 +561,74 @@ mod tests {
     #[test]
     fn bitsliced_overlap_degenerate_inputs() {
         // No postings -> no planes.
-        assert!(bitsliced_overlap(&[]).is_empty());
+        assert!(unweighted(&[]).is_empty());
         // A single posting -> count 1 for each of its ids, nothing at count 2.
         let single = bm(&[5, 9]);
-        let acc = bitsliced_overlap(&[&single]);
+        let acc = unweighted(&[&single]);
         assert_eq!(count_eq(&acc, 1).iter().collect::<Vec<_>>(), [5, 9]);
         assert!(count_eq(&acc, 2).is_empty());
         // An empty posting contributes nothing and pushes no phantom plane.
         let empty = RoaringBitmap::new();
-        assert!(bitsliced_overlap(&[&empty]).is_empty());
+        assert!(unweighted(&[&empty]).is_empty());
+    }
+
+    #[test]
+    fn weighted_add_scales_the_count() {
+        // One posting added with weight 3 gives every id count 3; a second weight-2 posting
+        // bumps the shared id to 5.
+        let a = bm(&[1, 2]);
+        let b = bm(&[2]);
+        let acc = weighted_overlap(&[&a, &b], &[3, 2]);
+        assert_eq!(count_eq(&acc, 3).iter().collect::<Vec<_>>(), [1]); // only in `a` (w=3)
+        assert_eq!(count_eq(&acc, 5).iter().collect::<Vec<_>>(), [2]); // in both: 3 + 2
+        assert!(count_eq(&acc, 2).is_empty());
+    }
+
+    #[test]
+    fn weighted_overlap_matches_repeated_unweighted_adds() {
+        // add_weighted(w) must equal adding the same posting w times unweighted.
+        let p = bm(&[1, 4, 9]);
+        let q = bm(&[4]);
+        let weighted = weighted_overlap(&[&p, &q], &[4, 1]);
+        let repeated = unweighted(&[&p, &p, &p, &p, &q]);
+        for c in 1..=5u32 {
+            assert_eq!(
+                count_eq(&weighted, c).iter().collect::<Vec<_>>(),
+                count_eq(&repeated, c).iter().collect::<Vec<_>>(),
+                "weighted vs repeated disagree at count {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_weights_anchor_at_df_max_and_cap_at_four() {
+        // df_max anchor (commonest -> weight 1); each df-doubling adds a step (D=1); cap at 4.
+        // dfs: 16 (df_max -> 1), 8 (1 doubling -> 2), 4 (2 -> 3), 1 (4 doublings -> capped 4).
+        let common = bm(&(0..16).collect::<Vec<_>>());
+        let mid = bm(&(0..8).collect::<Vec<_>>());
+        let rarer = bm(&(0..4).collect::<Vec<_>>());
+        let rarest = bm(&[0]);
+        let w = tier_weights(&[&common, &mid, &rarer, &rarest], 1.0);
+        assert_eq!(w, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn tier_weights_collapse_when_the_band_is_within_one_doubling() {
+        // A compressed band (all within one df-doubling of df_max) is all tier 1 — no
+        // manufactured spread.
+        let a = bm(&(0..10).collect::<Vec<_>>());
+        let b = bm(&(0..9).collect::<Vec<_>>());
+        let c = bm(&(0..8).collect::<Vec<_>>());
+        assert_eq!(tier_weights(&[&a, &b, &c], 1.0), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn tier_weights_step_widens_with_d() {
+        // A larger D needs more doublings per step: with D=2, an 8x-rarer gram (3 doublings)
+        // is only round(3/2)=2 steps -> weight 3 (vs weight 4 at D=1).
+        let common = bm(&(0..8).collect::<Vec<_>>());
+        let rarer = bm(&[0]); // 8x rarer => 3 doublings
+        assert_eq!(tier_weights(&[&common, &rarer], 1.0), vec![1, 4]);
+        assert_eq!(tier_weights(&[&common, &rarer], 2.0), vec![1, 3]);
     }
 }

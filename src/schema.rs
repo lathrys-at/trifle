@@ -41,7 +41,7 @@ fn doc_filt_indexes(table: &str, schema: &Schema) -> String {
 /// v2 (rev-v0.2): postings are keyed by an interned `u32` term-id (the `dict` table),
 /// not gram text; `fwd` holds a roaring bitmap of term-ids.
 /// v3 (rev-v0.2): per-field storage modes dropped (every text field is stored); `seg`
-/// gains a `len` column (per-segment gram count) for BM25+ length normalization.
+/// gains a `len` column (per-segment gram count) — a stored signal for a custom ranker.
 pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 pub(crate) const KEY_SCHEMA_VERSION: &str = "schema_version";
@@ -49,12 +49,12 @@ pub(crate) const KEY_DATA_VERSION: &str = "data_version";
 pub(crate) const KEY_FINGERPRINT: &str = "tokenizer_fingerprint";
 pub(crate) const KEY_SCHEMA_FINGERPRINT: &str = "schema_fingerprint";
 pub(crate) const KEY_NEXT_ID: &str = "next_id";
-/// Rolling segment count (the BM25 corpus size N and the `pool`-depth `N`), maintained in
-/// the write transaction so a search reads it as an O(1) point lookup rather than an O(N)
-/// `count(*)` (audit I3 / RA-2).
+/// Rolling segment count (`N`: reported by `stats()`, used as the `pool`-depth `N`, and
+/// available to a custom ranker), maintained in the write transaction so a search reads it as
+/// an O(1) point lookup rather than an O(N) `count(*)` (audit I3 / RA-2).
 pub(crate) const KEY_SEG_COUNT: &str = "seg_count";
-/// Rolling sum of per-segment gram lengths. `avgdl = seg_len_sum / seg_count` (BM25+ length
-/// normalization). Integer summation is exact, so the running mean is drift-free without
+/// Rolling sum of per-segment gram lengths. `avgdl = seg_len_sum / seg_count`, a stored signal
+/// for a custom ranker. Integer summation is exact, so the running mean is drift-free without
 /// floating-point compensation.
 pub(crate) const KEY_SEG_LEN_SUM: &str = "seg_len_sum";
 /// The dictionary generation (id-assignment epoch): bumped on every reassignment of
@@ -67,7 +67,7 @@ pub(crate) fn create_tables(conn: &Connection, ns: &Namespace, schema: &Schema) 
     let key_sql_type = schema.key_shape().sql_type();
     // The model is two levels: `doc` (one row per caller key) and `seg` (one row per
     // (doc, label) segment; `seg.id` is the roaring posting id). `seg.txt` is the stored
-    // segment text (always present); `seg.len` is its gram count (BM25+ length norm).
+    // segment text (always present); `seg.len` is its gram count (a custom-ranker signal).
     // `fwd` holds every segment's term-id set (a roaring bitmap), so delete needs neither
     // the text nor the tokenizer.
     // Postings are keyed by the interned term-id from `dict` (gram text lives only
@@ -242,8 +242,8 @@ pub(crate) fn reset(conn: &Connection, ns: &Namespace, schema: &Schema) -> Resul
     set_seg_stats(conn, ns, 0, 0)
 }
 
-/// The `(seg_count, seg_len_sum)` rolling stats (absent → `0`). `seg_count` is the BM25
-/// corpus size N; `avgdl = seg_len_sum / seg_count`.
+/// The `(seg_count, seg_len_sum)` rolling stats (absent → `0`). `seg_count` is the corpus
+/// size `N`; `avgdl = seg_len_sum / seg_count`.
 pub(crate) fn read_seg_stats(conn: &Connection, ns: &Namespace) -> Result<(i64, i64)> {
     let count = meta_get(conn, ns, KEY_SEG_COUNT)?
         .and_then(|s| s.parse().ok())

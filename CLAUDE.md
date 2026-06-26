@@ -10,10 +10,11 @@ write-infrequent. It is a **derived, rebuildable cache** over a caller-owned sou
 truth — it never touches the caller's data store, and any version/tokenizer drift drops the
 cache rather than migrating it.
 
-It is *lexical* fuzzy search, deliberately **not** semantic search and not a long-document
-relevance engine. Candidates come from trigram overlap; the default reranker adds a
-BM25-shaped score (idf, length normalization, literal verification) on top, but the design
-assumes small segments throughout.
+It is *lexical* fuzzy search, deliberately **not** semantic search and **not a relevance
+engine**. It ranks by **IDF-weighted trigram overlap** computed in the bit-sliced counter
+itself (rarer shared grams weigh more, via a per-query df-anchored 4-tier scheme); there is
+no BM25/relevance tier. A caller wanting one supplies a custom `Ranker`. The design assumes
+small segments throughout.
 
 ## Commands
 

@@ -9,9 +9,10 @@
 //! store.
 //!
 //! It targets a specific regime — **large corpora of small documents**
-//! (≲ 1–2 KB per segment), read-often / write-infrequent. The precision-tier reranker is
-//! BM25+ over the index's n-gram terms, length-normalized against the online mean segment
-//! length (the design assumes small segments throughout).
+//! (≲ 1–2 KB per segment), read-often / write-infrequent. It is a **fuzzy lexical overlap
+//! engine, not a relevance engine**: it ranks by IDF-weighted token overlap (rarer shared
+//! grams weigh more), computed in the counter itself — there is no BM25/relevance tier. A
+//! caller wanting one supplies a custom [`Ranker`].
 //!
 //! # Quick start
 //!
@@ -106,7 +107,7 @@ pub use rusqlite;
 use dict::{Dictionary, TermId};
 pub use error::{Error, Result};
 pub use model::{CmpOp, Document, Filter, FilterType, Key, KeyShape, Match, Schema, SchemaBuilder};
-use rank::{Bm25Ranker, Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
+use rank::{Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
 use schema::SCHEMA_VERSION;
 use select::{SelectParams, select};
 use store::{Backend, Namespace, Sidecar};
@@ -120,6 +121,8 @@ const DEFAULT_MIN_SHARED: u32 = 2;
 const TYPO_DAMAGE: u32 = 4;
 /// Default `t_max` — the number of rarest query tokens selection keeps.
 const DEFAULT_T_MAX: usize = 12;
+/// Default `D` — df-doublings per IDF weight step in the overlap counter.
+const DEFAULT_WEIGHT_STEP: f64 = 1.0;
 /// How many times a read retries a transient `SQLITE_BUSY`/`LOCKED`/`SCHEMA`.
 const RETRY_MAX: usize = 5;
 
@@ -152,50 +155,50 @@ impl Config {
 /// stack); a `dyn Fn` alias without it would force `'static` and reject such closures.
 pub type ScopeFn<'a> = dyn Fn(&Key, &str) -> bool + 'a;
 
-/// How hard the ranker tries: how deep a candidate pool to over-fetch and rerank.
+/// How deep a candidate pool to over-fetch for a **custom** [`Ranker`] to reorder.
 ///
-/// Candidate generation by bit-sliced overlap is cheap but orders only coarsely (by
-/// shared-token count); the precision tier — idf weighting and length normalization (the
-/// [`Bm25Ranker`]) — reorders a *pool* of
-/// the top candidates. The pool must be deeper than `limit` to recover a relevant
-/// document that overlap alone ranked past `limit`, and empirically the depth needed for
-/// a given recall scales as **`c·√(limit · N)`** (N = indexed segments) — a power law in
-/// corpus size, not a constant. Each level fixes `c` to hit a fraction of the
-/// deep-pool recall **ceiling** (calibrated on MS MARCO; see `benchmarks/`):
+/// trifle's default ranking is the IDF-weighted overlap order the counter produces, and it
+/// is exact at `pool = limit` (the bucket walk early-stops once the top-`limit` lock). So the
+/// default is [`None`](Effort::None) — no over-fetch. A *custom*
+/// [`ranker`](SearchOpts::ranker) that reorders survivors may need a deeper pool to pull up a
+/// document the weighted order placed past `limit`; the levels set that depth as
+/// `pool = max(limit, round(c·√(limit · N)))` (N = indexed segments) — a power-law-in-corpus-size
+/// over-fetch:
 ///
-/// | level | `c` | ≈ recall vs ceiling | cost |
-/// |-------|-----|---------------------|------|
-/// | [`None`](Effort::None)     | 0    | overlap order only | cheapest (pool = `limit`) |
-/// | [`Low`](Effort::Low)       | 0.03 | ~50% | |
-/// | [`Medium`](Effort::Medium) | 0.05 | ~90% | **the default** |
-/// | [`High`](Effort::High)     | 0.10 | ~95% | |
-/// | [`Max`](Effort::Max)       | 0.45 | ~99% (saturation tail) | deepest |
+/// | level | `c` | pool depth |
+/// |-------|-----|------------|
+/// | [`None`](Effort::None)     | 0    | `limit` (no over-fetch) — **the default** |
+/// | [`Low`](Effort::Low)       | 0.03 | shallow |
+/// | [`Medium`](Effort::Medium) | 0.05 | |
+/// | [`High`](Effort::High)     | 0.10 | |
+/// | [`Max`](Effort::Max)       | 0.45 | deepest |
 ///
-/// Deeper pool → more hydration + scoring, so latency grows ~linearly with the pool
-/// while recall grows logarithmically. The pool is always at least `limit`.
+/// Deeper pool → more hydration + custom-ranker scoring, so latency grows ~linearly with the
+/// pool. **Without a custom `ranker` a deeper pool changes nothing** (the weighted-overlap
+/// order is already the final order), so leave it at `None`. The pool is always at least `limit`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Effort {
-    /// No reranking: return the bit-sliced overlap order (pool = `limit`). Cheapest.
+    /// No over-fetch: pool = `limit`. Exact for the default weighted-overlap order. The default.
     None,
-    /// ~50% of the recall ceiling (`c = 0.03`).
+    /// A shallow over-fetch pool for a custom ranker (`c = 0.03`).
     Low,
-    /// ~90% of the recall ceiling (`c = 0.05`). The default.
+    /// A moderate over-fetch pool for a custom ranker (`c = 0.05`).
     Medium,
-    /// ~95% of the recall ceiling (`c = 0.10`).
+    /// A deep over-fetch pool for a custom ranker (`c = 0.10`).
     High,
-    /// ~99% of the recall ceiling (`c = 0.45`) — the flat saturation tail; large pool
-    /// for the last few points.
+    /// The deepest over-fetch pool for a custom ranker (`c = 0.45`).
     Max,
     /// An explicit coefficient `c` in `pool = max(limit, round(c·√(limit·N)))`. `0`
-    /// disables reranking, as [`None`](Effort::None).
+    /// means no over-fetch, as [`None`](Effort::None).
     Custom(f64),
 }
 
 impl Default for Effort {
-    /// [`Medium`](Effort::Medium) — reranking on, ~90% of the recall ceiling.
+    /// [`None`](Effort::None) — no over-fetch; the weighted-overlap order is exact at
+    /// `pool = limit`.
     fn default() -> Self {
-        Effort::Medium
+        Effort::None
     }
 }
 
@@ -212,12 +215,7 @@ impl Effort {
         }
     }
 
-    /// Whether reranking is active (a precision tier runs over an over-fetched pool).
-    fn reranks(self) -> bool {
-        self.coeff() > 0.0
-    }
-
-    /// The rerank pool depth for a result `limit` over `n_segments` indexed segments:
+    /// The over-fetch pool depth for a result `limit` over `n_segments` indexed segments:
     /// `max(limit, round(c·√(limit·n_segments)))`.
     fn pool(self, limit: usize, n_segments: u64) -> usize {
         let c = self.coeff();
@@ -247,28 +245,34 @@ pub struct SearchOpts<'a> {
     /// means more candidates and more posting rows scanned. A `t_max` below `F` is
     /// raised to `F`.
     pub t_max: Option<usize>,
-    /// A per-query [`Ranker`]. `None` → the built-in [`OverlapRanker`] (when reranking is
-    /// off) or [`Bm25Ranker`] (the [`Effort`] precision tier).
+    /// A per-query [`Ranker`] to reorder the IDF-weighted-overlap survivors. `None` → the
+    /// built-in [`OverlapRanker`], which preserves trifle's weighted-overlap order (there is
+    /// no built-in relevance/BM25 ranker).
     pub ranker: Option<&'a dyn Ranker>,
     /// A membership predicate `(key, label) -> keep` evaluated over candidates in
-    /// overlap order — never over the corpus. The walk continues until `limit`
+    /// weighted-overlap order — never over the corpus. The walk continues until `limit`
     /// predicate-passing results lock, so scoping needs no over-fetch. The predicate must
     /// not call back into this index's writer.
     pub scope: Option<&'a ScopeFn<'a>>,
-    /// How hard to rerank — the over-fetch [`Effort`]. Defaults to
-    /// [`Medium`](Effort::Medium). [`None`](Effort::None) disables reranking and returns
-    /// plain overlap order (cheapest). When `ranker` is also set, `effort` still chooses
-    /// the pool depth but that custom ranker scores it.
+    /// The over-fetch [`Effort`] — how deep a candidate pool to fetch for a custom `ranker`
+    /// to reorder. Defaults to [`None`](Effort::None) (pool = `limit`), which is exact for the
+    /// default weighted-overlap order; raise it only when a custom `ranker` needs deeper
+    /// candidates to pull up.
     pub effort: Effort,
+    /// `D` — df-doublings per IDF weight step in the overlap counter (the lone rarity-weighting
+    /// knob). `1.0` (the default) means each weight level is one more halving of df relative to
+    /// the query's commonest survivor. Larger `D` widens the steps (more grams share a tier).
+    /// `N`-invariant, so it does not go stale on insert.
+    pub weight_step: f64,
     /// An optional [`Filter`] over the schema's **filterable** fields (Tier 2). Applied as
-    /// a doc-id intersection during candidate generation — it prunes before rerank and
+    /// a doc-id intersection during candidate generation — it prunes before the ranker and
     /// hydration, but does not save the overlap work itself.
     pub filter: Option<&'a Filter>,
 }
 
 impl<'a> SearchOpts<'a> {
-    /// Options for the given result limit, everything else default (reranking at
-    /// [`Effort::Medium`]).
+    /// Options for the given result limit, everything else default (weighted-overlap order,
+    /// no over-fetch, weight step `D = 1.0`).
     pub fn new(limit: usize) -> Self {
         SearchOpts {
             limit,
@@ -277,6 +281,7 @@ impl<'a> SearchOpts<'a> {
             ranker: None,
             scope: None,
             effort: Effort::default(),
+            weight_step: DEFAULT_WEIGHT_STEP,
             filter: None,
         }
     }
@@ -305,9 +310,15 @@ impl<'a> SearchOpts<'a> {
         self
     }
 
-    /// Set the rerank [`Effort`] (pool depth + whether the precision tier runs).
+    /// Set the over-fetch [`Effort`] — the candidate-pool depth for a custom [`ranker`](Self::ranker).
     pub fn rerank(mut self, effort: Effort) -> Self {
         self.effort = effort;
+        self
+    }
+
+    /// Set `D`, the df-doublings per IDF weight step ([`weight_step`](Self::weight_step)).
+    pub fn weight_step(mut self, d: f64) -> Self {
+        self.weight_step = d;
         self
     }
 
@@ -614,8 +625,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     }
 
     /// Tokenize `text` once, returning both its distinct resolved term-ids (each assigned
-    /// via `assign`) and its total gram count **with repetition** — the BM25+ segment
-    /// length `|d|`. This is the single lowering shared by the incremental write path
+    /// via `assign`) and its total gram count **with repetition** — the stored segment
+    /// length `|d|` (kept for a custom [`Ranker`]). This is the single lowering
+    /// shared by the incremental write path
     /// ([`write_segment`](Self::write_segment), `assign` = stage intern) and
     /// [`rebuild`](Self::rebuild) (`assign` = a dense local allocator). Owning the
     /// tokenize + 3-codepoint ceiling check in one place keeps the two paths from drifting
@@ -677,8 +689,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let id = schema::alloc_ids(conn, ns, 1)?;
         // Tokenize once: intern straight from the tokens (`token.term()`), not via stringified
         // grams — the blanket `IntoTerm` packs each token with no per-token `String` allocation —
-        // and take the segment's gram length (with repetition) for BM25+ length normalization
-        // from the same pass (audit C2-F1).
+        // and take the segment's gram length (with repetition; a stored signal for a custom
+        // ranker) from the same pass (audit C2-F1).
         let (ids, seg_len) =
             self.distinct_term_ids(text, |term| stage.intern_term(term, conn, ns))?;
         conn.execute(
@@ -731,7 +743,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         if let Some(ids) = fwd.get(&(seg_id as u32)) {
             changes.remove(seg_id as u32, ids);
         }
-        // Subtract this segment's gram length from the rolling BM25 stats before deleting.
+        // Subtract this segment's gram length from the rolling segment-length stats before deleting.
         let seg_len: i64 = conn
             .query_row(
                 &format!("SELECT len FROM {} WHERE id = ?1", ns.seg()),
@@ -972,7 +984,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
 
         schema::swap_shadows(&tx, ns, &self.schema)?;
         schema::set_next_id(&tx, ns, next_seg)?;
-        // The rolling BM25 stats for the freshly-built corpus (segments = next_seg - 1).
+        // The rolling segment-length stats for the freshly-built corpus (segments = next_seg - 1).
         schema::set_seg_stats(&tx, ns, next_seg - 1, total_seg_len)?;
         // Reassigning the term-id space bumps the generation so a concurrent reader
         // detects the change and re-resolves against the new snapshot.
@@ -1088,16 +1100,11 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             typo_damage: TYPO_DAMAGE,
             t_max: opts.t_max.unwrap_or(DEFAULT_T_MAX),
         };
-        // The reranker: an explicit `opts.ranker` wins; otherwise the precision tier
-        // ([`Bm25Ranker`]) when reranking is active, else plain overlap order.
+        // Ranking is the IDF-weighted overlap order the counter produces; the default
+        // [`OverlapRanker`] preserves it. An explicit `opts.ranker` may reorder (over an
+        // [`Effort`]-deepened pool). There is no built-in relevance/BM25 tier.
         let overlap = OverlapRanker;
-        let bm25 = Bm25Ranker;
-        let default_ranker: &dyn Ranker = if opts.effort.reranks() {
-            &bm25
-        } else {
-            &overlap
-        };
-        let ranker: &dyn Ranker = opts.ranker.unwrap_or(default_ranker);
+        let ranker: &dyn Ranker = opts.ranker.unwrap_or(&overlap);
 
         // One batched frequency read over every resolved term-id in the batch.
         let all_ids: Vec<TermId> = resolved
@@ -1140,7 +1147,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let postings_map = postings::effective_postings(conn, ns, &sel_ids)?;
 
         // Corpus size + average segment length from the O(1) rolling meta counters (audit
-        // I3), read under this search's snapshot. `avgdl` feeds BM25+ length normalization.
+        // I3), read under this search's snapshot. Not used by the default overlap ranking
+        // (it is df-only); surfaced to a custom [`Ranker`] via [`QueryContext`].
         let (seg_count, seg_len_sum) = schema::read_seg_stats(conn, ns)?;
         let n_segments = seg_count.max(0) as u64;
         let avgdl = if seg_count > 0 {
@@ -1175,12 +1183,13 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 &present,
                 pool,
                 min_shared,
+                opts.weight_step,
                 self.schema.key_shape(),
                 filter_docs.as_ref(),
                 opts.scope,
             )?;
-            // Every indexed field is stored, so a match always carries its text and the
-            // reranker always sees it (no opt-out that could leave BM25 textless).
+            // Every indexed field is stored, so a match always carries its text and any
+            // custom ranker always sees it.
             self.hydrate_text(conn, ns, &mut survivors)?;
 
             out.push(self.rank_to_matches(
@@ -1585,7 +1594,7 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
                 for (id, tokens) in w.index.doc_segments(conn, ns, doc)? {
                     changes.remove(id, &tokens);
                 }
-                // Subtract every removed segment's gram length + count from the BM25 stats.
+                // Subtract every removed segment's gram length + count from the rolling stats.
                 let (seg_n, seg_len): (i64, i64) = conn.query_row(
                     &format!(
                         "SELECT count(*), coalesce(sum(len), 0) FROM {} WHERE doc_id = ?1",
@@ -1854,10 +1863,9 @@ mod effort_tests {
         assert_eq!(Effort::Medium.pool(10, 1_000_000), 158); // 0.05·3162 = 158.1
         assert_eq!(Effort::High.pool(10, 1_000_000), 316); // 0.10·3162 = 316.2
         assert_eq!(Effort::Max.pool(10, 1_000_000), 1423); // 0.45·3162 = 1423.0
-        // reranks() reflects whether c > 0.
-        assert!(!Effort::None.reranks());
-        assert!(Effort::Medium.reranks());
-        assert!(!Effort::Custom(0.0).reranks());
+        // None / Custom(0) never over-fetch; the pool stays at `limit`.
+        assert_eq!(Effort::None.pool(10, 1_000_000), 10);
+        assert_eq!(Effort::Custom(0.0).pool(10, 1_000_000), 10);
     }
 }
 

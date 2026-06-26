@@ -67,18 +67,16 @@ fn early_stop_keeps_the_higher_overlap_bucket() {
 }
 
 #[test]
-fn effort_over_fetch_lets_the_reranker_recover_a_buried_answer() {
-    // The over-fetch + BM25 rerank + truncate path only fires when the pool is deeper
-    // than `limit` (pool = max(limit, round(c·√(limit·N)))). On a small corpus the
-    // default levels floor to `limit`, so force a deep pool with Effort::Custom and
-    // confirm the reranker pulls in an answer that raw overlap order buried past `limit`.
+fn overlap_engine_does_not_promote_a_short_verbatim_match() {
+    // trifle is a lexical-overlap engine, not a relevance engine: with equal overlap AND
+    // equal gram rarity, a short verbatim match is NOT promoted over equal-overlap distractors
+    // (there is no length-normalizing relevance tier — a caller wanting that supplies a custom
+    // Ranker). This pins that contract.
     let h = Harness::new();
     let answer = 100;
-    // Insert the distractors FIRST (so they take the lower *internal* doc ids — the
-    // overlap tie-break is the internal id = insertion order), then the answer last so it
-    // is buried in raw overlap order. The distractors share the same two trigrams ("xqz",
-    // "qzv") but split apart in a long doc: equal overlap, yet a long length — BM25+
-    // length normalization favors the short verbatim answer.
+    // Distractors inserted FIRST (lower internal ids → win the overlap tie-break); they share
+    // the query's two grams ("xqz", "qzv") split across a long doc. The short verbatim answer
+    // goes last.
     for doc in 1..=12 {
         h.put(
             doc,
@@ -87,27 +85,24 @@ fn effort_over_fetch_lets_the_reranker_recover_a_buried_answer() {
             "xqz aaaa bbbb cccc dddd eeee ffff gggg qzv",
         );
     }
-    // The answer: a short doc that is a verbatim match for the query word.
     h.put(answer, "field", "a", "xqzv");
 
-    // Overlap-only (pool == limit): the equal-overlap distractors win the tie on the
-    // lower internal id, so the answer is not the top-1.
-    let overlap = h
-        .search("xqzv", SearchOpts::new(1).rerank(Effort::None))
-        .unwrap();
+    // Both share the query's two grams (equal overlap), and the grams are equally common
+    // (every doc has them) so weighting is uniform → the tie falls to insertion order.
+    let hits = h.search("xqzv", SearchOpts::new(1)).unwrap();
     assert_eq!(
-        overlap[0].key.as_i64(),
+        hits[0].key.as_i64(),
         Some(1),
-        "overlap order buries the answer behind lower-id ties"
+        "equal overlap + equal rarity → insertion order, not relevance promotion"
     );
 
-    // Deep pool + BM25 rerank: the short verbatim answer scores highest and surfaces.
-    let reranked = h
-        .search("xqzv", SearchOpts::new(1).rerank(Effort::Custom(5.0)))
+    // A deep over-fetch pool alone changes nothing without a custom ranker.
+    let deep = h
+        .search("xqzv", SearchOpts::new(1).rerank(Effort::High))
         .unwrap();
     assert_eq!(
-        reranked[0].key.as_i64(),
-        Some(answer),
-        "the reranker recovers the buried answer from the over-fetched pool"
+        deep[0].key.as_i64(),
+        Some(1),
+        "over-fetch alone does not reorder — there is no built-in reranker"
     );
 }

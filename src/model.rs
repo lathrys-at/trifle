@@ -6,8 +6,8 @@
 //! (`Integer`/`Text`/`Blob`), because the key is the one field trifle *compares* (dedup /
 //! replace / delete / return). Everything else is a **text field** (tokenized; its name is
 //! the label returned on a match). Every indexed text field's text is **stored** and is
-//! always surfaced to the reranker and returned on a match; filterable **payload** columns
-//! (Tier 2) are stored separately for filtering only and are never reranked or returned.
+//! always returned on a match (and available to a custom ranker); filterable **payload**
+//! columns (Tier 2) are stored separately for filtering only and are never ranked or returned.
 //!
 //! A document is a `key` plus a set of named segments (`label → text`) — the two-level
 //! document→segment hierarchy. `flat()` and `chunked()` are ergonomic front-ends that
@@ -532,8 +532,8 @@ impl SchemaBuilder {
         self
     }
 
-    /// Declare a text field named `name`. Its text is stored, indexed, and surfaced to the
-    /// reranker / returned on a match.
+    /// Declare a text field named `name`. Its text is stored, indexed, and returned on a
+    /// match (and available to a custom ranker).
     pub fn text(mut self, name: impl Into<String>) -> Self {
         self.fields.push(name.into());
         self

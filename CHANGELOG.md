@@ -35,10 +35,10 @@ A ground-up rework. **Breaking across the board, and a hard cache reset:** the o
   `key → named segments` over a two-level `doc`+`seg` store.
 - **All indexed text is stored and surfaced.** Per-field storage modes, the `TextResolver`
   / contentless mode, and the search-time `Hydration` ladder were **removed**: every
-  indexed text field is stored, always returned on a match, and always surfaced to the
-  reranker (so the reranker can never run textless). Filterable **payload** columns are
-  stored separately for filtering only — never reranked or returned. `Match.text` is a
-  `String` (no longer `Option`).
+  indexed text field is stored, always returned on a match, and always available to a custom
+  ranker (so one can never run textless). Filterable **payload** columns are stored separately
+  for filtering only — never ranked or returned. `Match.text` is a `String` (no longer
+  `Option`).
 - **`Segment`/`Match{doc_id,source,ref_}` → `Document` / `Match{key,label,span,text}`**;
   `Key` is `Integer`/`Text`/`Blob`. The scope predicate is `(&Key, &str label) -> bool`.
 - **Lease-based access.** `Index` shrinks to lifecycle (`open`/`rebuild`/`compact`/
@@ -56,17 +56,26 @@ A ground-up rework. **Breaking across the board, and a hard cache reset:** the o
 - **Drift** now also covers a **schema fingerprint** (alongside schema version, tokenizer
   fingerprint, and `data_version`).
 
-### Ranking — real BM25+
-- The default precision-tier reranker is now **BM25+ over the index's terms** (the
-  n-grams), with the segment as the unit: `idf` from `df` over `N` segments, length
-  normalization against the **online mean segment length** (`avgdl`, maintained from
-  rolling `seg_count`/`seg_len_sum` meta counters in the write transaction), and the BM25+
-  `δ` lower bound. The previous word-tokenized, ad-hoc substring/literal-verification tier
-  is **gone** (frontends annotate exact substrings). An application needing true
-  term-frequency can recompute it from each candidate's segment text in a custom `Ranker`
-  (`Candidate::matched_terms`/`seg_len` expose the BM25 inputs); the segment is the ranking
-  unit, so **cross-segment fusion happens above trifle** (aggregate results across your keys),
-  not in a `Ranker`.
+### Ranking — IDF-weighted lexical overlap (no BM25, no relevance tier)
+- trifle is a **fuzzy lexical overlap engine, not a relevance engine**. Ranking is
+  **IDF-weighted token overlap computed in the bit-sliced counter itself** — there is no
+  separate BM25/relevance rerank tier. Each selected gram is weighted by rarity with a
+  per-query, df-anchored **4-tier scheme** (weights `{1,2,3,4}`): the query's commonest
+  survivor gets weight 1, rarer grams more, spaced in df-doublings
+  `1 + min(3, round(log2(df_max/df_i) / D))`. This is `N`-free (IDF *gaps* don't depend on
+  corpus size), stores nothing, and reuses the survivor df's already fetched for pruning;
+  weighted accumulation is BSI arithmetic (popcount(w) ≤ 2 ripples/gram). The knob `D`
+  (df-doublings per weight step, default `1.0`) is on `SearchOpts::weight_step`.
+- The earlier BM25+ reranker (idf + length normalization + `δ`) and the word-tokenized
+  substring/literal tier before it are **both gone**. The default `Ranker` is `OverlapRanker`,
+  which preserves the weighted-overlap order; `Effort` now only sets the over-fetch pool depth
+  for a *custom* `Ranker` (default `Effort::None` — the weighted order is exact at `pool = limit`).
+- The pluggable `Ranker` stays as an extension point: a custom ranker can score over each
+  candidate's segment text + signals (`Candidate::overlap`/`score`/`matched_terms` (per-term
+  `df`)/`seg_len`, `QueryContext::n_segments`/`avgdl`). The segment is the ranking unit, so
+  **cross-segment fusion happens above trifle** (aggregate across your keys), not in a `Ranker`.
+  (`seg.len`/`avgdl` are still stored — as signals for such a ranker — but the default ranking
+  does not use them.)
 
 ### Filtering ladder
 - **Tier 2 — filterable columns.** `Schema::filterable(name, FilterType)` materializes

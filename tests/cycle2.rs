@@ -1,13 +1,13 @@
 //! Cycle-2 audit regressions:
 //! - C2-RA-1: `remove_segment` emptying a document must reap its `doc` row so its
 //!   filterable payload can't leak into a later insert under the same key.
-//! - D2: BM25+ length normalization ordering (short outranks long; binary tf).
-//! - C2-A3: a custom [`Ranker`] can compute an idf-weighted score from the public API.
+//! - Ranking: IDF-weighted overlap surfaces rare-gram matches; presence-not-frequency; the
+//!   `D` weight-step knob; and a custom [`Ranker`] scoring from the public signals.
 
 mod common;
 use common::*;
 
-use trifle::rank::{self, Candidates, QueryContext, Ranked, Ranker};
+use trifle::rank::{Candidates, QueryContext, Ranked, Ranker};
 use trifle::rusqlite::Connection;
 use trifle::rusqlite::types::Value;
 use trifle::{Config, Document, Filter, FilterType, Schema, SearchOpts};
@@ -198,65 +198,107 @@ fn removing_one_of_several_segments_keeps_the_doc_row() {
     ));
 }
 
-// ----- D2: BM25+ length-normalization ordering -----
+// ----- IDF-weighted overlap ranking -----
 
 #[test]
-fn bm25_length_normalization_favors_the_short_segment() {
+fn idf_weighting_surfaces_the_rare_gram_match() {
     let h = Harness::new();
-    // Long doc inserted FIRST (lower internal id => would win a tie); short doc last.
-    h.put(
-        1,
-        "field",
-        "f",
-        "zephyrqual aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn",
-    );
-    h.put(2, "field", "f", "zephyrqual");
-    let hits = h.search("zephyrqual", SearchOpts::new(10)).unwrap();
+    // "commonword" is in many docs (high df); "rarezzq" in one (low df). Single-word docs, so
+    // the query's space-boundary grams match neither — only the clean word grams overlap.
+    for doc in 1..=20 {
+        h.put(doc, "field", "f", "commonword");
+    }
+    h.put(50, "field", "f", "rarezzq");
+    let q = "rarezzq commonword";
+
+    // With weighting (default D=1), the rare match wins despite sharing FEWER grams than the
+    // common docs — rarity, not raw overlap, decides.
+    let weighted = h.search(q, SearchOpts::new(5)).unwrap();
     assert_eq!(
-        hits[0].key.as_i64(),
-        Some(2),
-        "the short verbatim segment ranks first under length normalization"
+        weighted[0].key.as_i64(),
+        Some(50),
+        "IDF weighting surfaces the rare-gram match over higher-overlap common matches"
+    );
+
+    // Collapse the weighting (a huge D → every gram tier 1) and raw-overlap order returns:
+    // a common doc (more shared grams, lowest id) now ranks first, burying the rare match.
+    let flat = h
+        .index
+        .reader()
+        .unwrap()
+        .search(q, SearchOpts::new(5).weight_step(1e9))
+        .unwrap();
+    assert_ne!(
+        flat[0].key.as_i64(),
+        Some(50),
+        "without weighting the rare match is buried by raw overlap"
     );
 }
 
 #[test]
-fn bm25_tf_is_binary_repetition_does_not_boost() {
+fn overlap_counts_gram_presence_not_repetition() {
     let h = Harness::new();
-    h.put(1, "field", "f", "wxqzv plain"); // term once + filler
-    h.put(2, "field", "f", "wxqzv wxqzv"); // term twice, equal length
+    h.put(1, "field", "f", "wxqzv plain"); // the query term once
+    h.put(2, "field", "f", "wxqzv wxqzv"); // the query term twice
     let hits = h.search("wxqzv", SearchOpts::new(10)).unwrap();
+    // A posting records presence, not frequency, so repetition does not raise the score; the
+    // two tie and fall back to insertion order.
     assert_eq!(
         ids(&hits),
         [1, 2],
-        "binary tf: a repeated term does not outrank a single occurrence"
+        "repeating a term in a segment does not boost its overlap"
     );
 }
 
-// ----- C2-A3: a custom Ranker can compute idf from the public API -----
+#[test]
+fn weight_step_d_widens_the_tiers() {
+    // Same rare/common corpus; a large-but-finite D shrinks the rare gram's weight advantage
+    // enough that the higher-overlap common doc overtakes it — the knob visibly moves ranking.
+    let h = Harness::new();
+    for doc in 1..=20 {
+        h.put(doc, "field", "f", "commonword");
+    }
+    h.put(50, "field", "f", "rarezzq");
+    let q = "rarezzq commonword";
+    let sharp = h.search(q, SearchOpts::new(5)).unwrap(); // D = 1.0
+    let blunt = h
+        .index
+        .reader()
+        .unwrap()
+        .search(q, SearchOpts::new(5).weight_step(50.0))
+        .unwrap();
+    assert_eq!(
+        sharp[0].key.as_i64(),
+        Some(50),
+        "sharp D keeps the rare match on top"
+    );
+    assert_ne!(
+        blunt[0].key.as_i64(),
+        Some(50),
+        "blunt D lets raw overlap win"
+    );
+}
 
-/// A BM25+ ranker built ENTIRELY from the public `Candidate`/`QueryContext` surface —
-/// [`Candidate::matched_terms`] (per-term `df`), [`Candidate::seg_len`] (`|d|`),
-/// [`rank::idf`], and [`QueryContext::n_segments`]/[`QueryContext::avgdl`] — proving the API
-/// exposes everything a precision-tier ranker needs (it previously could not see `df`).
-struct CustomBm25;
-impl Ranker for CustomBm25 {
+// ----- a custom Ranker scores from the public signals (extension point) -----
+
+/// A custom ranker that scores by summed inverse-document-frequency over the matched terms,
+/// built ENTIRELY from the public surface — [`Candidate::matched_terms`] (per-term `df`) and
+/// [`QueryContext::n_segments`] — proving a caller can compute a corpus-relative score
+/// without any built-in BM25.
+struct IdfSum;
+impl Ranker for IdfSum {
     fn rank(&self, candidates: &Candidates<'_>, q: &QueryContext<'_>) -> Vec<Ranked> {
-        const K1: f64 = 1.2;
-        const B: f64 = 0.75;
-        const DELTA: f64 = 1.0;
-        let n = q.n_segments.max(1);
+        let n = q.n_segments.max(1) as f64;
+        let idf = |df: u64| {
+            (1.0 + (n - df as f64 + 0.5) / (df as f64 + 0.5))
+                .ln()
+                .max(0.0)
+        };
         let mut scored: Vec<(usize, f64)> = candidates
             .iter()
             .map(|c| {
-                let dl = (c.seg_len() as f64).max(1.0);
-                let norm = if q.avgdl > 0.0 {
-                    1.0 - B + B * dl / q.avgdl
-                } else {
-                    1.0
-                };
-                let tf_component = (K1 + 1.0) / (1.0 + K1 * norm) + DELTA;
-                let idf_sum: f64 = c.matched_terms().map(|(_, df)| rank::idf(df, n)).sum();
-                (c.index(), idf_sum * tf_component)
+                let s: f64 = c.matched_terms().map(|(_, df)| idf(df)).sum();
+                (c.index(), s)
             })
             .collect();
         scored.sort_by(|a, b| {
@@ -272,28 +314,28 @@ impl Ranker for CustomBm25 {
 }
 
 #[test]
-fn custom_ranker_reproduces_bm25_ordering_from_public_api() {
+fn custom_ranker_can_score_from_public_signals() {
     let h = Harness::new();
-    h.put(
-        1,
-        "field",
-        "f",
-        "zephyrqual aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn",
-    );
-    h.put(2, "field", "f", "zephyrqual");
-    // A user-supplied ranker, using only the public idf inputs, recovers the short segment —
-    // the same result the built-in Bm25Ranker produces.
-    let custom = h
+    for doc in 1..=20 {
+        h.put(doc, "field", "f", "commonword");
+    }
+    h.put(50, "field", "f", "rarezzq");
+    // Over-fetch so the custom ranker sees the common docs alongside the rare one, then let it
+    // score by summed idf from the public df signal.
+    let hits = h
         .index
         .reader()
         .unwrap()
-        .search("zephyrqual", SearchOpts::new(10).ranker(&CustomBm25))
+        .search(
+            "rarezzq commonword",
+            SearchOpts::new(5)
+                .rerank(trifle::Effort::High)
+                .ranker(&IdfSum),
+        )
         .unwrap();
-    let builtin = h.search("zephyrqual", SearchOpts::new(10)).unwrap();
-    assert_eq!(custom[0].key.as_i64(), Some(2));
     assert_eq!(
-        ids(&custom),
-        ids(&builtin),
-        "custom BM25 matches the built-in"
+        hits[0].key.as_i64(),
+        Some(50),
+        "a custom idf ranker reads per-term df and ranks the rare match first"
     );
 }

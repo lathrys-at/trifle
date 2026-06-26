@@ -29,7 +29,7 @@ use rusqlite::Connection;
 use crate::error::Result;
 use crate::schema;
 use crate::store::Namespace;
-use crate::term::{Term, encode_term};
+use crate::term::Term;
 use crate::welford::{ClassSnap, ClassStats};
 
 /// An interned term identifier. `0` is reserved as "none"; ids start at `1`.
@@ -121,7 +121,7 @@ impl Dictionary {
     }
 
     /// Reader fault: resolve a gram-encoding key to its id, or `None` if absent. Never
-    /// mutates. (Batched query resolution goes through [`resolve_batch`](Self::resolve_batch).)
+    /// mutates. (Batched query resolution goes through [`resolve_terms`](Self::resolve_terms).)
     fn resolve_key(&self, key: u128) -> Option<TermId> {
         self.inner
             .read()
@@ -131,23 +131,22 @@ impl Dictionary {
             .copied()
     }
 
-    /// Resolve a batch of distinct grams to ids and snapshot the classes they touch, all
-    /// under one read-lock, capturing the generation atomically with the resolution.
-    /// Returns `(gram→id, generation, class snapshot)`; absent / over-ceiling grams are
-    /// omitted from the map (and resolve to df 0 downstream).
-    pub(crate) fn resolve_batch(
-        &self,
-        grams: &[&str],
-    ) -> (HashMap<String, TermId>, u64, ClassSnap) {
+    /// Resolve a batch of distinct terms to ids and snapshot the classes they touch, all
+    /// under one read-lock, capturing the generation atomically with the resolution. Returns
+    /// `(term-key→id, generation, class snapshot)`; a term absent from the corpus is omitted
+    /// from the map (and resolves to df 0 downstream).
+    ///
+    /// Keyed by the term's packed `u128` so the read path resolves straight from a tokenizer
+    /// token's [`term()`](crate::IntoTerm::term) — no `Token → String → re-encode` round-trip,
+    /// matching what the write path already does (audit T2 / I10).
+    pub(crate) fn resolve_terms(&self, terms: &[Term]) -> (HashMap<u128, TermId>, u64, ClassSnap) {
         let guard = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        let mut out = HashMap::with_capacity(grams.len());
+        let mut out = HashMap::with_capacity(terms.len());
         let mut classes_seen: Vec<u8> = Vec::new();
-        for &g in grams {
-            if let Some(t) = encode_term(g) {
-                classes_seen.push(t.class());
-                if let Some(&id) = guard.map.get(&t.0) {
-                    out.insert(g.to_string(), id);
-                }
+        for t in terms {
+            classes_seen.push(t.class());
+            if let Some(&id) = guard.map.get(&t.0) {
+                out.insert(t.0, id);
             }
         }
         let snap = guard.classes.snapshot_for(classes_seen);

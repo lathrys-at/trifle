@@ -892,14 +892,12 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
-    /// The distinct token strings of `text`, deduplicated via the token type (no
-    /// allocation per duplicate window — only the distinct set is stringified).
-    fn distinct_tokens(&self, text: &str) -> Vec<String> {
+    /// The distinct tokens of `text`, deduplicated via the token type. Returns the tokens
+    /// themselves (not strings): the read path resolves and selects in term-space and
+    /// stringifies only the tokens that reach the ranker (audit T2 / I10).
+    fn distinct_tokens(&self, text: &str) -> Vec<T::Token> {
         let distinct: HashSet<T::Token> = self.tokenizer.tokenize(text).collect();
-        distinct
-            .into_iter()
-            .map(|t| t.borrow().to_string())
-            .collect()
+        distinct.into_iter().collect()
     }
 
     // ----- maintenance --------------------------------------------------------
@@ -1186,8 +1184,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
-        let (query_tokens, all_grams) = search::query_grams(queries, |q| self.distinct_tokens(q));
-        search::search_read_on(self, conn, &all_grams, |conn, ns, resolved, class_snap| {
+        let (query_tokens, all_terms) = search::query_terms(queries, |q| self.distinct_tokens(q));
+        search::search_read_on(self, conn, &all_terms, |conn, ns, resolved, class_snap| {
             search::SearchCtx::new(self, conn, ns, resolved, class_snap, opts)
                 .run_search(queries, &query_tokens)
         })

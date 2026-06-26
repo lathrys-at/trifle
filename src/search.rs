@@ -12,6 +12,7 @@
 //! from that query's own tokens and the shared snapshot, so a query in a batch ranks
 //! identically to the same query run alone.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
@@ -29,25 +30,30 @@ use crate::store::{Backend, Namespace};
 use crate::tokenize::Tokenizer;
 use crate::welford::ClassSnap;
 use crate::{
-    DEFAULT_MIN_SHARED, DEFAULT_T_MAX, Error, Index, Match, RETRY_MAX, Result, SearchOpts,
-    TYPO_DAMAGE, is_retryable, postings, schema, term,
+    DEFAULT_MIN_SHARED, DEFAULT_T_MAX, Error, Index, IntoTerm, Match, RETRY_MAX, Result,
+    SearchOpts, TYPO_DAMAGE, Term, is_retryable, postings, schema,
 };
 
-/// The distinct tokens per query and the batch-wide distinct gram set (the resolution input).
-/// Factored so the [`Reader`](crate::Reader) and the warm [`SearchSession`](crate::SearchSession)
-/// share one tokenize pass shape.
-pub(crate) fn query_grams(
+/// The distinct tokens per query and the batch-wide distinct **term** set (the resolution
+/// input). Factored so the [`Reader`](crate::Reader) and the warm
+/// [`SearchSession`](crate::SearchSession) share one tokenize pass shape. The read path stays
+/// in term-space: it resolves from each token's [`term()`](crate::IntoTerm::term) (no
+/// `Token → String → re-encode`), so the per-query token vectors carry the tokens themselves
+/// and only the selected ones are later stringified (audit T2 / I10). A token wider than the
+/// encoding ceiling has no term and is dropped from the resolution set — it resolves to df 0
+/// and rides along as an absent token.
+pub(crate) fn query_terms<Tk: IntoTerm>(
     queries: &[&str],
-    tokenize: impl Fn(&str) -> Vec<String>,
-) -> (Vec<Vec<String>>, Vec<String>) {
-    let query_tokens: Vec<Vec<String>> = queries.iter().map(|q| tokenize(q)).collect();
-    let all_grams: Vec<String> = query_tokens
+    tokenize: impl Fn(&str) -> Vec<Tk>,
+) -> (Vec<Vec<Tk>>, Vec<Term>) {
+    let query_tokens: Vec<Vec<Tk>> = queries.iter().map(|q| tokenize(q)).collect();
+    let all_terms: Vec<Term> = query_tokens
         .iter()
-        .flat_map(|q| q.iter().cloned())
-        .collect::<BTreeSet<String>>()
+        .flat_map(|q| q.iter().filter_map(|t| t.term()))
+        .collect::<BTreeSet<Term>>()
         .into_iter()
         .collect();
-    (query_tokens, all_grams)
+    (query_tokens, all_terms)
 }
 
 /// One search's context: the index plus the single consistent snapshot the search runs
@@ -58,7 +64,8 @@ pub(crate) struct SearchCtx<'a, T: Tokenizer, B: Backend> {
     index: &'a Index<T, B>,
     conn: &'a Connection,
     ns: &'a Namespace,
-    resolved: &'a HashMap<String, TermId>,
+    /// The query's distinct terms resolved to ids, keyed by the packed term `u128`.
+    resolved: &'a HashMap<u128, TermId>,
     class_snap: &'a ClassSnap,
     opts: &'a SearchOpts<'a>,
 }
@@ -68,7 +75,7 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
         index: &'a Index<T, B>,
         conn: &'a Connection,
         ns: &'a Namespace,
-        resolved: &'a HashMap<String, TermId>,
+        resolved: &'a HashMap<u128, TermId>,
         class_snap: &'a ClassSnap,
         opts: &'a SearchOpts<'a>,
     ) -> Self {
@@ -87,7 +94,7 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
     pub(crate) fn run_search(
         &self,
         queries: &[&str],
-        query_tokens: &[Vec<String>],
+        query_tokens: &[Vec<T::Token>],
     ) -> Result<Vec<Vec<Match>>> {
         let opts = self.opts;
         let min_shared = opts.min_shared.unwrap_or(DEFAULT_MIN_SHARED).max(1);
@@ -111,24 +118,25 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
             .into_iter()
             .collect();
         let dfs = postings::read_dfs(self.conn, self.ns, &all_ids)?;
-        // A gram's df: 0 if it resolved to no id (absent token) or its id has no live df
-        // row — exactly the existing df-0 behavior.
-        let df_of = |t: &str| -> i64 {
-            self.resolved
-                .get(t)
-                .and_then(|id| dfs.get(id))
-                .copied()
-                .unwrap_or(0)
+        // A token's `(id, df)`, resolving straight from its packed term — `None` if it has no
+        // term (over the encoding ceiling) or its term is absent from the corpus (→ df 0).
+        let resolve = |tok: &T::Token| -> Option<(TermId, i64)> {
+            let id = *self.resolved.get(&tok.term()?.0)?;
+            Some((id, dfs.get(&id).copied().unwrap_or(0)))
         };
 
-        let selected_per: Vec<Vec<String>> = query_tokens
+        // Selection runs in term-space; its tie-break is the token's own `Ord` (the
+        // `Tokenizer::Token` contract), identical to the previous string tie-break for the
+        // built-in tokenizers (their `Ord` delegates to `str`).
+        let selected_per: Vec<Vec<T::Token>> = query_tokens
             .iter()
             .map(|q| {
-                let triples: Vec<(String, i64, u8)> = q
+                let triples: Vec<(T::Token, i64, u8)> = q
                     .iter()
-                    .map(|t| {
-                        let class = term::encode_term(t).map(|tm| tm.class()).unwrap_or(0);
-                        (t.clone(), df_of(t), class)
+                    .map(|tok| {
+                        let class = tok.term().map(|t| t.class()).unwrap_or(0);
+                        let df = resolve(tok).map_or(0, |(_, df)| df);
+                        (tok.clone(), df, class)
                     })
                     .collect();
                 select(&triples, sel_params, self.class_snap)
@@ -137,7 +145,7 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
         let sel_ids: Vec<TermId> = selected_per
             .iter()
             .flat_map(|s| s.iter())
-            .filter_map(|t| self.resolved.get(t.as_str()).copied())
+            .filter_map(|tok| resolve(tok).map(|(id, _)| id))
             .collect::<BTreeSet<TermId>>()
             .into_iter()
             .collect();
@@ -181,13 +189,14 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
         let mut out = Vec::with_capacity(queries.len());
         for (qi, &query) in queries.iter().enumerate() {
             let selected = &selected_per[qi];
+            // The selected tokens that have a posting, paired with it via the token's `&str`
+            // view (no allocation — `Borrow<str>`).
             let present: Vec<(&str, &RoaringBitmap)> = selected
                 .iter()
-                .filter_map(|t| {
-                    self.resolved
-                        .get(t.as_str())
-                        .and_then(|id| postings_map.get(id))
-                        .map(|bm| (t.as_str(), bm))
+                .filter_map(|tok| {
+                    resolve(tok)
+                        .and_then(|(id, _)| postings_map.get(&id))
+                        .map(|bm| (tok.borrow(), bm))
                 })
                 .collect();
             // Telemetry for the weight-step hint (df-only; no corpus read).
@@ -198,9 +207,16 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
             // custom ranker always sees it.
             self.hydrate_text(&mut survivors)?;
 
+            // Stringify only the selected tokens — the public ranker API
+            // ([`QueryContext::selected`]) and `span` take strings; nothing else on the read
+            // path allocates per token (audit T2 / I10).
+            let selected_strings: Vec<String> = selected
+                .iter()
+                .map(|tok| tok.borrow().to_string())
+                .collect();
             let qctx = QueryContext {
                 query,
-                selected,
+                selected: &selected_strings,
                 min_shared,
                 n_segments,
                 avgdl,
@@ -292,20 +308,19 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
 pub(crate) fn search_read_on<T: Tokenizer, B: Backend, R>(
     index: &Index<T, B>,
     conn: &Connection,
-    all_grams: &[String],
-    mut f: impl FnMut(&Connection, &Namespace, &HashMap<String, TermId>, &ClassSnap) -> Result<R>,
+    all_terms: &[Term],
+    mut f: impl FnMut(&Connection, &Namespace, &HashMap<u128, TermId>, &ClassSnap) -> Result<R>,
 ) -> Result<R> {
     let ns = index.backend.namespace();
-    let gram_refs: Vec<&str> = all_grams.iter().map(String::as_str).collect();
     let mut attempt = 0;
     loop {
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => return Err(Error::from(e)),
         };
-        // Resolve the grams in memory + capture the generation and per-class stats
+        // Resolve the terms in memory + capture the generation and per-class stats
         // snapshot atomically, then read the snapshot's generation to compare.
-        let (resolved, gen_mem, class_snap) = index.dict.resolve_batch(&gram_refs);
+        let (resolved, gen_mem, class_snap) = index.dict.resolve_terms(all_terms);
         let gen_snap = match schema::dict_generation(&tx, ns) {
             Ok(g) => g,
             Err(e) => {

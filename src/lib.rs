@@ -77,7 +77,9 @@ use rusqlite::{Connection, OptionalExtension};
 pub use rusqlite;
 
 pub use error::{Error, Result};
-pub use model::{Document, Key, KeyShape, Match, Schema, SchemaBuilder, StorageMode};
+pub use model::{
+    CmpOp, Document, Filter, FilterType, Key, KeyShape, Match, Schema, SchemaBuilder, StorageMode,
+};
 use dict::{Dictionary, TermId};
 use rank::{Bm25Ranker, Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
 use schema::SCHEMA_VERSION;
@@ -265,6 +267,10 @@ pub struct SearchOpts<'a> {
     /// How much of a match to materialize — the [`Hydration`] cost ladder. Defaults to
     /// [`SegmentText`](Hydration::SegmentText).
     pub hydration: Hydration,
+    /// An optional [`Filter`] over the schema's **filterable** fields (Tier 2). Applied as
+    /// a doc-id intersection during candidate generation — it prunes before rerank and
+    /// hydration, but does not save the overlap work itself.
+    pub filter: Option<&'a Filter>,
 }
 
 impl<'a> SearchOpts<'a> {
@@ -279,12 +285,19 @@ impl<'a> SearchOpts<'a> {
             scope: None,
             effort: Effort::default(),
             hydration: Hydration::default(),
+            filter: None,
         }
     }
 
     /// Set the [`Hydration`] level (how much of each match to materialize).
     pub fn hydrate(mut self, hydration: Hydration) -> Self {
         self.hydration = hydration;
+        self
+    }
+
+    /// Set a [`Filter`] over the schema's filterable fields.
+    pub fn filter(mut self, filter: &'a Filter) -> Self {
+        self.filter = Some(filter);
         self
     }
 
@@ -439,10 +452,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     fn init(&self) -> Result<()> {
         let mut guard = self.backend.write()?;
         let ns = self.backend.namespace();
-        let key_ty = self.schema.key_shape().sql_type();
         let tx = guard.transaction()?;
         schema::drop_shadows(&tx, ns)?;
-        schema::create_tables(&tx, ns, key_ty)?;
+        schema::create_tables(&tx, ns, &self.schema)?;
 
         let stamps = schema::read_stamps(&tx, ns)?;
         let fingerprint = self.tokenizer.fingerprint();
@@ -454,7 +466,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let desync = !drift && self.desync(&tx, ns)?;
 
         if drift || desync {
-            schema::reset(&tx, ns, key_ty)?;
+            schema::reset(&tx, ns, &self.schema)?;
             schema::set_next_id(&tx, ns, 1)?;
             // A reset empties the dictionary and so reassigns the (now empty) id space;
             // bump the generation so any concurrent reader detects the change.
@@ -687,6 +699,47 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
+    /// Set a document's filterable column values from `fields` (Tier 2); names not
+    /// declared filterable are skipped. `doc_table` is the live or shadow `doc` table.
+    fn set_doc_fields(
+        &self,
+        conn: &Connection,
+        doc_table: &str,
+        doc_id: i64,
+        fields: &[(String, Value)],
+    ) -> Result<()> {
+        let mut sets = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        for (name, value) in fields {
+            if let Ok(col) = self.schema.filter_column(name) {
+                sets.push(format!("{col} = ?"));
+                params.push(value.clone());
+            }
+        }
+        if sets.is_empty() {
+            return Ok(());
+        }
+        params.push(Value::Integer(doc_id));
+        let sql = format!("UPDATE {doc_table} SET {} WHERE id = ?", sets.join(", "));
+        conn.execute(&sql, rusqlite::params_from_iter(params))?;
+        Ok(())
+    }
+
+    /// The internal doc ids matching a structured [`Filter`] over the schema's filterable
+    /// columns (Tier 2). Field names are validated against the schema (the injection
+    /// guard); a value-less / unsatisfiable filter yields an empty set.
+    fn filter_docs(&self, conn: &Connection, ns: &Namespace, filter: &Filter) -> Result<RoaringBitmap> {
+        let (where_sql, params) = filter.compile(&self.schema)?;
+        let sql = format!("SELECT id FROM {} WHERE {}", ns.doc(), where_sql);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        let mut bm = RoaringBitmap::new();
+        while let Some(r) = rows.next()? {
+            bm.insert(r.get::<_, i64>(0)? as u32);
+        }
+        Ok(bm)
+    }
+
     /// The distinct token strings of `text`, deduplicated via the token type (no
     /// allocation per duplicate window — only the distinct set is stringified).
     fn distinct_tokens(&self, text: &str) -> Vec<String> {
@@ -736,10 +789,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     pub fn rebuild(&self, corpus: impl IntoIterator<Item = Document>) -> Result<()> {
         let mut guard = self.backend.write()?;
         let ns = self.backend.namespace();
-        let key_ty = self.schema.key_shape().sql_type();
-
         let tx = guard.transaction()?;
-        schema::create_shadows(&tx, ns, key_ty)?;
+        schema::create_shadows(&tx, ns, &self.schema)?;
 
         // Accumulate the inverted index in memory while streaming doc/seg rows to the
         // shadow tables. Three id spaces are reassigned dense (doc, segment, term); the
@@ -767,6 +818,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 let doc_id = next_doc;
                 next_doc += 1;
                 doc_ins.execute(rusqlite::params![doc_id, doc.key.to_value()])?;
+                if !doc.payload.is_empty() {
+                    self.set_doc_fields(&tx, ns.doc_shadow(), doc_id, &doc.payload)?;
+                }
                 for (label, text) in &doc.segments {
                     let mode = self.schema.storage_for(label).ok_or_else(|| {
                         Error::InvalidInput(format!("label {label:?} is not a field of the schema"))
@@ -828,7 +882,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             inverted.iter().map(|(id, bm)| (*id, bm)),
         )?;
 
-        schema::swap_shadows(&tx, ns)?;
+        schema::swap_shadows(&tx, ns, &self.schema)?;
         schema::set_next_id(&tx, ns, next_seg)?;
         // Reassigning the term-id space bumps the generation so a concurrent reader
         // detects the change and re-resolves against the new snapshot.
@@ -973,6 +1027,13 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             // over-fetch), so the overlap ranker pays nothing.
             let pool = opts.effort.pool(opts.limit, n_segments);
 
+            // Tier-2 filter: the doc ids matching the structured filter, intersected
+            // during candidate generation (same for every query in the batch).
+            let filter_docs = match opts.filter {
+                Some(f) => Some(self.filter_docs(conn, ns, f)?),
+                None => None,
+            };
+
             let mut out = Vec::with_capacity(queries.len());
             for (qi, query) in queries.iter().enumerate() {
                 let selected = &selected_per[qi];
@@ -994,6 +1055,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                     pool,
                     min_shared,
                     self.schema.key_shape(),
+                    filter_docs.as_ref(),
                     opts.scope,
                 )?;
                 if opts.hydration != Hydration::Coordinates {
@@ -1297,6 +1359,23 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
         }
         let df = changes.apply(conn, ns)?;
         self.pending_df.extend(df);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Set the document's filterable field values (Tier 2), creating the document if
+    /// absent. Undeclared field names are ignored. Independent of the segment methods.
+    pub fn set_fields(&mut self, key: impl Into<Key>, fields: &[(&str, Value)]) -> Result<()> {
+        let key = key.into();
+        let ns = self.index.backend.namespace();
+        let conn: &Connection = &self.guard;
+        let doc = self
+            .index
+            .doc_id_for(conn, ns, &key, true)?
+            .expect("create=true always yields a doc id");
+        let owned: Vec<(String, Value)> =
+            fields.iter().map(|(n, v)| (n.to_string(), v.clone())).collect();
+        self.index.set_doc_fields(conn, ns.doc(), doc, &owned)?;
         self.dirty = true;
         Ok(())
     }

@@ -8,7 +8,32 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
+use crate::model::Schema;
 use crate::store::Namespace;
+
+/// The extra `doc` column definitions for the schema's filterable fields, e.g.
+/// `, deck INTEGER, lang TEXT`. Names are validated identifiers (checked at schema build).
+fn doc_filt_cols(schema: &Schema) -> String {
+    let mut s = String::new();
+    for (name, ty) in schema.filterable_columns() {
+        s.push_str(", ");
+        s.push_str(name);
+        s.push(' ');
+        s.push_str(ty.sql_type());
+    }
+    s
+}
+
+/// `CREATE INDEX` statements for the schema's filterable `doc` columns (on `table`).
+fn doc_filt_indexes(table: &str, schema: &Schema) -> String {
+    let mut s = String::new();
+    for (name, _) in schema.filterable_columns() {
+        s.push_str(&format!(
+            "CREATE INDEX IF NOT EXISTS {table}_filt_{name} ON {table}({name});\n"
+        ));
+    }
+    s
+}
 
 /// trifle's on-disk format version. Bump on any incompatible schema change; an
 /// index stamped with a different value is reset on open.
@@ -28,7 +53,8 @@ pub(crate) const KEY_NEXT_ID: &str = "next_id";
 pub(crate) const KEY_DICT_GENERATION: &str = "dict_generation";
 
 /// Create every persistent table and index if absent. Idempotent.
-pub(crate) fn create_tables(conn: &Connection, ns: &Namespace, key_sql_type: &str) -> Result<()> {
+pub(crate) fn create_tables(conn: &Connection, ns: &Namespace, schema: &Schema) -> Result<()> {
+    let key_sql_type = schema.key_shape().sql_type();
     // The model is two levels: `doc` (one row per caller key) and `seg` (one row per
     // (doc, label) segment; `seg.id` is the roaring posting id). `seg.txt` is NULL for a
     // non-`Stored` field. `fwd` holds every segment's term-id set (a roaring bitmap), so
@@ -40,9 +66,9 @@ pub(crate) fn create_tables(conn: &Connection, ns: &Namespace, key_sql_type: &st
     // apart from `dict`. `doc.key` is the one schema-typed column.
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {meta}(key TEXT PRIMARY KEY, value);
-         CREATE TABLE IF NOT EXISTS {doc}(id INTEGER PRIMARY KEY, key {keyty} NOT NULL);
+         CREATE TABLE IF NOT EXISTS {doc}(id INTEGER PRIMARY KEY, key {keyty} NOT NULL{filtcols});
          CREATE UNIQUE INDEX IF NOT EXISTS {doc}_by_key ON {doc}(key);
-         CREATE TABLE IF NOT EXISTS {seg}(
+         {filtidx}CREATE TABLE IF NOT EXISTS {seg}(
             id     INTEGER PRIMARY KEY,
             doc_id INTEGER NOT NULL,
             label  TEXT    NOT NULL,
@@ -67,6 +93,8 @@ pub(crate) fn create_tables(conn: &Connection, ns: &Namespace, key_sql_type: &st
         post = ns.post(),
         delta = ns.delta(),
         keyty = key_sql_type,
+        filtcols = doc_filt_cols(schema),
+        filtidx = doc_filt_indexes(ns.doc(), schema),
     );
     conn.execute_batch(&sql)?;
     Ok(())
@@ -123,10 +151,10 @@ pub(crate) fn drop_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
 /// Create fresh, empty rebuild-shadow tables (dropping any leftovers first). No
 /// `doc`/`seg`/`dict` indexes — all are recreated on the live tables after the swap (the
 /// shadow bulk-inserts are dup-free, so the unique indexes are not needed during build).
-pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace, key_sql_type: &str) -> Result<()> {
+pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace, schema: &Schema) -> Result<()> {
     drop_shadows(conn, ns)?;
     let sql = format!(
-        "CREATE TABLE {doc}(id INTEGER PRIMARY KEY, key {keyty} NOT NULL);
+        "CREATE TABLE {doc}(id INTEGER PRIMARY KEY, key {keyty} NOT NULL{filtcols});
          CREATE TABLE {seg}(
             id INTEGER PRIMARY KEY, doc_id INTEGER NOT NULL, label TEXT NOT NULL, txt TEXT
          );
@@ -142,7 +170,8 @@ pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace, key_sql_type: &s
         term = ns.term_shadow(),
         post = ns.post_shadow(),
         delta = ns.delta_shadow(),
-        keyty = key_sql_type,
+        keyty = schema.key_shape().sql_type(),
+        filtcols = doc_filt_cols(schema),
     );
     conn.execute_batch(&sql)?;
     Ok(())
@@ -151,7 +180,7 @@ pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace, key_sql_type: &s
 /// Swap the freshly-built shadow tables in for the live ones in one transaction:
 /// drop live, rename each shadow to its live name, recreate the `seg`-by-doc index.
 /// A reader sees complete-old or complete-new — never partial.
-pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
+pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace, schema: &Schema) -> Result<()> {
     let sql = format!(
         "DROP INDEX IF EXISTS {doc}_by_key;
          DROP INDEX IF EXISTS {seg}_by_doc;
@@ -165,7 +194,7 @@ pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
          DROP TABLE IF EXISTS {post};  ALTER TABLE {post_s}  RENAME TO {post};
          DROP TABLE IF EXISTS {delta}; ALTER TABLE {delta_s} RENAME TO {delta};
          CREATE UNIQUE INDEX {doc}_by_key ON {doc}(key);
-         CREATE INDEX {seg}_by_doc ON {seg}(doc_id);
+         {filtidx}CREATE INDEX {seg}_by_doc ON {seg}(doc_id);
          CREATE UNIQUE INDEX {seg}_by_doc_label ON {seg}(doc_id, label);
          CREATE UNIQUE INDEX {dict}_by_gram ON {dict}(gram);",
         doc = ns.doc(),
@@ -175,6 +204,7 @@ pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
         term = ns.term(),
         post = ns.post(),
         delta = ns.delta(),
+        filtidx = doc_filt_indexes(ns.doc(), schema),
         doc_s = ns.doc_shadow(),
         seg_s = ns.seg_shadow(),
         fwd_s = ns.fwd_shadow(),
@@ -190,10 +220,10 @@ pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
 /// Reset the store to empty: drop persistent tables and any shadows, then recreate
 /// the persistent tables. Used when a version stamp mismatches or the id-allocation
 /// invariant is found broken at open.
-pub(crate) fn reset(conn: &Connection, ns: &Namespace, key_sql_type: &str) -> Result<()> {
+pub(crate) fn reset(conn: &Connection, ns: &Namespace, schema: &Schema) -> Result<()> {
     drop_shadows(conn, ns)?;
     drop_persistent(conn, ns)?;
-    create_tables(conn, ns, key_sql_type)
+    create_tables(conn, ns, schema)
 }
 
 /// Read a meta value as a string.

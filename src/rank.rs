@@ -102,6 +102,7 @@ pub(crate) fn overlap_search(
     limit: usize,
     min_shared: u32,
     key_shape: KeyShape,
+    filter_docs: Option<&RoaringBitmap>,
     scope: Option<&crate::ScopeFn<'_>>,
 ) -> Result<Vec<Survivor>> {
     let bitmaps: Vec<&RoaringBitmap> = present.iter().map(|(_, b)| *b).collect();
@@ -140,6 +141,12 @@ pub(crate) fn overlap_search(
                 let Some((doc, key, label)) = provenance.get(&id) else {
                     continue; // posting id with no live segment row — skip
                 };
+                // Tier-2 filter: keep only docs passing the structured filter.
+                if let Some(fd) = filter_docs {
+                    if !fd.contains(*doc) {
+                        continue;
+                    }
+                }
                 if let Some(scope) = scope {
                     if !scope(key, label) {
                         continue;

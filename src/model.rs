@@ -151,23 +151,193 @@ impl StorageMode {
     }
 }
 
+/// The declared type of a **filterable** field (Tier 2 of the filtering ladder): it
+/// materializes as a real, indexed `doc` column the search can `WHERE` against. Picks the
+/// column's SQLite affinity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterType {
+    /// Integer-affinity column.
+    Int,
+    /// Real-affinity column.
+    Real,
+    /// Text-affinity column.
+    Text,
+}
+
+impl FilterType {
+    pub(crate) fn sql_type(self) -> &'static str {
+        match self {
+            FilterType::Int => "INTEGER",
+            FilterType::Real => "REAL",
+            FilterType::Text => "TEXT",
+        }
+    }
+    fn code(self) -> u8 {
+        match self {
+            FilterType::Int => 1,
+            FilterType::Real => 2,
+            FilterType::Text => 3,
+        }
+    }
+}
+
+/// A comparison operator for a [`Filter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    /// `=`
+    Eq,
+    /// `<>`
+    Ne,
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+}
+
+impl CmpOp {
+    fn sql(self) -> &'static str {
+        match self {
+            CmpOp::Eq => "=",
+            CmpOp::Ne => "<>",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+        }
+    }
+}
+
+/// A structured filter over **filterable** fields (Tier 2). Compiles to a parameterized
+/// `WHERE` over the materialized `doc` columns and is applied as a doc-id set
+/// intersection between candidate generation and rerank/hydration (it prunes before
+/// ranking; it does not save the candidate-generation overlap work — that needs a
+/// partition). Only declared-filterable fields are addressable, via this restricted
+/// grammar — never arbitrary SQL.
+#[derive(Clone, Debug)]
+pub enum Filter {
+    /// `field op value`.
+    Cmp {
+        /// The filterable field name.
+        field: String,
+        /// The comparison operator.
+        op: CmpOp,
+        /// The bound value.
+        value: Value,
+    },
+    /// `field IN (values…)`.
+    In {
+        /// The filterable field name.
+        field: String,
+        /// The candidate values.
+        values: Vec<Value>,
+    },
+    /// Both sub-filters.
+    And(Box<Filter>, Box<Filter>),
+    /// Either sub-filter.
+    Or(Box<Filter>, Box<Filter>),
+}
+
+impl Filter {
+    /// `field op value`.
+    pub fn cmp(field: impl Into<String>, op: CmpOp, value: impl Into<Value>) -> Filter {
+        Filter::Cmp {
+            field: field.into(),
+            op,
+            value: value.into(),
+        }
+    }
+    /// `field = value`.
+    pub fn eq(field: impl Into<String>, value: impl Into<Value>) -> Filter {
+        Filter::cmp(field, CmpOp::Eq, value)
+    }
+    /// `field IN (values…)`.
+    pub fn in_(field: impl Into<String>, values: impl IntoIterator<Item = Value>) -> Filter {
+        Filter::In {
+            field: field.into(),
+            values: values.into_iter().collect(),
+        }
+    }
+    /// Conjoin two filters.
+    pub fn and(self, other: Filter) -> Filter {
+        Filter::And(Box::new(self), Box::new(other))
+    }
+    /// Disjoin two filters.
+    pub fn or(self, other: Filter) -> Filter {
+        Filter::Or(Box::new(self), Box::new(other))
+    }
+
+    /// Compile to a parameterized SQL predicate over `doc` columns, validating every
+    /// referenced field against the schema's filterable set (the injection guard — only
+    /// declared idents reach SQL). Returns the predicate and its bound parameters.
+    pub(crate) fn compile(&self, schema: &Schema) -> Result<(String, Vec<Value>)> {
+        let mut params = Vec::new();
+        let sql = self.build(schema, &mut params)?;
+        Ok((sql, params))
+    }
+
+    fn build(&self, schema: &Schema, params: &mut Vec<Value>) -> Result<String> {
+        match self {
+            Filter::Cmp { field, op, value } => {
+                let col = schema.filter_column(field)?;
+                params.push(value.clone());
+                Ok(format!("{col} {} ?", op.sql()))
+            }
+            Filter::In { field, values } => {
+                let col = schema.filter_column(field)?;
+                if values.is_empty() {
+                    return Ok("0".to_string()); // empty IN matches nothing
+                }
+                let marks = vec!["?"; values.len()].join(", ");
+                for v in values {
+                    params.push(v.clone());
+                }
+                Ok(format!("{col} IN ({marks})"))
+            }
+            Filter::And(a, b) => Ok(format!(
+                "({} AND {})",
+                a.build(schema, params)?,
+                b.build(schema, params)?
+            )),
+            Filter::Or(a, b) => Ok(format!(
+                "({} OR {})",
+                a.build(schema, params)?,
+                b.build(schema, params)?
+            )),
+        }
+    }
+}
+
 /// A document to index: a [`Key`] plus its named segments (`label → text`). Used by
 /// [`rebuild`](crate::Index::rebuild) and the batch insert.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Document {
     /// The caller's key — the unit of retrieval and lifecycle.
     pub key: Key,
     /// The document's segments as `(label, text)` pairs; each `label` names a text field.
     pub segments: Vec<(String, String)>,
+    /// Values for the schema's **filterable** fields, as `(field, value)` pairs. Stored
+    /// into the materialized `doc` columns (Tier 2); undeclared names are ignored.
+    pub payload: Vec<(String, Value)>,
 }
 
 impl Document {
-    /// Construct a document.
+    /// Construct a document with no filterable payload.
     pub fn new(key: impl Into<Key>, segments: Vec<(String, String)>) -> Self {
         Document {
             key: key.into(),
             segments,
+            payload: Vec::new(),
         }
+    }
+
+    /// Set the filterable-field payload.
+    pub fn with_payload(mut self, payload: Vec<(String, Value)>) -> Self {
+        self.payload = payload;
+        self
     }
 }
 
@@ -199,6 +369,9 @@ pub struct Schema {
     fields: HashMap<String, StorageMode>,
     /// Storage mode for labels not explicitly declared (`flat()`); `None` rejects them.
     default_text: Option<StorageMode>,
+    /// Declared filterable fields (Tier 2): materialized as indexed `doc` columns, in
+    /// declaration order (the order the columns are created).
+    filterable: Vec<(String, FilterType)>,
     fingerprint: u64,
 }
 
@@ -209,6 +382,7 @@ impl Schema {
             key: None,
             fields: Vec::new(),
             default_text: None,
+            filterable: Vec::new(),
         }
     }
 
@@ -242,6 +416,19 @@ impl Schema {
         self.default_text == Some(StorageMode::Resolver)
             || self.fields.values().any(|m| *m == StorageMode::Resolver)
     }
+    /// The `doc` column name for a declared filterable `field`, or an error if it is not
+    /// declared filterable (the injection guard for a compiled `WHERE`).
+    pub(crate) fn filter_column(&self, field: &str) -> Result<&str> {
+        self.filterable
+            .iter()
+            .find(|(n, _)| n == field)
+            .map(|(n, _)| n.as_str())
+            .ok_or_else(|| Error::schema(format!("{field:?} is not a filterable field")))
+    }
+    /// The declared filterable fields (name + type), in declaration / column order.
+    pub(crate) fn filterable_columns(&self) -> &[(String, FilterType)] {
+        &self.filterable
+    }
     /// The schema fingerprint (semantic identity), folded into the drift check.
     pub(crate) fn fingerprint(&self) -> u64 {
         self.fingerprint
@@ -253,6 +440,7 @@ pub struct SchemaBuilder {
     key: Option<(String, KeyShape)>,
     fields: Vec<(String, StorageMode)>,
     default_text: Option<StorageMode>,
+    filterable: Vec<(String, FilterType)>,
 }
 
 impl SchemaBuilder {
@@ -277,6 +465,13 @@ impl SchemaBuilder {
     /// front-end used by [`Schema::flat`].
     pub fn default_text(mut self, storage: StorageMode) -> Self {
         self.default_text = Some(storage);
+        self
+    }
+
+    /// Declare a **filterable** field of the given type (Tier 2). It materializes as an
+    /// indexed `doc` column a search can `WHERE` against via a [`Filter`].
+    pub fn filterable(mut self, name: impl Into<String>, ty: FilterType) -> Self {
+        self.filterable.push((name.into(), ty));
         self
     }
 
@@ -309,12 +504,32 @@ impl SchemaBuilder {
                 "schema declares no text field and no default — nothing to index",
             ));
         }
+        // Filterable fields become `doc` columns: ident-safe, distinct, and not the
+        // built-in `id`/`key` columns.
+        for (name, _) in &self.filterable {
+            crate::store::validate_ident(name)?;
+            if name == "id" || name == "key" {
+                return Err(Error::schema(format!(
+                    "filterable field {name:?} collides with a built-in doc column"
+                )));
+            }
+            if !seen.insert(name.clone()) {
+                return Err(Error::schema(format!("duplicate field name {name:?}")));
+            }
+        }
 
-        let fingerprint = schema_fingerprint(&key_name, key_shape, &self.fields, self.default_text);
+        let fingerprint = schema_fingerprint(
+            &key_name,
+            key_shape,
+            &self.fields,
+            self.default_text,
+            &self.filterable,
+        );
         Ok(Schema {
             key_shape,
             fields,
             default_text: self.default_text,
+            filterable: self.filterable,
             fingerprint,
         })
     }
@@ -329,9 +544,12 @@ fn schema_fingerprint(
     key_shape: KeyShape,
     fields: &[(String, StorageMode)],
     default_text: Option<StorageMode>,
+    filterable: &[(String, FilterType)],
 ) -> u64 {
     let mut sorted: Vec<&(String, StorageMode)> = fields.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut filt: Vec<&(String, FilterType)> = filterable.iter().collect();
+    filt.sort_by(|a, b| a.0.cmp(&b.0));
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"schema-v1");
     bytes.extend_from_slice(&(key_name.len() as u64).to_le_bytes());
@@ -343,6 +561,12 @@ fn schema_fingerprint(
         bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
         bytes.extend_from_slice(name.as_bytes());
         bytes.push(mode.code());
+    }
+    bytes.extend_from_slice(&(filt.len() as u64).to_le_bytes());
+    for (name, ty) in filt {
+        bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(ty.code());
     }
     crate::tokenize::fnv1a_64(&bytes)
 }

@@ -164,12 +164,18 @@ pub enum FilterType {
     Real,
     /// Text-affinity column.
     Text,
+    /// A datetime, stored as a **sortable scalar** so the plain `<`/`>`/`=` comparisons
+    /// order chronologically. Sugar for an epoch-`INTEGER` column (the canonical
+    /// encoding); for ISO-8601 strings — which sort chronologically as text — declare
+    /// [`Text`](FilterType::Text) instead. SQLite has no datetime type, so no special
+    /// operators are needed: the sortable encoding *is* the mechanism.
+    Timestamp,
 }
 
 impl FilterType {
     pub(crate) fn sql_type(self) -> &'static str {
         match self {
-            FilterType::Int => "INTEGER",
+            FilterType::Int | FilterType::Timestamp => "INTEGER",
             FilterType::Real => "REAL",
             FilterType::Text => "TEXT",
         }
@@ -179,6 +185,7 @@ impl FilterType {
             FilterType::Int => 1,
             FilterType::Real => 2,
             FilterType::Text => 3,
+            FilterType::Timestamp => 4,
         }
     }
 }
@@ -237,6 +244,44 @@ pub enum Filter {
         /// The candidate values.
         values: Vec<Value>,
     },
+    /// `field BETWEEN low AND high` (inclusive) — the clean form for a range, including a
+    /// datetime range over a [`Timestamp`](FilterType::Timestamp) field.
+    Between {
+        /// The filterable field name.
+        field: String,
+        /// The inclusive lower bound.
+        low: Value,
+        /// The inclusive upper bound.
+        high: Value,
+    },
+    /// `field IS NULL`.
+    IsNull {
+        /// The filterable field name.
+        field: String,
+    },
+    /// `field LIKE pattern`. **Cost:** a *leading-wildcard* pattern (`"%x"`) forces a full
+    /// scan — the index cannot help — the same hidden cliff as an un-indexed path. Prefer
+    /// an anchored pattern (`"x%"`).
+    Like {
+        /// The filterable field name.
+        field: String,
+        /// The `LIKE` pattern.
+        pattern: String,
+    },
+    /// A raw, parameterized SQL predicate **fragment over the filterable columns** — the
+    /// escape hatch. It exposes all of SQLite's expression language (date functions,
+    /// arithmetic, …) but is fenced to the materialized `doc` columns: it cannot reach the
+    /// postings or internal tables. **Costs:** *untyped* (a malformed fragment is a
+    /// runtime error, not a compile error); the **fragment is trusted** (it is the
+    /// injection surface — keep it a constant and bind data through `params`, never format
+    /// values into it); and it **couples you to trifle's column names**. Advanced and may
+    /// break across versions — prefer the structured variants.
+    Sql {
+        /// The SQL predicate fragment, with `?` placeholders for `params`.
+        fragment: String,
+        /// The bound parameters, in placeholder order.
+        params: Vec<Value>,
+    },
     /// Both sub-filters.
     And(Box<Filter>, Box<Filter>),
     /// Either sub-filter.
@@ -261,6 +306,39 @@ impl Filter {
         Filter::In {
             field: field.into(),
             values: values.into_iter().collect(),
+        }
+    }
+    /// `field BETWEEN low AND high` (inclusive).
+    pub fn between(
+        field: impl Into<String>,
+        low: impl Into<Value>,
+        high: impl Into<Value>,
+    ) -> Filter {
+        Filter::Between {
+            field: field.into(),
+            low: low.into(),
+            high: high.into(),
+        }
+    }
+    /// `field IS NULL`.
+    pub fn is_null(field: impl Into<String>) -> Filter {
+        Filter::IsNull {
+            field: field.into(),
+        }
+    }
+    /// `field LIKE pattern` (mind the leading-wildcard scan cost — see [`Filter::Like`]).
+    pub fn like(field: impl Into<String>, pattern: impl Into<String>) -> Filter {
+        Filter::Like {
+            field: field.into(),
+            pattern: pattern.into(),
+        }
+    }
+    /// A raw parameterized SQL fragment over the filterable columns (the escape hatch —
+    /// see [`Filter::Sql`] for the costs).
+    pub fn sql(fragment: impl Into<String>, params: impl IntoIterator<Item = Value>) -> Filter {
+        Filter::Sql {
+            fragment: fragment.into(),
+            params: params.into_iter().collect(),
         }
     }
     /// Conjoin two filters.
@@ -298,6 +376,34 @@ impl Filter {
                     params.push(v.clone());
                 }
                 Ok(format!("{col} IN ({marks})"))
+            }
+            Filter::Between { field, low, high } => {
+                let col = schema.filter_column(field)?;
+                params.push(low.clone());
+                params.push(high.clone());
+                Ok(format!("{col} BETWEEN ? AND ?"))
+            }
+            Filter::IsNull { field } => {
+                let col = schema.filter_column(field)?;
+                Ok(format!("{col} IS NULL"))
+            }
+            Filter::Like { field, pattern } => {
+                let col = schema.filter_column(field)?;
+                params.push(Value::Text(pattern.clone()));
+                Ok(format!("{col} LIKE ?"))
+            }
+            Filter::Sql {
+                fragment,
+                params: p,
+            } => {
+                // The escape hatch: the fragment is trusted and not field-validated (it is
+                // the injection surface); only its values are parameterized. Fenced to the
+                // `doc` table by where it is spliced — it cannot name postings/internal
+                // tables.
+                for v in p {
+                    params.push(v.clone());
+                }
+                Ok(format!("({fragment})"))
             }
             Filter::And(a, b) => Ok(format!(
                 "({} AND {})",
@@ -644,5 +750,66 @@ mod tests {
             .build()
             .unwrap();
         assert_ne!(a.fingerprint(), c.fingerprint());
+    }
+
+    #[test]
+    fn filter_grammar_compiles_and_validates_fields() {
+        let s = Schema::chunked()
+            .text("body")
+            .filterable("deck", FilterType::Int)
+            .filterable("created", FilterType::Timestamp)
+            .filterable("lang", FilterType::Text)
+            .build()
+            .unwrap();
+
+        // Comparison, range, null, like, in.
+        assert_eq!(
+            Filter::eq("deck", Value::Integer(3)).compile(&s).unwrap().0,
+            "deck = ?"
+        );
+        let (sql, p) = Filter::between("created", Value::Integer(100), Value::Integer(200))
+            .compile(&s)
+            .unwrap();
+        assert_eq!(sql, "created BETWEEN ? AND ?");
+        assert_eq!(p.len(), 2);
+        assert_eq!(
+            Filter::is_null("lang").compile(&s).unwrap().0,
+            "lang IS NULL"
+        );
+        assert_eq!(
+            Filter::like("lang", "en%").compile(&s).unwrap().0,
+            "lang LIKE ?"
+        );
+        assert_eq!(
+            Filter::in_("deck", [Value::Integer(1), Value::Integer(2)])
+                .compile(&s)
+                .unwrap()
+                .0,
+            "deck IN (?, ?)"
+        );
+
+        // AND / OR nest with parentheses.
+        let nested = Filter::eq("deck", Value::Integer(1)).and(Filter::like("lang", "en%"));
+        assert_eq!(nested.compile(&s).unwrap().0, "(deck = ? AND lang LIKE ?)");
+
+        // The raw SQL hatch is spliced verbatim (parenthesized), values bound.
+        let (sql, p) = Filter::sql(
+            "deck > ? OR lang = ?",
+            [Value::Integer(5), Value::Text("fr".into())],
+        )
+        .compile(&s)
+        .unwrap();
+        assert_eq!(sql, "(deck > ? OR lang = ?)");
+        assert_eq!(p.len(), 2);
+
+        // An undeclared field is rejected (the injection guard).
+        assert!(
+            Filter::eq("not_a_field", Value::Integer(1))
+                .compile(&s)
+                .is_err()
+        );
+
+        // A Timestamp field is an INTEGER column (epoch).
+        assert_eq!(FilterType::Timestamp.sql_type(), "INTEGER");
     }
 }

@@ -42,8 +42,14 @@ A ground-up rework. **Breaking across the board, and a hard cache reset:** the o
 
 ### Filtering ladder
 - **Tier 2 — filterable columns.** `Schema::filterable(name, FilterType)` materializes
-  indexed `doc` columns; a structured `Filter` (`Cmp`/`In`/`And`/`Or`) compiles to a
-  validated, parameterized `WHERE` applied during candidate generation.
+  indexed `doc` columns; a structured `Filter` compiles to a validated, parameterized
+  `WHERE` applied during candidate generation. Grammar: `Cmp` (`= <> < <= > >=`), `In`,
+  `Between`, `IsNull`, `Like` (with a documented leading-wildcard scan cost), and `And`/
+  `Or`. `FilterType::Timestamp` is sugar for an epoch-`INTEGER` datetime column (ISO-8601
+  users declare `Text`) — sortable encoding means the plain comparisons just work.
+- **Escape hatch — `Filter::sql(fragment, params)`:** a raw parameterized SQL predicate
+  fenced to the filterable `doc` columns (full SQLite expression language, but untyped, a
+  trusted fragment, and coupled to column names — advanced/may-break).
 - **Tier 3 — post-filter predicate** (`SearchOpts::scope`) is retained.
 
 ### New dependency

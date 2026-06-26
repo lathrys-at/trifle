@@ -514,6 +514,18 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(Reader { index: self })
     }
 
+    /// Acquire a [`SearchSession`] — like a [`Reader`] but holding a **warm** pooled
+    /// connection across calls, the right shape for an as-you-type burst (no per-search
+    /// checkout). Drop and re-acquire to see newer writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a read connection cannot be acquired.
+    pub fn session(&self) -> Result<SearchSession<'_, T, B>> {
+        let conn = self.backend.read()?;
+        Ok(SearchSession { index: self, conn })
+    }
+
     // ----- write internals (used by the `Writer` lease) -----------------------
 
     /// Find the internal doc id for `key`, creating a fresh `doc` row if absent and
@@ -943,6 +955,44 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
+        let (query_tokens, all_grams) = Self::query_grams(queries, |q| self.distinct_tokens(q));
+        // Per-search checkout + snapshot, then the shared search body.
+        self.search_read(&all_grams, |conn, ns, resolved, class_snap| {
+            self.run_search(conn, ns, resolved, class_snap, queries, &query_tokens, opts)
+        })
+    }
+
+    /// The distinct tokens per query and the batch-wide distinct gram set (resolution
+    /// input). Factored so the [`SearchSession`] reuses it.
+    fn query_grams(
+        queries: &[&str],
+        tokenize: impl Fn(&str) -> Vec<String>,
+    ) -> (Vec<Vec<String>>, Vec<String>) {
+        let query_tokens: Vec<Vec<String>> = queries.iter().map(|q| tokenize(q)).collect();
+        let all_grams: Vec<String> = query_tokens
+            .iter()
+            .flat_map(|q| q.iter().cloned())
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        (query_tokens, all_grams)
+    }
+
+    /// The per-snapshot search body: given the resolved gram→id map and class snapshot,
+    /// read dfs/postings, select, generate candidates, apply the filter, rank, hydrate.
+    /// Shared by the [`Reader`] (per-search checkout) and the warm [`SearchSession`]
+    /// (held connection).
+    #[allow(clippy::too_many_arguments)]
+    fn run_search(
+        &self,
+        conn: &Connection,
+        ns: &Namespace,
+        resolved: &HashMap<String, TermId>,
+        class_snap: &ClassSnap,
+        queries: &[&str],
+        query_tokens: &[Vec<String>],
+        opts: &SearchOpts<'_>,
+    ) -> Result<Vec<Vec<Match>>> {
         let min_shared = opts.min_shared.unwrap_or(DEFAULT_MIN_SHARED).max(1);
         let sel_params = SelectParams {
             min_shared,
@@ -960,115 +1010,91 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         };
         let ranker: &dyn Ranker = opts.ranker.unwrap_or(default_ranker);
 
-        // Distinct tokens per query (deduplicated), computed once outside the read.
-        let query_tokens: Vec<Vec<String>> =
-            queries.iter().map(|q| self.distinct_tokens(q)).collect();
-        // Every distinct gram across the batch — resolved once to term-ids inside the
-        // read (under the dictionary's generation guard).
-        let all_grams: Vec<&str> = query_tokens
-            .iter()
-            .flat_map(|q| q.iter().map(String::as_str))
-            .collect::<BTreeSet<&str>>()
+        // One batched frequency read over every resolved term-id in the batch.
+        let all_ids: Vec<TermId> = resolved
+            .values()
+            .copied()
+            .collect::<BTreeSet<TermId>>()
             .into_iter()
             .collect();
-
-        self.search_read(&all_grams, |conn, ns, resolved, class_snap| {
-            // One batched frequency read over every resolved term-id in the batch.
-            let all_ids: Vec<TermId> = resolved
-                .values()
+        let dfs = postings::read_dfs(conn, ns, &all_ids)?;
+        // A gram's df: 0 if it resolved to no id (absent token) or its id has no live df
+        // row — exactly the existing df-0 behavior.
+        let df_of = |t: &str| -> i64 {
+            resolved
+                .get(t)
+                .and_then(|id| dfs.get(id))
                 .copied()
-                .collect::<BTreeSet<TermId>>()
-                .into_iter()
-                .collect();
-            let dfs = postings::read_dfs(conn, ns, &all_ids)?;
-            // A gram's df: 0 if it resolved to no id (absent token) or its id has no
-            // live df row — exactly the existing df-0 behavior.
-            let df_of = |t: &str| -> i64 {
-                resolved
-                    .get(t)
-                    .and_then(|id| dfs.get(id))
-                    .copied()
-                    .unwrap_or(0)
-            };
+                .unwrap_or(0)
+        };
 
-            // Per-query selection, then one batched posting read over every selected
-            // token in the batch.
-            let selected_per: Vec<Vec<String>> = query_tokens
-                .iter()
-                .map(|q| {
-                    let triples: Vec<(String, i64, u8)> = q
-                        .iter()
-                        .map(|t| {
-                            let class = term::encode_term(t).map(|tm| tm.class()).unwrap_or(0);
-                            (t.clone(), df_of(t), class)
-                        })
-                        .collect();
-                    select(&triples, sel_params, class_snap)
-                })
-                .collect();
-            let sel_ids: Vec<TermId> = selected_per
-                .iter()
-                .flat_map(|s| s.iter())
-                .filter_map(|t| resolved.get(t.as_str()).copied())
-                .collect::<BTreeSet<TermId>>()
-                .into_iter()
-                .collect();
-            let postings_map = postings::effective_postings(conn, ns, &sel_ids)?;
-
-            // Total live segments — the `N` a length/idf reranker normalizes by. One
-            // count for the whole batch (cheap; the default overlap ranker ignores it).
-            let n_segments: u64 =
-                conn.query_row(&format!("SELECT count(*) FROM {}", ns.seg()), [], |r| {
-                    r.get::<_, i64>(0)
-                })? as u64;
-            // A reranking ranker needs more than `limit` candidates to reorder (the
-            // target of a "ranking gap" miss sits past `limit` by raw overlap); fetch a
-            // pool, rank it, then truncate to `limit`. Default pool == limit (no
-            // over-fetch), so the overlap ranker pays nothing.
-            let pool = opts.effort.pool(opts.limit, n_segments);
-
-            // Tier-2 filter: the doc ids matching the structured filter, intersected
-            // during candidate generation (same for every query in the batch).
-            let filter_docs = match opts.filter {
-                Some(f) => Some(self.filter_docs(conn, ns, f)?),
-                None => None,
-            };
-
-            let mut out = Vec::with_capacity(queries.len());
-            for (qi, query) in queries.iter().enumerate() {
-                let selected = &selected_per[qi];
-                // Map each selected token back to its posting via its resolved id.
-                let present: Vec<(&str, &RoaringBitmap)> = selected
+        let selected_per: Vec<Vec<String>> = query_tokens
+            .iter()
+            .map(|q| {
+                let triples: Vec<(String, i64, u8)> = q
                     .iter()
-                    .filter_map(|t| {
-                        resolved
-                            .get(t.as_str())
-                            .and_then(|id| postings_map.get(id))
-                            .map(|bm| (t.as_str(), bm))
+                    .map(|t| {
+                        let class = term::encode_term(t).map(|tm| tm.class()).unwrap_or(0);
+                        (t.clone(), df_of(t), class)
                     })
                     .collect();
+                select(&triples, sel_params, class_snap)
+            })
+            .collect();
+        let sel_ids: Vec<TermId> = selected_per
+            .iter()
+            .flat_map(|s| s.iter())
+            .filter_map(|t| resolved.get(t.as_str()).copied())
+            .collect::<BTreeSet<TermId>>()
+            .into_iter()
+            .collect();
+        let postings_map = postings::effective_postings(conn, ns, &sel_ids)?;
 
-                let mut survivors = overlap_search(
-                    conn,
-                    ns,
-                    &present,
-                    pool,
-                    min_shared,
-                    self.schema.key_shape(),
-                    filter_docs.as_ref(),
-                    opts.scope,
-                )?;
-                if opts.hydration != Hydration::Coordinates {
-                    self.hydrate_text(conn, ns, &mut survivors)?;
-                }
+        let n_segments: u64 =
+            conn.query_row(&format!("SELECT count(*) FROM {}", ns.seg()), [], |r| {
+                r.get::<_, i64>(0)
+            })? as u64;
+        let pool = opts.effort.pool(opts.limit, n_segments);
 
-                out.push(self.rank_to_matches(
-                    &survivors, &present, selected, query, min_shared, ranker, opts.limit,
-                    n_segments,
-                ));
+        // Tier-2 filter: the doc ids matching the structured filter (same per batch).
+        let filter_docs = match opts.filter {
+            Some(f) => Some(self.filter_docs(conn, ns, f)?),
+            None => None,
+        };
+
+        let mut out = Vec::with_capacity(queries.len());
+        for (qi, query) in queries.iter().enumerate() {
+            let selected = &selected_per[qi];
+            let present: Vec<(&str, &RoaringBitmap)> = selected
+                .iter()
+                .filter_map(|t| {
+                    resolved
+                        .get(t.as_str())
+                        .and_then(|id| postings_map.get(id))
+                        .map(|bm| (t.as_str(), bm))
+                })
+                .collect();
+
+            let mut survivors = overlap_search(
+                conn,
+                ns,
+                &present,
+                pool,
+                min_shared,
+                self.schema.key_shape(),
+                filter_docs.as_ref(),
+                opts.scope,
+            )?;
+            if opts.hydration != Hydration::Coordinates {
+                self.hydrate_text(conn, ns, &mut survivors)?;
             }
-            Ok(out)
-        })
+
+            out.push(self.rank_to_matches(
+                &survivors, &present, selected, query, min_shared, ranker, opts.limit,
+                n_segments,
+            ));
+        }
+        Ok(out)
     }
 
     /// Run the ranker over the survivors and build the result matches.
@@ -1205,27 +1231,40 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     /// generations agree. Transient busy/locked/schema-change faults are retried too.
     fn search_read<R>(
         &self,
-        all_grams: &[&str],
+        all_grams: &[String],
+        f: impl FnMut(&Connection, &Namespace, &HashMap<String, TermId>, &ClassSnap) -> Result<R>,
+    ) -> Result<R> {
+        let conn = self.backend.read()?;
+        self.search_read_on(&conn, all_grams, f)
+    }
+
+    /// The retry/snapshot/generation-guard loop on a **given** connection — used both by
+    /// [`search_read`](Self::search_read) (a fresh pooled checkout per call) and by the
+    /// warm [`SearchSession`] (a held connection reused across keystrokes). Retries open a
+    /// fresh snapshot on the same connection.
+    fn search_read_on<R>(
+        &self,
+        conn: &Connection,
+        all_grams: &[String],
         mut f: impl FnMut(&Connection, &Namespace, &HashMap<String, TermId>, &ClassSnap) -> Result<R>,
     ) -> Result<R> {
         let ns = self.backend.namespace();
+        let gram_refs: Vec<&str> = all_grams.iter().map(String::as_str).collect();
         let mut attempt = 0;
         loop {
-            let conn = self.backend.read()?;
             let tx = match conn.unchecked_transaction() {
                 Ok(tx) => tx,
                 Err(e) => return Err(Error::from(e)),
             };
             // Resolve the grams in memory + capture the generation and per-class stats
             // snapshot atomically, then read the snapshot's generation to compare.
-            let (resolved, gen_mem, class_snap) = self.dict.resolve_batch(all_grams);
+            let (resolved, gen_mem, class_snap) = self.dict.resolve_batch(&gram_refs);
             let gen_snap = match schema::dict_generation(&tx, ns) {
                 Ok(g) => g,
                 Err(e) => {
                     let retry =
                         attempt < RETRY_MAX && matches!(&e, Error::Sqlite(se) if is_retryable(se));
                     drop(tx);
-                    drop(conn);
                     if retry {
                         attempt += 1;
                         std::thread::sleep(Duration::from_millis(10 * attempt as u64));
@@ -1236,9 +1275,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             };
             if gen_snap != gen_mem {
                 // A rebuild/reset reassigned ids between the in-memory capture and this
-                // snapshot — retry on a fresh snapshot.
+                // snapshot — retry on a fresh snapshot on the same connection.
                 drop(tx);
-                drop(conn);
                 if attempt >= RETRY_MAX {
                     return Err(Error::corrupt(
                         "dictionary generation skew did not settle across retries",
@@ -1251,7 +1289,6 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             match f(&tx, ns, &resolved, &class_snap) {
                 Err(Error::Sqlite(e)) if attempt < RETRY_MAX && is_retryable(&e) => {
                     drop(tx);
-                    drop(conn);
                     attempt += 1;
                     std::thread::sleep(Duration::from_millis(10 * attempt as u64));
                 }
@@ -1456,6 +1493,54 @@ impl<T: Tokenizer, B: Backend> Reader<'_, T, B> {
     /// Returns an error if the store read fails.
     pub fn search_batch(&self, queries: &[&str], opts: SearchOpts<'_>) -> Result<Vec<Vec<Match>>> {
         self.index.search_batch(queries, &opts)
+    }
+}
+
+/// A warm search lease (§3): it holds a pooled read connection across searches, so an
+/// as-you-type burst reuses one connection instead of checking out per keystroke. Each
+/// search still runs under its own consistent snapshot on the held connection.
+///
+/// Warming layers (§3): **Layer 3** — debounce (~30–50 ms) + cancel the superseded
+/// in-flight search — is the largest felt win and is a **caller** concern (drop the
+/// session/future to cancel). **Layer 1** (a per-session posting/DF cache keyed on the
+/// index data-version) and **Layer 2** (an incremental count vector) are documented
+/// follow-ups; this type is their home — it already owns the warm connection they cache
+/// against.
+pub struct SearchSession<'a, T: Tokenizer = TrigramTokenizer, B: Backend = Sidecar> {
+    index: &'a Index<T, B>,
+    conn: B::ReadGuard<'a>,
+}
+
+impl<T: Tokenizer, B: Backend> SearchSession<'_, T, B> {
+    /// Search for `query`, returning up to `opts.limit` ranked matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store read fails.
+    pub fn search(&self, query: &str, opts: SearchOpts<'_>) -> Result<Vec<Match>> {
+        Ok(self
+            .search_batch(&[query], opts)?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
+    }
+
+    /// Search a batch of queries on the warm connection (`batch == serial`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store read fails.
+    pub fn search_batch(&self, queries: &[&str], opts: SearchOpts<'_>) -> Result<Vec<Vec<Match>>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (query_tokens, all_grams) =
+            Index::<T, B>::query_grams(queries, |q| self.index.distinct_tokens(q));
+        self.index
+            .search_read_on(&self.conn, &all_grams, |conn, ns, resolved, class_snap| {
+                self.index
+                    .run_search(conn, ns, resolved, class_snap, queries, &query_tokens, &opts)
+            })
     }
 }
 

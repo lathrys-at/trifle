@@ -140,6 +140,49 @@ fn count_eq(acc: &[RoaringBitmap], c: u32) -> RoaringBitmap {
     out
 }
 
+/// A compiled Tier-2 structured filter: a `WHERE` fragment with `?` placeholders and its
+/// bound params (from [`Filter::compile`](crate::Filter)). [`overlap_search`] applies it
+/// **scoped to each bucket's candidate doc ids** (`WHERE id IN rarray(...) AND (<fragment>)`),
+/// so the filter's cost is bounded by the hydrated pool, never an O(N) scan of the whole
+/// corpus (audit T5 / I12).
+pub(crate) struct CompiledFilter<'a> {
+    pub where_sql: &'a str,
+    pub params: &'a [Value],
+}
+
+/// The subset of `cand` (candidate doc ids) that pass `filter`, found with one
+/// `SELECT id FROM doc WHERE id IN rarray(?1) AND (<filter>)` — the scope restriction binds as
+/// `?1`, so the filter's own bare `?` placeholders number from `?2` (SQLite assigns a bare `?`
+/// one past the largest number already seen). O(candidates), not O(corpus).
+fn filter_pass(
+    conn: &Connection,
+    ns: &Namespace,
+    filter: &CompiledFilter<'_>,
+    cand: &[u32],
+) -> Result<RoaringBitmap> {
+    let mut out = RoaringBitmap::new();
+    if cand.is_empty() {
+        return Ok(out);
+    }
+    let arr: Rc<Vec<Value>> = Rc::new(cand.iter().map(|&i| Value::Integer(i as i64)).collect());
+    let sql = format!(
+        "SELECT id FROM {doc} WHERE id IN rarray(?1) AND ({where_sql})",
+        doc = ns.doc(),
+        where_sql = filter.where_sql,
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + filter.params.len());
+    binds.push(&arr);
+    for p in filter.params {
+        binds.push(p);
+    }
+    let mut rows = stmt.query(binds.as_slice())?;
+    while let Some(r) = rows.next()? {
+        out.insert(r.get::<_, i64>(0)? as u32);
+    }
+    Ok(out)
+}
+
 /// Generate and rank candidates by IDF-weighted overlap, hydrating only as deep as the
 /// top-`limit` needs.
 ///
@@ -164,7 +207,7 @@ pub(crate) fn overlap_search(
     min_shared: u32,
     weight_step: f64,
     key_shape: KeyShape,
-    filter_docs: Option<&RoaringBitmap>,
+    filter: Option<&CompiledFilter<'_>>,
     scope: Option<&crate::ScopeFn<'_>>,
 ) -> Result<Vec<Survivor>> {
     let bitmaps: Vec<&RoaringBitmap> = present.iter().map(|(_, b)| *b).collect();
@@ -197,11 +240,33 @@ pub(crate) fn overlap_search(
 
     // internal doc id -> its best (highest weighted score, lowest-seg-id) segment.
     let mut best: HashMap<u32, Survivor> = HashMap::new();
+    // Memoized Tier-2 verdict per candidate doc id. The filter is evaluated lazily, scoped to
+    // the candidate ids each bucket hydrates (one small `WHERE id IN rarray(...)` per bucket),
+    // so its total cost is bounded by the hydrated pool — not the corpus (audit T5 / I12).
+    let mut filter_memo: HashMap<u32, bool> = HashMap::new();
     for c in (floor..=max_score).rev() {
         let bucket = count_eq(&acc, c);
         if !bucket.is_empty() {
             let ids: Vec<u32> = bucket.iter().collect();
             let provenance = hydrate_provenance(conn, ns, &ids, key_shape)?;
+            // Resolve the Tier-2 filter for this bucket's not-yet-classified candidate docs in
+            // one scoped query, caching the verdict so a doc with multiple segments (or a doc
+            // seen in a later bucket) is never re-queried.
+            if let Some(cf) = filter {
+                let unseen: Vec<u32> = provenance
+                    .values()
+                    .map(|(doc, _, _)| *doc)
+                    .filter(|d| !filter_memo.contains_key(d))
+                    .collect::<std::collections::BTreeSet<u32>>()
+                    .into_iter()
+                    .collect();
+                if !unseen.is_empty() {
+                    let passing = filter_pass(conn, ns, cf, &unseen)?;
+                    for d in unseen {
+                        filter_memo.insert(d, passing.contains(d));
+                    }
+                }
+            }
             // `ids` is ascending (bitmap order), so the first segment recorded for a
             // doc is its lowest id at this — its highest — score.
             for id in ids {
@@ -214,11 +279,10 @@ pub(crate) fn overlap_search(
                 if overlap < floor {
                     continue;
                 }
-                // Tier-2 filter: keep only docs passing the structured filter.
-                if let Some(fd) = filter_docs {
-                    if !fd.contains(*doc) {
-                        continue;
-                    }
+                // Tier-2 filter: keep only docs passing the structured filter (verdict memoized
+                // above; a filtered search records a verdict for every candidate doc).
+                if filter.is_some() && !filter_memo.get(doc).copied().unwrap_or(false) {
+                    continue;
                 }
                 if let Some(scope) = scope {
                     if !scope(key, label) {

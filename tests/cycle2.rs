@@ -199,6 +199,52 @@ fn removing_one_of_several_segments_keeps_the_doc_row() {
     ));
 }
 
+// T5 (I12): the Tier-2 filter is now applied scoped to candidate ids, not by materializing
+// every matching doc id in the corpus. The correctness contract is unchanged: a non-selective
+// filter (one the whole result set satisfies) must not alter the results or their order, and a
+// selective filter still narrows.
+#[test]
+fn scoped_filter_matches_the_unfiltered_result_set() {
+    let h = Harness::with_schema(schema_with_deck(), Config::default());
+    {
+        let mut w = h.index.writer().unwrap();
+        for d in 1..=12 {
+            w.insert_document(
+                Document::new(d, vec![("body".into(), "alpha bravo charlie".into())])
+                    .with_payload(vec![("deck".into(), Value::Integer(7))]),
+            )
+            .unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    // Every doc has deck=7, so a deck=7 filter spans the whole corpus: the scoped filter must
+    // return exactly the unfiltered result set, in the same order.
+    let unfiltered = ids(&h.search("alpha bravo", SearchOpts::new(20)).unwrap());
+    let broad = ids(&h
+        .search(
+            "alpha bravo",
+            SearchOpts::new(20).filter(&Filter::eq("deck", 7i64)),
+        )
+        .unwrap());
+    assert_eq!(broad.len(), 12, "all twelve docs match the broad filter");
+    assert_eq!(
+        unfiltered, broad,
+        "a non-selective filter must not change the result set or order"
+    );
+
+    // A selective filter still narrows; a filter matching nothing returns nothing.
+    assert!(
+        h.search(
+            "alpha bravo",
+            SearchOpts::new(20).filter(&Filter::eq("deck", 99i64))
+        )
+        .unwrap()
+        .is_empty(),
+        "a filter matching no doc returns nothing"
+    );
+}
+
 // ----- IDF-weighted overlap ranking -----
 
 #[test]

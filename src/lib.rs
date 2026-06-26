@@ -107,7 +107,9 @@ pub use rusqlite;
 use dict::{Dictionary, TermId};
 pub use error::{Error, Result};
 pub use model::{CmpOp, Document, Filter, FilterType, Key, KeyShape, Match, Schema, SchemaBuilder};
-use rank::{Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
+use rank::{
+    Candidates, CompiledFilter, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search,
+};
 use schema::SCHEMA_VERSION;
 use select::{SelectParams, select};
 use store::{Backend, Namespace, Sidecar};
@@ -894,26 +896,6 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Ok(())
     }
 
-    /// The internal doc ids matching a structured [`Filter`] over the schema's filterable
-    /// columns (Tier 2). Field names are validated against the schema (the injection
-    /// guard); a value-less / unsatisfiable filter yields an empty set.
-    fn filter_docs(
-        &self,
-        conn: &Connection,
-        ns: &Namespace,
-        filter: &Filter,
-    ) -> Result<RoaringBitmap> {
-        let (where_sql, params) = filter.compile(&self.schema)?;
-        let sql = format!("SELECT id FROM {} WHERE {}", ns.doc(), where_sql);
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-        let mut bm = RoaringBitmap::new();
-        while let Some(r) = rows.next()? {
-            bm.insert(r.get::<_, i64>(0)? as u32);
-        }
-        Ok(bm)
-    }
-
     /// The distinct token strings of `text`, deduplicated via the token type (no
     /// allocation per duplicate window — only the distinct set is stringified).
     fn distinct_tokens(&self, text: &str) -> Vec<String> {
@@ -1296,11 +1278,18 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         };
         let pool = opts.effort.pool(opts.limit, n_segments);
 
-        // Tier-2 filter: the doc ids matching the structured filter (same per batch).
-        let filter_docs = match opts.filter {
-            Some(f) => Some(self.filter_docs(conn, ns, f)?),
+        // Tier-2 filter, compiled once for the whole batch. It is applied **scoped to each
+        // query's candidate ids** inside `overlap_search` (a small `WHERE id IN rarray(...)` per
+        // bucket), so its cost is bounded by the pool, never an O(N) scan of the corpus (audit
+        // T5 / I12). Compiling here rather than per query keeps batch == serial — every query in
+        // the batch sees the identical predicate.
+        let compiled_filter = match opts.filter {
+            Some(f) => Some(f.compile(&self.schema)?),
             None => None,
         };
+        let filter = compiled_filter
+            .as_ref()
+            .map(|(where_sql, params)| CompiledFilter { where_sql, params });
 
         let mut out = Vec::with_capacity(queries.len());
         for (qi, query) in queries.iter().enumerate() {
@@ -1325,7 +1314,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 min_shared,
                 opts.weight_step,
                 self.schema.key_shape(),
-                filter_docs.as_ref(),
+                filter.as_ref(),
                 opts.scope,
             )?;
             // Every indexed field is stored, so a match always carries its text and any

@@ -14,7 +14,7 @@
 
 use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use roaring::RoaringBitmap;
 use rusqlite::Connection;
@@ -30,9 +30,25 @@ use crate::store::{Backend, Namespace};
 use crate::tokenize::Tokenizer;
 use crate::welford::ClassSnap;
 use crate::{
-    DEFAULT_MIN_SHARED, DEFAULT_T_MAX, Error, Index, IntoTerm, Match, RETRY_MAX, Result,
-    SearchOpts, TYPO_DAMAGE, Term, is_retryable, postings, schema,
+    DEFAULT_MIN_SHARED, DEFAULT_T_MAX, Error, Index, IntoTerm, Match, Result, SearchOpts,
+    TYPO_DAMAGE, Term, is_retryable, postings, schema,
 };
+
+/// The reader's retry budget for a transient store fault or a dictionary-generation skew
+/// window. The skew window equals the writer's in-memory dictionary reload, whose duration
+/// *grows with the vocabulary*, so the budget is time-bounded rather than a fixed attempt
+/// count — a slow reload still settles instead of spuriously erroring `Busy` at a large vocab
+/// (audit T6). Backoff grows exponentially from [`RETRY_BACKOFF_START`] and is capped at
+/// [`RETRY_BACKOFF_CAP`]; a non-retryable error still returns immediately.
+const RETRY_BUDGET: Duration = Duration::from_secs(2);
+const RETRY_BACKOFF_START: Duration = Duration::from_millis(1);
+const RETRY_BACKOFF_CAP: Duration = Duration::from_millis(50);
+
+/// Sleep the current backoff, then grow it (exponential, capped at [`RETRY_BACKOFF_CAP`]).
+fn backoff_sleep(backoff: &mut Duration) {
+    std::thread::sleep(*backoff);
+    *backoff = (*backoff * 2).min(RETRY_BACKOFF_CAP);
+}
 
 /// The distinct tokens per query and the batch-wide distinct **term** set (the resolution
 /// input). Factored so the [`Reader`](crate::Reader) and the warm
@@ -300,11 +316,13 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
 /// seg rows from the new one. The transaction is read-only and never committed; dropping it
 /// just releases the snapshot.
 ///
-/// Because the term dictionary is in memory (out of the SQL snapshot), the grams are resolved
+/// Because the term dictionary is in memory (out of the SQL snapshot), the terms are resolved
 /// and the dictionary generation captured atomically, then compared to the snapshot's stored
 /// `dict_generation`. A mismatch means a rebuild/reset reassigned ids relative to this
 /// snapshot — the read retries on a fresh snapshot, where the generations agree. Transient
-/// busy/locked/schema-change faults are retried too.
+/// busy/locked/schema-change faults are retried too. Retries are bounded by an elapsed-time
+/// budget ([`RETRY_BUDGET`]) with exponential backoff, not a fixed count, so a dictionary
+/// reload whose duration scales with the vocabulary still settles (audit T6).
 pub(crate) fn search_read_on<T: Tokenizer, B: Backend, R>(
     index: &Index<T, B>,
     conn: &Connection,
@@ -312,7 +330,8 @@ pub(crate) fn search_read_on<T: Tokenizer, B: Backend, R>(
     mut f: impl FnMut(&Connection, &Namespace, &HashMap<u128, TermId>, &ClassSnap) -> Result<R>,
 ) -> Result<R> {
     let ns = index.backend.namespace();
-    let mut attempt = 0;
+    let deadline = Instant::now() + RETRY_BUDGET;
+    let mut backoff = RETRY_BACKOFF_START;
     loop {
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
@@ -324,12 +343,11 @@ pub(crate) fn search_read_on<T: Tokenizer, B: Backend, R>(
         let gen_snap = match schema::dict_generation(&tx, ns) {
             Ok(g) => g,
             Err(e) => {
-                let retry =
-                    attempt < RETRY_MAX && matches!(&e, Error::Sqlite(se) if is_retryable(se));
+                let retry = Instant::now() < deadline
+                    && matches!(&e, Error::Sqlite(se) if is_retryable(se));
                 drop(tx);
                 if retry {
-                    attempt += 1;
-                    std::thread::sleep(Duration::from_millis(10 * attempt as u64));
+                    backoff_sleep(&mut backoff);
                     continue;
                 }
                 return Err(e);
@@ -339,24 +357,22 @@ pub(crate) fn search_read_on<T: Tokenizer, B: Backend, R>(
             // A rebuild/reset reassigned ids between the in-memory capture and this
             // snapshot — retry on a fresh snapshot on the same connection.
             drop(tx);
-            if attempt >= RETRY_MAX {
+            if Instant::now() >= deadline {
                 // The store is consistent; only the in-memory dictionary raced a
                 // concurrent rebuild's id-reassignment. This is transient — a fresh
                 // reader resolves against the settled generation — so surface it as
                 // retryable, NOT Corrupt (which would wrongly imply an unrepairable store).
                 return Err(Error::busy(
-                    "dictionary generation skew did not settle across retries; retry on a fresh reader",
+                    "dictionary generation skew did not settle within the retry budget; retry on a fresh reader",
                 ));
             }
-            attempt += 1;
-            std::thread::sleep(Duration::from_millis(10 * attempt as u64));
+            backoff_sleep(&mut backoff);
             continue;
         }
         match f(&tx, ns, &resolved, &class_snap) {
-            Err(Error::Sqlite(e)) if attempt < RETRY_MAX && is_retryable(&e) => {
+            Err(Error::Sqlite(e)) if Instant::now() < deadline && is_retryable(&e) => {
                 drop(tx);
-                attempt += 1;
-                std::thread::sleep(Duration::from_millis(10 * attempt as u64));
+                backoff_sleep(&mut backoff);
             }
             other => return other,
         }

@@ -125,8 +125,6 @@ const DEFAULT_WEIGHT_STEP: f64 = 1.0;
 const HINT_BUCKETS: usize = 13;
 /// Width of each band-spread histogram bucket, in df-doublings (`log2` units).
 const HINT_BUCKET_WIDTH: f64 = 0.5;
-/// How many times a read retries a transient `SQLITE_BUSY`/`LOCKED`/`SCHEMA`.
-const RETRY_MAX: usize = 5;
 
 /// Index configuration.
 ///

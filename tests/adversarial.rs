@@ -5,7 +5,7 @@ mod common;
 use common::*;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use trifle::store::Sidecar;
@@ -194,4 +194,78 @@ fn reads_continue_across_a_rebuild_swap() {
     for r in readers {
         assert!(r.join().unwrap() > 0);
     }
+}
+
+// T6: a reader tolerating dictionary-generation skew during a concurrent rebuild must not
+// spuriously error `Busy`. The skew window equals the writer's in-memory dict reload, whose
+// duration grows with the vocabulary; the reader's retry is now time-bounded (not a fixed
+// attempt count), so a slow reload still settles. This probe runs readers against repeated
+// rebuilds over a larger vocabulary and asserts no spurious busy.
+//
+// #[ignore]: rebuild churn is slow; run on demand. It can't cheaply reach the
+// millions-of-grams scale where the *old* fixed budget broke, so it guards against future
+// regressions in the retry logic rather than reproducing the original failure.
+#[test]
+#[ignore = "slow: rebuild churn over a larger vocabulary"]
+fn concurrent_search_under_rebuild_churn_does_not_spuriously_busy() {
+    let (idx, _dir) = shared_index();
+    // A larger vocabulary: a per-doc unique gram across 2k docs, plus a token present in every
+    // generation so a correct read always finds it (complete-old or complete-new, never partial).
+    let corpus = || -> Vec<Document> {
+        (0..2000)
+            .map(|d| {
+                Document::new(
+                    d,
+                    vec![(
+                        "body".to_string(),
+                        format!("persistent token document number {d} uniquegram{d} filler text"),
+                    )],
+                )
+            })
+            .collect()
+    };
+    idx.rebuild(corpus()).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = Arc::new(AtomicU64::new(0));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let idx = Arc::clone(&idx);
+            let stop = Arc::clone(&stop);
+            let busy = Arc::clone(&busy);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match idx
+                        .reader()
+                        .unwrap()
+                        .search("persistent token", SearchOpts::new(10))
+                    {
+                        Ok(hits) => assert!(
+                            !hits.is_empty(),
+                            "the always-present token vanished mid-swap"
+                        ),
+                        // A skew that doesn't settle within the budget is retryable, not fatal.
+                        Err(trifle::Error::Busy(_)) => {
+                            busy.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            panic!("unexpected non-retryable error under rebuild churn: {e:?}")
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for _ in 0..30 {
+        idx.rebuild(corpus()).unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        r.join().unwrap();
+    }
+    let busy = busy.load(Ordering::Relaxed);
+    assert_eq!(
+        busy, 0,
+        "the time-bounded retry must not spuriously Busy at this vocabulary (saw {busy})"
+    );
 }

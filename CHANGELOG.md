@@ -3,7 +3,7 @@
 ## 0.2.0 — `rev-v0.2` (unreleased)
 
 A ground-up rework. **Breaking across the board, and a hard cache reset:** the on-disk
-`SCHEMA_VERSION` bumps to 2, so an existing index drops its cache on open and must be
+`SCHEMA_VERSION` bumps to 3, so an existing index drops its cache on open and must be
 `rebuild()`-ed. trifle is a derived, rebuildable cache, so this is data-loss-free for the
 *cache* (the caller's source of truth is untouched).
 
@@ -91,5 +91,3 @@ A ground-up rework. **Breaking across the board, and a hard cache reset:** the o
 - **Layer-1/2 search-warming caches** (§3) — `SearchSession` holds the warm connection;
   the posting/DF cache and incremental count vector are seams.
 - **Mixed-script recall eval** validating the Welford z-score vs raw DF.
-- **Integration-test migration** to the v0.2 API (the library, its unit tests, and the
-  doctests are green; the `tests/*.rs` binaries still target the v0.1 API).

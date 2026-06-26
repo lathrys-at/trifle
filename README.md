@@ -47,7 +47,8 @@ fn main() -> trifle::Result<()> {
     w.insert(2, &[("title", "the quack brown ox")])?;
     w.commit()?;
 
-    // Reads go through a reader lease (a pinned snapshot). A misspelled query still matches.
+    // Reads go through a reader lease; each search runs under a consistent snapshot
+    // (a single search_batch shares one). A misspelled query still matches.
     let hits = index.reader()?.search("quikc brown", SearchOpts::new(10))?;
     assert_eq!(hits[0].key.as_i64(), Some(1));
     Ok(())
@@ -64,13 +65,13 @@ has a **key** and one or more named **segments**:
   keys. A `Match` carries the `key`, the matched segment's `label`, its `text`, and (when
   locatable) a byte `span`.
 - **segment** — a `(label, text)` pair under a key. `label` is a free-form name returned on
-  a match so you know which segment matched; a document holds each label at most once. Each
-  text field has a `StorageMode`: `Stored` (snapshot kept), `Resolver` (text fetched from
-  your `TextResolver` at query time — contentless), or `CoordinatesOnly` (only the match
-  location is returned).
+  a match so you know which segment matched; a document holds each label at most once. Every
+  indexed text field is **stored** and returned on a match (and surfaced to the reranker).
+  The segment is the ranking unit (BM25+ over its terms); fuse across a key's segments with
+  a custom `Ranker`.
 - `Schema::flat()` is the simplest shape: an integer key and one default text field that
-  accepts any label, stored. `Schema::chunked()` / the builder declare named fields, their
-  storage modes, and **filterable** columns.
+  accepts any label. `Schema::chunked()` / the builder declare named text fields and
+  **filterable** columns (stored, indexed, used only for filtering — never reranked).
 
 This covers two common patterns:
 
@@ -92,15 +93,13 @@ This covers two common patterns:
   fixed-width tokenizer for single-script corpora.
 - **Configurable normalization** — NFC (default), NFD, accent-insensitive
   (`NfdStripMarks`), or none. Unicode casefolding is on by default.
-- **Reranking** — bit-sliced posting list overlap generates candidates; the default
-  `Effort::Medium` reranks a pool of ~`c·√(k·N)` with a BM25-shaped tier (idf, length
-  normalization, literal verification). Tune via `SearchOpts::rerank(Effort)` (`None`
-  through `Max`), or supply a custom `Ranker`.
+- **Reranking** — bit-sliced posting-list overlap generates candidates; the default
+  `Effort::Medium` reranks a pool of ~`c·√(k·N)` with **BM25+** over the matched terms (idf,
+  length normalization against the online mean segment length, the `δ` lower bound). Tune
+  via `SearchOpts::rerank(Effort)` (`None` through `Max`), or supply a custom `Ranker`.
 - **Filtering** — declare `filterable` columns and pass a structured `Filter` (comparisons,
-  `In`/`Between`/`IsNull`/`Like`, `And`/`Or`) to cut the rerank/hydration set; plus a
-  `scope` predicate evaluated over candidates only.
-- **Hydration ladder** — `SearchOpts::hydrate` chooses how much each match carries
-  (coordinates only, segment text, or document payload), so you pay only for what you read.
+  `In`/`Between`/`IsNull`/`Like`, `And`/`Or`) to cut the rerank set; plus a `scope`
+  predicate evaluated over candidates only.
 
 ## Usage
 
@@ -163,7 +162,7 @@ when choosing one:
 
 | | embedded (no server)? | updates | scales to 1M+ small docs? | provenance | matching semantics | storage |
 |---|---|---|---|---|---|---|
-| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | key / label | trigram overlap + BM25-shaped rerank | disk (SQLite) |
+| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | key / label | trigram overlap + BM25+ rerank | disk (SQLite) |
 | **[SQLite FTS5](https://www.sqlite.org/fts5.html#the_trigram_tokenizer)** | yes | incremental | yes | rowid | trigram substring (`MATCH` / `LIKE`) | disk (SQLite) |
 | **[pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html)** | no (server) | incremental (GIN / GiST) | yes | table rows | trigram similarity | disk (server) |
 | **[Tantivy](https://github.com/quickwit-oss/tantivy)** | yes | incremental (segments) | yes | stored fields | Levenshtein automaton (≤ 2 edits) | disk (segments) |

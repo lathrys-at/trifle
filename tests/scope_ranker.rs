@@ -102,7 +102,7 @@ impl Ranker for LiteralOnly {
     fn rank(&self, candidates: &Candidates<'_>, q: &QueryContext<'_>) -> Vec<Ranked> {
         candidates
             .iter()
-            .filter(|c| c.text().is_some_and(|t| t.contains(q.query)))
+            .filter(|c| c.text().contains(q.query))
             .map(|c| Ranked {
                 candidate: c.index(),
             })
@@ -140,10 +140,8 @@ impl Ranker for InvariantChecker {
             assert!(c.overlap() >= 1);
             // Each matched token is genuinely a token of THIS segment's text (recounted
             // independently of the postings) and is one of the query's selected tokens.
-            let seg_tokens: HashSet<String> = tok
-                .tokenize(c.text().unwrap())
-                .map(|g| g.to_string())
-                .collect();
+            let seg_tokens: HashSet<String> =
+                tok.tokenize(c.text()).map(|g| g.to_string()).collect();
             for mt in &matched {
                 assert!(
                     seg_tokens.contains(*mt),

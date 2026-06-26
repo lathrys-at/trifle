@@ -68,8 +68,7 @@ fn _assert_send_sync<T: Send + Sync>() {}
 #[test]
 fn index_monomorphizations_are_send_and_sync() {
     // Shared `&self` across threads is a documented contract; pin it at compile time
-    // for both backends (the contentless `Box<dyn TextResolver>` field lives in the
-    // same `Index<_, Sidecar>` type, so this covers it too).
+    // for both backends.
     _assert_send_sync::<Index<DefaultTokenizer, Sidecar>>();
     _assert_send_sync::<Index<DefaultTokenizer, Shared>>();
 }
@@ -80,11 +79,14 @@ fn a_span_always_implies_text() {
     load_fixture(&h);
     for q in ["quick brown fox", "lazy dog", "wizards jump"] {
         for m in h.search(q, SearchOpts::new(10)).unwrap() {
-            if m.span.is_some() {
-                assert!(m.text.is_some(), "a span requires text to index into");
-            }
+            // Every indexed field is stored, so text is always present (D1).
+            assert!(
+                !m.text.is_empty(),
+                "a match always carries its segment text"
+            );
             // And a returned span is always sliceable without panic.
-            if let (Some((lo, hi)), Some(text)) = (m.span, m.text.as_deref()) {
+            if let Some((lo, hi)) = m.span {
+                let text = m.text.as_str();
                 assert!(text.is_char_boundary(lo) && text.is_char_boundary(hi));
                 let _ = &text[lo..hi];
             }

@@ -23,7 +23,7 @@ fn match_carries_provenance_and_text() {
         .expect("found");
     // The segment label (the v0.1 `ref`) is returned; `source` no longer exists.
     assert_eq!(m.label, "page-3.png");
-    assert_eq!(m.text.as_deref(), Some("the treaty was signed in vienna"));
+    assert_eq!(m.text, "the treaty was signed in vienna");
 }
 
 #[test]
@@ -33,7 +33,7 @@ fn span_indexes_the_matched_region_of_the_text() {
     let hits = h.search("charlie", SearchOpts::new(5)).unwrap();
     let m = &hits[0];
     let (lo, hi) = m.span.expect("a span for a clean ascii match");
-    let text = m.text.as_deref().unwrap();
+    let text = m.text.as_str();
     // The span must be valid byte offsets bracketing the matched word.
     assert!(lo < hi && hi <= text.len());
     let region = &text[lo..hi];

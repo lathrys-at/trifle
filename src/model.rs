@@ -662,7 +662,11 @@ mod tests {
 
     #[test]
     fn chunked_schema_only_accepts_declared_fields() {
-        let s = Schema::chunked().text("front").text("back").build().unwrap();
+        let s = Schema::chunked()
+            .text("front")
+            .text("back")
+            .build()
+            .unwrap();
         assert!(s.accepts_label("front"));
         assert!(s.accepts_label("back"));
         assert!(!s.accepts_label("undeclared"));

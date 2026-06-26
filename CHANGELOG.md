@@ -31,24 +31,39 @@ A ground-up rework. **Breaking across the board, and a hard cache reset:** the o
 
 ### Data model & API (breaking)
 - **Runtime `Schema`** replaces the fixed `(doc_id, source, ref, text)` model: a declared
-  **key** (shape `Integer`/`Text`/`Blob`) plus named **text fields**, each with a
-  per-field `StorageMode` (`Stored` / `Resolver` / `CoordinatesOnly`). Documents are
+  **key** (shape `Integer`/`Text`/`Blob`) plus named **text fields**. Documents are
   `key → named segments` over a two-level `doc`+`seg` store.
+- **All indexed text is stored and surfaced.** Per-field storage modes, the `TextResolver`
+  / contentless mode, and the search-time `Hydration` ladder were **removed**: every
+  indexed text field is stored, always returned on a match, and always surfaced to the
+  reranker (so the reranker can never run textless). Filterable **payload** columns are
+  stored separately for filtering only — never reranked or returned. `Match.text` is a
+  `String` (no longer `Option`).
 - **`Segment`/`Match{doc_id,source,ref_}` → `Document` / `Match{key,label,span,text}`**;
-  `Key` is `Integer`/`Text`/`Blob`. `TextResolver` and the scope predicate move to
-  `(&Key, &str label)`.
+  `Key` is `Integer`/`Text`/`Blob`. The scope predicate is `(&Key, &str label) -> bool`.
 - **Lease-based access.** `Index` shrinks to lifecycle (`open`/`rebuild`/`compact`/
   `stats`/`reader`/`writer`/`session`). Writes go through a `Writer` lease (the exclusive
-  single-writer lock; six methods `insert`/`upsert`/`remove` × whole/segment;
-  `commit()` is commit-and-continue; drop rolls back). The labels in one
-  `insert`/`upsert` call must be distinct (a document holds each label once; debug-asserted).
-  Reads go through a `Reader`;
-  `SearchSession` holds a warm connection for as-you-type. `SearchOpts` gains a
-  `Hydration` cost ladder.
+  single-writer lock; `insert`/`upsert`/`remove` × whole/segment, plus
+  `insert_document`/`upsert_document` for a whole `Document` with payload; `commit()` is
+  commit-and-continue; drop rolls back). **Each write method is atomic** — its body runs in
+  a `SAVEPOINT`, so a mid-call error (and a caught-error-then-`commit()`) leaves the store
+  exactly as before the call. The labels in one call must be distinct (debug-asserted).
+  Reads go through a `Reader`; **each search runs under a consistent snapshot, and a single
+  `search_batch` shares one** (a fresh reader observes newer writes). `SearchSession` holds
+  a warm connection for as-you-type.
 - **`Index::open` now takes a `Schema`**: `Index::open_at(path, schema, config)` /
   `Index::open(backend, tokenizer, schema, config)`.
 - **Drift** now also covers a **schema fingerprint** (alongside schema version, tokenizer
   fingerprint, and `data_version`).
+
+### Ranking — real BM25+
+- The default precision-tier reranker is now **BM25+ over the index's terms** (the
+  n-grams), with the segment as the unit: `idf` from `df` over `N` segments, length
+  normalization against the **online mean segment length** (`avgdl`, maintained from
+  rolling `seg_count`/`seg_len_sum` meta counters in the write transaction), and the BM25+
+  `δ` lower bound. The previous word-tokenized, ad-hoc substring/literal-verification tier
+  is **gone** (frontends annotate exact substrings). An application needing true
+  term-frequency or cross-segment fusion supplies its own `Ranker`.
 
 ### Filtering ladder
 - **Tier 2 — filterable columns.** `Schema::filterable(name, FilterType)` materializes

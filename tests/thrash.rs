@@ -158,7 +158,7 @@ fn faithful(oracle: &Oracle, m: &trifle::Match) -> bool {
         .and_then(|d| oracle.get(&d))
         .and_then(|labels| labels.get(&m.label))
         .map(|t| t.as_str())
-        == m.text.as_deref()
+        == Some(m.text.as_str())
 }
 
 /// Check every invariant against the oracle.
@@ -187,7 +187,8 @@ fn check(idx: &Idx, oracle: &Oracle) {
                 faithful(oracle, m),
                 "result {m:?} is not a live oracle segment"
             );
-            if let (Some((lo, hi)), Some(text)) = (m.span, m.text.as_deref()) {
+            if let Some((lo, hi)) = m.span {
+                let text = m.text.as_str();
                 assert!(
                     text.is_char_boundary(lo) && text.is_char_boundary(hi) && lo < hi,
                     "span {:?} invalid for {text:?}",

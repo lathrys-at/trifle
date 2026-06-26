@@ -99,9 +99,7 @@ pub use rusqlite;
 
 use dict::{Dictionary, TermId};
 pub use error::{Error, Result};
-pub use model::{
-    CmpOp, Document, Filter, FilterType, Key, KeyShape, Match, Schema, SchemaBuilder,
-};
+pub use model::{CmpOp, Document, Filter, FilterType, Key, KeyShape, Match, Schema, SchemaBuilder};
 use rank::{Bm25Ranker, Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
 use schema::SCHEMA_VERSION;
 use select::{SelectParams, select};
@@ -134,9 +132,7 @@ pub struct Config {
 impl Config {
     /// A configuration with the given drift token and otherwise default settings.
     pub fn new(data_version: u64) -> Self {
-        Config {
-            data_version,
-        }
+        Config { data_version }
     }
 }
 
@@ -1187,7 +1183,10 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let ids: Vec<u32> = survivors.iter().map(|s| s.seg_id).collect();
         let arr: std::rc::Rc<Vec<Value>> =
             std::rc::Rc::new(ids.iter().map(|&i| Value::Integer(i as i64)).collect());
-        let sql = format!("SELECT id, txt, len FROM {} WHERE id IN rarray(?1)", ns.seg());
+        let sql = format!(
+            "SELECT id, txt, len FROM {} WHERE id IN rarray(?1)",
+            ns.seg()
+        );
         let mut texts: HashMap<u32, (String, u32)> = HashMap::with_capacity(ids.len());
         {
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -1438,6 +1437,44 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
     pub fn upsert_segment(&mut self, key: impl Into<Key>, label: &str, text: &str) -> Result<()> {
         let key = key.into();
         self.atomic(|w| w.write_doc(key, &[(label, text)], true))
+    }
+
+    /// Insert a whole [`Document`] — its segments **and** its filterable payload — in one
+    /// atomic call (errors on a `(key, label)` collision). This is the incremental twin of
+    /// the [`Document`] form [`rebuild`](Index::rebuild) consumes, so a document with
+    /// filterable columns has a single home on the write path (audit I8).
+    pub fn insert_document(&mut self, doc: Document) -> Result<()> {
+        self.write_document(doc, false)
+    }
+
+    /// Insert-or-replace a whole [`Document`] (segments + filterable payload) in one atomic
+    /// call; never errors on collision, and keeps the key's other (unnamed) segments.
+    pub fn upsert_document(&mut self, doc: Document) -> Result<()> {
+        self.write_document(doc, true)
+    }
+
+    /// Shared body of [`insert_document`](Self::insert_document) /
+    /// [`upsert_document`](Self::upsert_document): write the segments, then the payload, all
+    /// under one savepoint.
+    fn write_document(&mut self, doc: Document, replace: bool) -> Result<()> {
+        self.atomic(|w| {
+            let segs: Vec<(&str, &str)> = doc
+                .segments
+                .iter()
+                .map(|(l, t)| (l.as_str(), t.as_str()))
+                .collect();
+            w.write_doc(doc.key.clone(), &segs, replace)?;
+            if !doc.payload.is_empty() {
+                let ns = w.index.backend.namespace();
+                let conn: &Connection = &w.guard;
+                let did = w
+                    .index
+                    .doc_id_for(conn, ns, &doc.key, true)?
+                    .expect("create=true always yields a doc id");
+                w.index.set_doc_fields(conn, ns.doc(), did, &doc.payload)?;
+            }
+            Ok(())
+        })
     }
 
     /// The shared body of the four insert/upsert methods.

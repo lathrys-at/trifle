@@ -10,6 +10,28 @@ don't match. The design rationale for anything below lives in the module `//!` d
 design spec at `~/Desktop/trifle-design-addendum.md` (+ `trifle-filter-grammar-notes.md`);
 section numbers like “§7.5” refer to the addendum.
 
+## Status — completed in the follow-up cycle (branch `feat/rev-v0.2`)
+
+Eight tasks landed after the doc was written, each its own commit with a regression test and
+the full gate green (fmt, `cargo test`, clippy `-D warnings`, rustdoc `-D warnings`, workspace;
+`cargo-deny` not run locally but no deps changed). **Not yet adversarially reviewed** — that's
+the next step.
+
+| Task | Commit | Summary |
+|------|--------|---------|
+| **T1** | `c81c2b3` | rebuild folds filterable columns into the `doc` INSERT (one write/doc) |
+| **T15** | `7e0d73a` | band-spread histogram reset on rebuild / drift reset (not compact) |
+| **T5** | `c270db9` | Tier-2 filter applied scoped to candidate ids (last O(N)/search path gone) |
+| **T3** | `5bcb0b1` | `set_fields` requires an existing document (option **a**; no ghost rows) |
+| **T4** | `5051ece` | CLAUDE.md error-taxonomy synced to four classes |
+| **T7** | `0a2deee` | query pipeline extracted to `src/search.rs` behind `SearchCtx`; allows removed |
+| **T2** | `feeddda` | read path resolves in term-space (no Token→String→u128→String round-trip) |
+| **T6** | `852c2cb` | reader retry across a rebuild reload is time-bounded, not a fixed count |
+
+Still open: **T8–T12** (larger features) and **T13–T14** (ranking benchmark / autotune). One
+`#[allow(clippy::too_many_arguments)]` remains on the write-path `write_segment` — deferred to
+T7's optional step 4 ("move write helpers onto `Writer`").
+
 ## What changed since this doc was first written
 
 A few things landed after the initial backlog, so read the tasks with this context:
@@ -31,8 +53,9 @@ A few things landed after the initial backlog, so read the tasks with this conte
   poison path also returns instead of `Corrupt`); and `atomic()` escalates a faulted savepoint
   rollback to a full `ROLLBACK` + poison. So `Error` now has **four** caller-facing classes,
   not three.
-- **The big deferred items remain open** (I10/I12/I-N1/I22 → T1/T2/T5/T7, plus C2-FB-C2 → T6).
-  Line numbers below are refreshed to `f97a774`.
+- **The big deferred items (I10/I12/I-N1/I22 → T1/T2/T5/T7, plus C2-FB-C2 → T6) are now done**
+  — see the status table above. Line numbers in the task entries below are as of `f97a774` and
+  have drifted; grep the named function.
 - **Not yet adversarially reviewed:** the ranking redesign (the weighted counter, the
   band-spread hint, the `Effort`-default change) is tested and green but has **not** been
   through a review cycle. Point reviewers there first next cycle.
@@ -47,7 +70,7 @@ its named test exists.
 
 ### Small, self-contained changes
 
-#### T1 — Fold filterable columns into the rebuild doc INSERT (was I-N1)
+#### ✅ T1 (DONE) — Fold filterable columns into the rebuild doc INSERT (was I-N1)
 - **Why.** `rebuild()` writes each document's `doc` row, then issues a *separate* `UPDATE` per
   document that has payload. For a payload-bearing corpus that doubles the per-doc write count
   and re-compiles SQL per row — O(docs) extra writes on the heaviest path.
@@ -63,7 +86,7 @@ its named test exists.
   behavior change — purely fewer statements.
 - **Done-when.** Rebuild of a payload corpus issues one write per doc; gate green.
 
-#### T2 — Resolve the read path in term-space, not string-space (was I10)
+#### ✅ T2 (DONE) — Resolve the read path in term-space, not string-space (was I10)
 - **Why.** The query path round-trips `Token → String → u128 → String`: `distinct_tokens`
   stringifies each query gram, then `resolve_batch` re-encodes the string back to the `u128`
   term key and stringifies again for the map key. The write path already interns straight from
@@ -81,7 +104,7 @@ its named test exists.
 - **Done-when.** No `to_string()` on the hot read path except for the tokens surfaced to the
   ranker; `scope_ranker.rs` + `thrash.rs` green.
 
-#### T3 — Decide the `set_fields`-on-empty-key contract (was A4 ghost doc)
+#### ✅ T3 (DONE) — Decide the `set_fields`-on-empty-key contract (was A4 ghost doc)
 - **Why.** `set_fields(key, …)` on a key with no segments creates a payload-only `doc` row that
   no search can ever return (search needs segments) — an invisible “ghost”. Not a correctness
   leak (the C2-RA-1 fix reaps *delete*-orphaned rows; this is the *create* path), but a
@@ -97,7 +120,7 @@ its named test exists.
   interact with the C2-RA-1 reaping path.
 - **Done-when.** Behavior is intentional, tested, and documented on `set_fields`.
 
-#### T4 — Sync `CLAUDE.md`'s error-taxonomy line
+#### ✅ T4 (DONE) — Sync `CLAUDE.md`'s error-taxonomy line
 - **Why.** `CLAUDE.md` says `src/error.rs` “variants separate the **three** failure classes”;
   there are now four (`Error::WriterStranded` was added — store-fine/handle-dead). The
   `error.rs` module rustdoc is already correct; only `CLAUDE.md` drifted.
@@ -110,7 +133,7 @@ its named test exists.
 
 ### Performance / robustness
 
-#### T5 — Scope the Tier-2 filter to candidate ids (was I12)
+#### ✅ T5 (DONE) — Scope the Tier-2 filter to candidate ids (was I12)
 - **Why.** A broad structured filter (e.g. `lang = 'en'` over most of a 1M-doc corpus)
   materializes a `RoaringBitmap` of **every** matching `doc` id on **every** search — an O(N)
   row scan + bitmap build, even though only the small candidate pool is ever consulted. It is
@@ -130,7 +153,7 @@ its named test exists.
 - **Done-when.** No O(N) `SELECT id FROM doc WHERE <filter>` on the search path; results
   identical; gate green.
 
-#### T6 — Coordinate readers with an in-progress rebuild reload (was C2-FB-C2)
+#### ✅ T6 (DONE) — Coordinate readers with an in-progress rebuild reload (was C2-FB-C2)
 - **Why.** During a concurrent `rebuild()`, a reader tolerates dictionary-generation skew for a
   **fixed** budget (`RETRY_MAX = 5`, ~150 ms), but the skew window equals the whole
   `dict.load` table scan, which **grows with vocabulary**. At a large-enough vocab, normal
@@ -155,7 +178,7 @@ its named test exists.
 
 ### Architecture
 
-#### T7 — Extract the search pipeline; give the leases real bodies (was I22)
+#### ✅ T7 (DONE) — Extract the search pipeline; give the leases real bodies (was I22)
 - **Why.** `src/lib.rs` is ~2.0k lines and the read/write logic lives as inherent `Index`
   methods while `Writer`/`Reader`/`SearchSession` are thin shells — the lease types don't own
   the work the §8 model says they should, and the search pipeline is hand-wired across several
@@ -215,7 +238,7 @@ its named test exists.
 - **Done-when.** A caller can opt into a corpus-fitted `D` without manually plumbing `stats()`
   back into `SearchOpts`, and the multi-regime case is handled honestly (no false single-`D`).
 
-#### T15 — Reset the band-spread histogram on rebuild / drift reset
+#### ✅ T15 (DONE) — Reset the band-spread histogram on rebuild / drift reset
 - **Why.** The weight-step hint accumulates over the index's whole lifetime, but `rebuild()` and
   a `data_version`/schema drift reset can change the df distribution substantially — pre-change
   band-spread samples then bias the suggested `D`.

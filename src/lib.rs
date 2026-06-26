@@ -1745,17 +1745,30 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
         })
     }
 
-    /// Set the document's filterable field values (Tier 2), creating the document if
-    /// absent. Undeclared field names are ignored. Independent of the segment methods.
+    /// Set the document's filterable field values (Tier 2). The document **must already
+    /// exist** (have at least one segment); calling `set_fields` on a key with no segments
+    /// returns [`Error::InvalidInput`] rather than creating a payload-only "ghost" `doc` row
+    /// that no search can ever return — a typo'd key can't silently accrete rows (audit T3 /
+    /// A4). Undeclared field names are ignored. Independent of the segment methods otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] if `key` names no existing document, or a store error if
+    /// the write fails.
     pub fn set_fields(&mut self, key: impl Into<Key>, fields: &[(&str, Value)]) -> Result<()> {
         let key = key.into();
         self.atomic(|w| {
             let ns = w.index.backend.namespace();
             let conn: &Connection = &w.guard;
-            let doc = w
-                .index
-                .doc_id_for(conn, ns, &key, true)?
-                .expect("create=true always yields a doc id");
+            // create=false: a document is created only by inserting segments, and emptying one
+            // reaps its row (C2-RA-1), so "no doc row" == "no such document". Refuse rather than
+            // stage payload onto a row search can never surface.
+            let Some(doc) = w.index.doc_id_for(conn, ns, &key, false)? else {
+                return Err(Error::InvalidInput(format!(
+                    "set_fields on key {key:?} which has no segments; insert the document's \
+                     segments before setting its filterable fields"
+                )));
+            };
             let owned: Vec<(String, Value)> = fields
                 .iter()
                 .map(|(n, v)| (n.to_string(), v.clone()))

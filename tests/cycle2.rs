@@ -245,6 +245,67 @@ fn scoped_filter_matches_the_unfiltered_result_set() {
     );
 }
 
+// T3 (A4): set_fields requires an existing document — it must NOT create a payload-only
+// "ghost" doc row that no search can return, and must not resurrect a doc the C2-RA-1 reaping
+// path removed.
+#[test]
+fn set_fields_requires_an_existing_document() {
+    let h = Harness::with_schema(schema_with_deck(), Config::default());
+    let path = h.db_path();
+
+    // A key that was never inserted is rejected; no ghost row is staged.
+    {
+        let mut w = h.index.writer().unwrap();
+        let err = w
+            .set_fields(404, &[("deck", Value::Integer(1))])
+            .unwrap_err();
+        assert!(
+            matches!(err, trifle::Error::InvalidInput(_)),
+            "a fresh key must be rejected, got {err:?}"
+        );
+        w.commit().unwrap();
+    }
+    assert_eq!(
+        doc_rows_with_deck(&path, 1),
+        0,
+        "no ghost doc row was created"
+    );
+
+    // On a real document (with a segment) set_fields succeeds and the payload is filterable.
+    {
+        let mut w = h.index.writer().unwrap();
+        w.insert(7, &[("body", "alpha bravo charlie")]).unwrap();
+        w.set_fields(7, &[("deck", Value::Integer(2))]).unwrap();
+        w.commit().unwrap();
+    }
+    assert!(hit(
+        &h.search(
+            "alpha bravo",
+            SearchOpts::new(10).filter(&Filter::eq("deck", 2i64))
+        )
+        .unwrap(),
+        7
+    ));
+
+    // C2-RA-1 non-interaction: emptying the doc reaps its row, after which set_fields errors
+    // again rather than recreating a ghost.
+    h.remove_segment(7, "body");
+    {
+        let mut w = h.index.writer().unwrap();
+        let err = w.set_fields(7, &[("deck", Value::Integer(3))]).unwrap_err();
+        assert!(
+            matches!(err, trifle::Error::InvalidInput(_)),
+            "a reaped doc must not be resurrected by set_fields, got {err:?}"
+        );
+        w.commit().unwrap();
+    }
+    assert_eq!(
+        doc_rows_with_deck(&path, 3),
+        0,
+        "no ghost row after the reap"
+    );
+}
+
 // ----- IDF-weighted overlap ranking -----
 
 #[test]

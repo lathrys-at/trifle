@@ -512,7 +512,6 @@ dependencies = [
 name = "trifle"
 version = "0.1.0"
 dependencies = [
- "memchr",
  "proptest",
  "roaring",
  "rusqlite",

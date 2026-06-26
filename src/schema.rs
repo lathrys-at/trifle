@@ -40,8 +40,8 @@ fn doc_filt_indexes(table: &str, schema: &Schema) -> String {
 ///
 /// v2 (rev-v0.2): postings are keyed by an interned `u32` term-id (the `dict` table),
 /// not gram text; `fwd` holds a roaring bitmap of term-ids.
-/// v3 (rev-v0.2): per-field storage modes dropped (every text field is stored); `doc`
-/// gains a `len` column (per-document gram length for BM25+).
+/// v3 (rev-v0.2): per-field storage modes dropped (every text field is stored); `seg`
+/// gains a `len` column (per-segment gram count) for BM25+ length normalization.
 pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 pub(crate) const KEY_SCHEMA_VERSION: &str = "schema_version";
@@ -49,6 +49,14 @@ pub(crate) const KEY_DATA_VERSION: &str = "data_version";
 pub(crate) const KEY_FINGERPRINT: &str = "tokenizer_fingerprint";
 pub(crate) const KEY_SCHEMA_FINGERPRINT: &str = "schema_fingerprint";
 pub(crate) const KEY_NEXT_ID: &str = "next_id";
+/// Rolling segment count (the BM25 corpus size N and the `pool`-depth `N`), maintained in
+/// the write transaction so a search reads it as an O(1) point lookup rather than an O(N)
+/// `count(*)` (audit I3 / RA-2).
+pub(crate) const KEY_SEG_COUNT: &str = "seg_count";
+/// Rolling sum of per-segment gram lengths. `avgdl = seg_len_sum / seg_count` (BM25+ length
+/// normalization). Integer summation is exact, so the running mean is drift-free without
+/// floating-point compensation.
+pub(crate) const KEY_SEG_LEN_SUM: &str = "seg_len_sum";
 /// The dictionary generation (id-assignment epoch): bumped on every reassignment of
 /// term-ids (rebuild + reset). The read path compares the snapshot's value to the
 /// in-memory dictionary's loaded generation to detect a concurrent reassignment.
@@ -58,9 +66,10 @@ pub(crate) const KEY_DICT_GENERATION: &str = "dict_generation";
 pub(crate) fn create_tables(conn: &Connection, ns: &Namespace, schema: &Schema) -> Result<()> {
     let key_sql_type = schema.key_shape().sql_type();
     // The model is two levels: `doc` (one row per caller key) and `seg` (one row per
-    // (doc, label) segment; `seg.id` is the roaring posting id). `seg.txt` is NULL for a
-    // non-`Stored` field. `fwd` holds every segment's term-id set (a roaring bitmap), so
-    // delete needs neither the text nor the tokenizer regardless of storage mode.
+    // (doc, label) segment; `seg.id` is the roaring posting id). `seg.txt` is the stored
+    // segment text (always present); `seg.len` is its gram count (BM25+ length norm).
+    // `fwd` holds every segment's term-id set (a roaring bitmap), so delete needs neither
+    // the text nor the tokenizer.
     // Postings are keyed by the interned term-id from `dict` (gram text lives only
     // there). The three-way write-frequency split — `term`/`delta` on every write, `post`
     // only on fold/rebuild — keeps a write from rewriting the big base posting. `dict`
@@ -74,7 +83,8 @@ pub(crate) fn create_tables(conn: &Connection, ns: &Namespace, schema: &Schema) 
             id     INTEGER PRIMARY KEY,
             doc_id INTEGER NOT NULL,
             label  TEXT    NOT NULL,
-            txt    TEXT
+            txt    TEXT    NOT NULL,
+            len    INTEGER NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS {seg}_by_doc ON {seg}(doc_id);
          CREATE UNIQUE INDEX IF NOT EXISTS {seg}_by_doc_label ON {seg}(doc_id, label);
@@ -158,7 +168,8 @@ pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace, schema: &Schema)
     let sql = format!(
         "CREATE TABLE {doc}(id INTEGER PRIMARY KEY, key {keyty} NOT NULL{filtcols});
          CREATE TABLE {seg}(
-            id INTEGER PRIMARY KEY, doc_id INTEGER NOT NULL, label TEXT NOT NULL, txt TEXT
+            id INTEGER PRIMARY KEY, doc_id INTEGER NOT NULL, label TEXT NOT NULL,
+            txt TEXT NOT NULL, len INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE {fwd}(id INTEGER PRIMARY KEY, tokens BLOB NOT NULL);
          CREATE TABLE {dict}(id INTEGER PRIMARY KEY, gram BLOB NOT NULL);
@@ -225,7 +236,45 @@ pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace, schema: &Schema) -
 pub(crate) fn reset(conn: &Connection, ns: &Namespace, schema: &Schema) -> Result<()> {
     drop_shadows(conn, ns)?;
     drop_persistent(conn, ns)?;
-    create_tables(conn, ns, schema)
+    create_tables(conn, ns, schema)?;
+    // `drop_persistent` keeps `meta`, so explicitly zero the rolling segment stats — the
+    // data tables are now empty.
+    set_seg_stats(conn, ns, 0, 0)
+}
+
+/// The `(seg_count, seg_len_sum)` rolling stats (absent → `0`). `seg_count` is the BM25
+/// corpus size N; `avgdl = seg_len_sum / seg_count`.
+pub(crate) fn read_seg_stats(conn: &Connection, ns: &Namespace) -> Result<(i64, i64)> {
+    let count = meta_get(conn, ns, KEY_SEG_COUNT)?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let len_sum = meta_get(conn, ns, KEY_SEG_LEN_SUM)?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Ok((count, len_sum))
+}
+
+/// Set the rolling segment stats to absolute values (rebuild swap, reset).
+pub(crate) fn set_seg_stats(
+    conn: &Connection,
+    ns: &Namespace,
+    count: i64,
+    len_sum: i64,
+) -> Result<()> {
+    meta_set(conn, ns, KEY_SEG_COUNT, &count.to_string())?;
+    meta_set(conn, ns, KEY_SEG_LEN_SUM, &len_sum.to_string())
+}
+
+/// Apply `(count_delta, len_delta)` to the rolling segment stats (an incremental write).
+/// Runs inside the caller's transaction, so a `SAVEPOINT` rollback reverts it.
+pub(crate) fn bump_seg_stats(
+    conn: &Connection,
+    ns: &Namespace,
+    count_delta: i64,
+    len_delta: i64,
+) -> Result<()> {
+    let (count, len_sum) = read_seg_stats(conn, ns)?;
+    set_seg_stats(conn, ns, count + count_delta, len_sum + len_delta)
 }
 
 /// Read a meta value as a string.

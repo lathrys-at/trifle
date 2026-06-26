@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use memchr::memmem;
 use roaring::RoaringBitmap;
 use rusqlite::Connection;
 use rusqlite::types::Value;
@@ -36,6 +35,9 @@ pub(crate) struct Survivor {
     /// (every indexed field is stored, so a survivor's text is always populated before
     /// ranking).
     pub text: String,
+    /// The segment's gram length (`|d|`) for BM25+ length normalization — `0` until
+    /// hydrated alongside the text.
+    pub len: u32,
 }
 
 /// Bit-sliced overlap counting. Returns the count "bit planes" `acc` where a given
@@ -162,6 +164,7 @@ pub(crate) fn overlap_search(
                     seg_id: id,
                     overlap: c,
                     text: String::new(),
+                    len: 0,
                 });
             }
         }
@@ -219,9 +222,9 @@ fn hydrate_provenance(
 /// Reorders the overlap-counted candidates into the final result order.
 ///
 /// The default [`OverlapRanker`] orders by overlap (free — it reads only counts).
-/// A richer ranker spends more for quality — literal-verification (promoting exact
-/// substring hits, recovering a precision tier without BM25), proximity, or
-/// idf-weighting — over the segment text each candidate carries.
+/// A richer ranker spends more for quality — the built-in [`Bm25Ranker`] (idf + BM25+
+/// length normalization over terms), or a custom one doing proximity, cross-segment
+/// fusion, or exact-substring promotion — over the segment text each candidate carries.
 pub trait Ranker: Send + Sync {
     /// Return the candidates in final result order (best first). May drop candidates
     /// by omitting them; trifle truncates the result to the search limit.
@@ -251,100 +254,62 @@ fn idf(df: u64, n: u64) -> f64 {
 }
 
 /// The precision-tier reranker run over an over-fetched pool when
-/// [`Effort`](crate::Effort) reranking is on (the default). It rescores each candidate
-/// with a BM25-shaped signal:
+/// [`Effort`](crate::Effort) reranking is on (the default): **real BM25+** over the index's
+/// **terms** (the n-grams), with the segment as the unit ("document"):
 ///
-/// - **idf-weighted matched mass** — a candidate's score sums `idf(df)` over the selected
-///   query trigrams it shares, so *rare* shared trigrams (the discriminating ones) count
-///   far more than common ones that any long document carries.
-/// - **length normalization** — divide by `len^0.35`, so a long document doesn't win on
-///   incidental overlap, the failure mode plain overlap order is most prone to.
-/// - **literal word-coverage** — multiply by a small boost per query *word* found
-///   verbatim in the text (a `memmem` substring verify, the [`Finder`](memmem::Finder)
-///   built once per query). It is **trigram-gated**: trigram-containment is necessary for
-///   substring-containment, so a word whose selected trigrams the candidate is missing is
-///   provably absent and skips the (per-candidate) lowercase + search.
+/// `score(seg) = Σ_{t ∈ query ∩ seg} idf(t) · [ (k1+1)·tf / (tf + k1·(1 − b + b·|d|/avgdl)) + δ ]`
 ///
-/// Reads only the candidate text and posting cardinalities already in hand — no extra
-/// store reads. See `benchmarks/` for the recall/latency curves and the `Effort`
-/// pool-depth calibration.
+/// - **idf(t)** is the BM25 idf from the term's `df` (segments containing it) over `N`
+///   segments — rare shared terms count far more than common ones.
+/// - **length normalization** uses the segment's gram length `|d|` against `avgdl` (the
+///   online mean segment length), so a long segment doesn't win on incidental overlap. The
+///   `δ` lower bound is BM25+'s fix for BM25 over-penalizing long documents.
+/// - **tf is binary** (`tf = 1` for a present term): the bit-sliced index records presence,
+///   not per-term counts, and for short n-gram segments a gram's tf is almost always 1, so
+///   a presence-frequency BM25+ is the faithful-and-cheap form. (An application that needs
+///   true tf or cross-segment fusion supplies its own [`Ranker`].)
+///
+/// The ad-hoc literal/substring tier of the previous scorer is **gone** — verifying exact
+/// substrings is the frontend's job (highlighting/annotation), not the ranker's. Reads only
+/// posting cardinalities and the (already-hydrated) segment length — no extra store reads.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Bm25Ranker;
 
 impl Ranker for Bm25Ranker {
     fn rank(&self, candidates: &Candidates<'_>, query: &QueryContext<'_>) -> Vec<Ranked> {
-        // Length-normalization exponent and per-literal-hit boost.
-        const ALPHA: f64 = 0.35;
-        const LIT_BOOST: f64 = 0.5;
+        // BM25 saturation (k1) and length-normalization (b) parameters; BM25+ lower bound δ.
+        const K1: f64 = 1.2;
+        const B: f64 = 0.75;
+        const DELTA: f64 = 1.0;
         let n = query.n_segments.max(1);
-
-        // The literal tier: per distinct query word (>= 3 chars), a memmem Finder paired
-        // with the bitmask of the *selected query trigrams that word covers*. Built ONCE
-        // here. `mask == 0` is a common word (its trigrams were all pruned): kept but
-        // ungateable — it contributes only when the candidate is already being lowercased
-        // for some discriminating word, so the gate stays recall-neutral. (Gating needs
-        // the present set to fit a u64; with > 64 selected trigrams the tier runs ungated.)
-        let gated = candidates.present.len() <= 64;
-        let lits: Vec<(u64, memmem::Finder<'static>)> = {
-            let lowered = query.query.to_lowercase();
-            let mut words: Vec<&str> = lowered
-                .split(|c: char| !c.is_alphanumeric())
-                .filter(|w| w.chars().count() >= 3)
-                .collect();
-            words.sort_unstable();
-            words.dedup();
-            words
-                .into_iter()
-                .map(|w| {
-                    let mut mask = 0u64;
-                    if gated {
-                        for (j, (t, _)) in candidates.present.iter().enumerate() {
-                            if w.contains(*t) {
-                                mask |= 1u64 << j;
-                            }
-                        }
-                    }
-                    (mask, memmem::Finder::new(w.as_bytes()).into_owned())
-                })
-                .collect()
-        };
+        let avgdl = query.avgdl;
+        // idf is invariant across candidates for a given present term — compute it once
+        // (audit I19), not per (candidate × term).
+        let idfs: Vec<f64> = candidates
+            .present
+            .iter()
+            .map(|(_, bm)| idf(bm.len(), n))
+            .collect();
 
         let mut scored: Vec<(usize, f64, u32)> = (0..candidates.len())
             .map(|i| {
                 let s = &candidates.survivors[i];
-                // idf mass + the matched selected-trigram bitmask (for the literal gate),
-                // in one pass over the few present postings.
+                // Length-normalized tf component (binary tf = 1), shared by all of this
+                // segment's present terms. avgdl == 0 (empty corpus) → no length norm.
+                let dl = (s.len as f64).max(1.0);
+                let norm = if avgdl > 0.0 {
+                    1.0 - B + B * dl / avgdl
+                } else {
+                    1.0
+                };
+                let tf_component = (K1 + 1.0) / (1.0 + K1 * norm) + DELTA;
                 let mut idf_sum = 0.0;
-                let mut matched_mask = 0u64;
                 for (j, (_, bm)) in candidates.present.iter().enumerate() {
                     if bm.contains(s.seg_id) {
-                        idf_sum += idf(bm.len(), n);
-                        if gated {
-                            matched_mask |= 1u64 << j;
-                        }
+                        idf_sum += idfs[j];
                     }
                 }
-                let len = s.text.chars().count().max(1);
-                let mut score = idf_sum / (len as f64).powf(ALPHA);
-                // Literal tier, trigram-gated: lowercase + memmem only the words that can
-                // be present; a discriminating word triggers the work, common words ride
-                // the lowercase we already paid for (so the gate never drops a real hit).
-                if !lits.is_empty() {
-                    let text = s.text.as_str();
-                    let gate = |mask: u64| !gated || (mask & matched_mask) == mask;
-                    let triggers = |mask: u64| if gated { mask != 0 && gate(mask) } else { true };
-                    let hits = if !lits.iter().any(|(mask, _)| triggers(*mask)) {
-                        0
-                    } else {
-                        let lower = text.to_lowercase();
-                        lits.iter()
-                            .filter(|(mask, _)| gate(*mask))
-                            .filter(|(_, f)| f.find(lower.as_bytes()).is_some())
-                            .count()
-                    };
-                    score *= 1.0 + LIT_BOOST * hits as f64;
-                }
-                (i, score, s.overlap)
+                (i, idf_sum * tf_component, s.overlap)
             })
             .collect();
 
@@ -370,8 +335,11 @@ pub struct QueryContext<'a> {
     pub selected: &'a [String],
     /// The match floor `m` in effect for this query.
     pub min_shared: u32,
-    /// Total live segments `N`, for idf weighting (`idf(t) ∝ ln(N/df(t))`).
+    /// Total live segments `N` (the BM25 corpus size), for idf (`idf(t) ∝ ln(N/df(t))`).
     pub n_segments: u64,
+    /// Mean segment gram length (`avgdl`), for BM25+ length normalization. `0.0` only on an
+    /// empty corpus (the ranker then skips length normalization).
+    pub avgdl: f64,
 }
 
 /// The overlap-counted survivors handed to a [`Ranker`], with their text already

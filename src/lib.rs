@@ -643,12 +643,14 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             self.drop_segment(conn, ns, seg_id, changes)?;
         }
         let id = schema::alloc_ids(conn, ns, 1)?;
+        // The segment's gram length (with repetition) for BM25+ length normalization.
+        let seg_len = self.tokenizer.tokenize(text).count() as i64;
         conn.execute(
             &format!(
-                "INSERT INTO {}(id, doc_id, label, txt) VALUES(?1, ?2, ?3, ?4)",
+                "INSERT INTO {}(id, doc_id, label, txt, len) VALUES(?1, ?2, ?3, ?4, ?5)",
                 ns.seg()
             ),
-            rusqlite::params![id, doc, label, text],
+            rusqlite::params![id, doc, label, text, seg_len],
         )?;
         // Intern straight from the tokens (`token.term()`), not via stringified grams — the
         // blanket `IntoTerm` packs each token with no per-token `String` allocation.
@@ -659,6 +661,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             rusqlite::params![id, postings::serialize(&bm)?],
         )?;
         changes.add(id as u32, &ids);
+        schema::bump_seg_stats(conn, ns, 1, seg_len)?;
         Ok(())
     }
 
@@ -695,6 +698,15 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         if let Some(ids) = fwd.get(&(seg_id as u32)) {
             changes.remove(seg_id as u32, ids);
         }
+        // Subtract this segment's gram length from the rolling BM25 stats before deleting.
+        let seg_len: i64 = conn
+            .query_row(
+                &format!("SELECT len FROM {} WHERE id = ?1", ns.seg()),
+                rusqlite::params![seg_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
         conn.execute(
             &format!("DELETE FROM {} WHERE id = ?1", ns.fwd()),
             rusqlite::params![seg_id],
@@ -703,6 +715,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             &format!("DELETE FROM {} WHERE id = ?1", ns.seg()),
             rusqlite::params![seg_id],
         )?;
+        schema::bump_seg_stats(conn, ns, -1, -seg_len)?;
         Ok(())
     }
 
@@ -829,13 +842,14 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let mut inverted: HashMap<TermId, RoaringBitmap> = HashMap::new();
         let mut next_doc: i64 = 1;
         let mut next_seg: i64 = 1;
+        let mut total_seg_len: i64 = 0;
         {
             let mut doc_ins = tx.prepare_cached(&format!(
                 "INSERT INTO {}(id, key) VALUES(?1, ?2)",
                 ns.doc_shadow()
             ))?;
             let mut seg_ins = tx.prepare_cached(&format!(
-                "INSERT INTO {}(id, doc_id, label, txt) VALUES(?1, ?2, ?3, ?4)",
+                "INSERT INTO {}(id, doc_id, label, txt, len) VALUES(?1, ?2, ?3, ?4, ?5)",
                 ns.seg_shadow()
             ))?;
             let mut fwd_ins = tx.prepare_cached(&format!(
@@ -857,7 +871,15 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                     }
                     let seg_id = next_seg;
                     next_seg += 1;
-                    seg_ins.execute(rusqlite::params![seg_id, doc_id, label, text.as_str()])?;
+                    let seg_len = self.tokenizer.tokenize(text).count() as i64;
+                    total_seg_len += seg_len;
+                    seg_ins.execute(rusqlite::params![
+                        seg_id,
+                        doc_id,
+                        label,
+                        text.as_str(),
+                        seg_len
+                    ])?;
                     // Same lowering as the incremental path, but assigning dense ids from a
                     // rebuild-local allocator (see `distinct_term_ids` / audit I4).
                     let ids = self.distinct_term_ids(text, |term| {
@@ -902,6 +924,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
 
         schema::swap_shadows(&tx, ns, &self.schema)?;
         schema::set_next_id(&tx, ns, next_seg)?;
+        // The rolling BM25 stats for the freshly-built corpus (segments = next_seg - 1).
+        schema::set_seg_stats(&tx, ns, next_seg - 1, total_seg_len)?;
         // Reassigning the term-id space bumps the generation so a concurrent reader
         // detects the change and re-resolves against the new snapshot.
         schema::bump_dict_generation(&tx, ns)?;
@@ -927,17 +951,18 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     pub fn stats(&self) -> Result<Stats> {
         let ns = self.backend.namespace();
         let conn = self.backend.read()?;
-        let segments: u64 =
-            conn.query_row(&format!("SELECT count(*) FROM {}", ns.seg()), [], |r| {
-                r.get::<_, i64>(0)
-            })? as u64;
-        let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
-        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-        let stamps = schema::read_stamps(&conn, ns)?;
+        // One pinned snapshot so the reported fields are mutually consistent (audit RA-2),
+        // and segment count is the O(1) rolling meta counter, not an O(N) `count(*)` (I3).
+        let tx = conn.unchecked_transaction()?;
+        let (seg_count, _) = schema::read_seg_stats(&tx, ns)?;
+        let segments = seg_count.max(0) as u64;
+        let page_count: i64 = tx.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let page_size: i64 = tx.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let stamps = schema::read_stamps(&tx, ns)?;
         Ok(Stats {
             segments,
-            terms: postings::term_count(&conn, ns)?,
-            delta_backlog: postings::delta_backlog(&conn, ns)?,
+            terms: postings::term_count(&tx, ns)?,
+            delta_backlog: postings::delta_backlog(&tx, ns)?,
             disk_bytes: (page_count * page_size).max(0) as u64,
             data_version: stamps.data_version.unwrap_or(self.data_version),
             tokenizer_fingerprint: stamps
@@ -1056,10 +1081,15 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             .collect();
         let postings_map = postings::effective_postings(conn, ns, &sel_ids)?;
 
-        let n_segments: u64 =
-            conn.query_row(&format!("SELECT count(*) FROM {}", ns.seg()), [], |r| {
-                r.get::<_, i64>(0)
-            })? as u64;
+        // Corpus size + average segment length from the O(1) rolling meta counters (audit
+        // I3), read under this search's snapshot. `avgdl` feeds BM25+ length normalization.
+        let (seg_count, seg_len_sum) = schema::read_seg_stats(conn, ns)?;
+        let n_segments = seg_count.max(0) as u64;
+        let avgdl = if seg_count > 0 {
+            seg_len_sum as f64 / seg_count as f64
+        } else {
+            0.0
+        };
         let pool = opts.effort.pool(opts.limit, n_segments);
 
         // Tier-2 filter: the doc ids matching the structured filter (same per batch).
@@ -1097,6 +1127,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
 
             out.push(self.rank_to_matches(
                 &survivors, &present, selected, query, min_shared, ranker, opts.limit, n_segments,
+                avgdl,
             ));
         }
         Ok(out)
@@ -1114,6 +1145,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         ranker: &dyn Ranker,
         limit: usize,
         n_segments: u64,
+        avgdl: f64,
     ) -> Vec<Match> {
         let candidates = Candidates::new(survivors, present);
         let qctx = QueryContext {
@@ -1121,6 +1153,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             selected,
             min_shared,
             n_segments,
+            avgdl,
         };
         let ranked = ranker.rank(&candidates, &qctx);
         let sel_refs: Vec<&str> = selected.iter().map(String::as_str).collect();
@@ -1154,18 +1187,22 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         let ids: Vec<u32> = survivors.iter().map(|s| s.seg_id).collect();
         let arr: std::rc::Rc<Vec<Value>> =
             std::rc::Rc::new(ids.iter().map(|&i| Value::Integer(i as i64)).collect());
-        let sql = format!("SELECT id, txt FROM {} WHERE id IN rarray(?1)", ns.seg());
-        let mut texts: HashMap<u32, String> = HashMap::with_capacity(ids.len());
+        let sql = format!("SELECT id, txt, len FROM {} WHERE id IN rarray(?1)", ns.seg());
+        let mut texts: HashMap<u32, (String, u32)> = HashMap::with_capacity(ids.len());
         {
             let mut stmt = conn.prepare_cached(&sql)?;
             let mut rows = stmt.query(rusqlite::params![arr])?;
             while let Some(r) = rows.next()? {
-                texts.insert(r.get::<_, i64>(0)? as u32, r.get::<_, String>(1)?);
+                let id = r.get::<_, i64>(0)? as u32;
+                let txt = r.get::<_, String>(1)?;
+                let len = r.get::<_, i64>(2)?.max(0) as u32;
+                texts.insert(id, (txt, len));
             }
         }
         for s in survivors.iter_mut() {
-            if let Some(t) = texts.remove(&s.seg_id) {
+            if let Some((t, len)) = texts.remove(&s.seg_id) {
                 s.text = t;
+                s.len = len;
             }
         }
         Ok(())
@@ -1444,11 +1481,21 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
                 for (id, tokens) in w.index.doc_segments(conn, ns, doc)? {
                     changes.remove(id, &tokens);
                 }
+                // Subtract every removed segment's gram length + count from the BM25 stats.
+                let (seg_n, seg_len): (i64, i64) = conn.query_row(
+                    &format!(
+                        "SELECT count(*), coalesce(sum(len), 0) FROM {} WHERE doc_id = ?1",
+                        ns.seg()
+                    ),
+                    rusqlite::params![doc],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
                 w.index.delete_doc_rows(conn, ns, doc)?;
                 conn.execute(
                     &format!("DELETE FROM {} WHERE id = ?1", ns.doc()),
                     rusqlite::params![doc],
                 )?;
+                schema::bump_seg_stats(conn, ns, -seg_n, -seg_len)?;
             }
             let df = changes.apply(conn, ns)?;
             w.pending_df.extend(df);

@@ -399,7 +399,7 @@ mod tests {
         let names: Vec<&str> = ns.table_names().collect();
         assert!(names.contains(&"seg"));
         assert!(names.contains(&"seg_shadow"));
-        assert_eq!(names.len(), 13); // 7 persistent + 6 shadows
+        assert_eq!(names.len(), 15); // 8 persistent + 7 shadows
     }
 
     #[test]
@@ -414,6 +414,7 @@ mod tests {
     fn explicit_rejects_collisions() {
         let map = TableMap {
             meta: "a".into(),
+            doc: "g".into(),
             seg: "a".into(), // collides with meta
             fwd: "b".into(),
             term: "c".into(),
@@ -429,6 +430,7 @@ mod tests {
         // `seg` derives `seg_shadow`; naming another table `seg_shadow` collides.
         let map = TableMap {
             meta: "meta".into(),
+            doc: "doc".into(),
             seg: "seg".into(),
             fwd: "seg_shadow".into(),
             term: "term".into(),

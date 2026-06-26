@@ -270,7 +270,10 @@ mod tests {
         let cs = stats.snapshot_for([1u8, 2u8]);
         // A df-40 token in the dense class is rarer-for-its-kind than a df-40 token in
         // the sparse class, so it sorts first even though raw DF ties.
-        let t = vec![("sparse40".to_string(), 40i64, 2u8), ("dense40".to_string(), 40i64, 1u8)];
+        let t = vec![
+            ("sparse40".to_string(), 40i64, 2u8),
+            ("dense40".to_string(), 40i64, 1u8),
+        ];
         let kept = select(&t, params(1, 2), &cs);
         assert_eq!(kept, ["dense40", "sparse40"]);
     }

@@ -341,9 +341,7 @@ fn prepare_chars(
         match normalization {
             Normalization::Nfc => text.nfc().collect(),
             Normalization::Nfd => text.nfd().collect(),
-            Normalization::NfdStripMarks => {
-                text.nfd().filter(|c| !is_combining_mark(*c)).collect()
-            }
+            Normalization::NfdStripMarks => text.nfd().filter(|c| !is_combining_mark(*c)).collect(),
             Normalization::None => text.chars().collect(),
         }
     };

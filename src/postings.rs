@@ -33,7 +33,11 @@ pub(crate) fn deserialize(bytes: &[u8]) -> Result<RoaringBitmap> {
 /// An `Rc`'d carray of term-ids for an `IN rarray(?1)` bind — one prepared statement
 /// for any id count, with no temp btree.
 fn id_array(ids: impl IntoIterator<Item = TermId>) -> Rc<Vec<Value>> {
-    Rc::new(ids.into_iter().map(|id| Value::Integer(id as i64)).collect())
+    Rc::new(
+        ids.into_iter()
+            .map(|id| Value::Integer(id as i64))
+            .collect(),
+    )
 }
 
 /// Read the effective document frequency of each term-id in one batched query. An id
@@ -356,7 +360,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         rusqlite::vtab::array::load_module(&conn).unwrap();
         let ns = Namespace::bare();
-        schema::create_tables(&conn, &ns).unwrap();
+        schema::create_tables(&conn, &ns, &crate::model::Schema::flat()).unwrap();
         (conn, ns)
     }
 
@@ -605,8 +609,13 @@ mod tests {
         let mut map: HashMap<TermId, RoaringBitmap> = HashMap::new();
         map.insert(1, [1u32, 2].into_iter().collect());
         map.insert(2, [3u32].into_iter().collect());
-        write_base_postings(&conn, ns.post(), ns.term(), map.iter().map(|(id, b)| (*id, b)))
-            .unwrap();
+        write_base_postings(
+            &conn,
+            ns.post(),
+            ns.term(),
+            map.iter().map(|(id, b)| (*id, b)),
+        )
+        .unwrap();
         assert_eq!(posting(&conn, &ns, 1), [1, 2]);
         assert_eq!(df(&conn, &ns, 2), Some(1));
     }

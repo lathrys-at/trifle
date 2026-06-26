@@ -30,10 +30,7 @@ pub(crate) struct Term(pub(crate) u128);
 /// Pack three codepoints (zero = absent) and a script tag into the term layout.
 #[inline]
 pub(crate) fn pack(c0: u32, c1: u32, c2: u32, script: u8) -> u128 {
-    ((script as u128) << 120)
-        | ((c0 as u128) << 88)
-        | ((c1 as u128) << 56)
-        | ((c2 as u128) << 24) // low 24 bits reserved = 0
+    ((script as u128) << 120) | ((c0 as u128) << 88) | ((c1 as u128) << 56) | ((c2 as u128) << 24) // low 24 bits reserved = 0
 }
 
 /// Reverse [`pack`] (debug / lossless decode). Explicit masks document that the script

@@ -205,7 +205,10 @@ fn hydrate_provenance(
         let doc: i64 = r.get(1)?;
         let label: String = r.get(2)?;
         let kv: Value = r.get(3)?;
-        out.insert(seg_id as u32, (doc as u32, Key::from_value(key_shape, kv)?, label));
+        out.insert(
+            seg_id as u32,
+            (doc as u32, Key::from_value(key_shape, kv)?, label),
+        );
     }
     Ok(out)
 }

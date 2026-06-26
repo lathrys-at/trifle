@@ -70,7 +70,9 @@ impl Key {
             (KeyShape::Integer, Value::Integer(i)) => Ok(Key::Integer(i)),
             (KeyShape::Text, Value::Text(s)) => Ok(Key::Text(s)),
             (KeyShape::Blob, Value::Blob(b)) => Ok(Key::Blob(b)),
-            _ => Err(Error::corrupt("stored key does not match the declared key shape")),
+            _ => Err(Error::corrupt(
+                "stored key does not match the declared key shape",
+            )),
         }
     }
 }
@@ -597,7 +599,12 @@ mod tests {
 
     #[test]
     fn build_rejects_no_key_and_dup_names_and_no_text() {
-        assert!(Schema::builder().default_text(StorageMode::Stored).build().is_err());
+        assert!(
+            Schema::builder()
+                .default_text(StorageMode::Stored)
+                .build()
+                .is_err()
+        );
         assert!(
             Schema::builder()
                 .key("id", KeyShape::Integer)
@@ -618,8 +625,16 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable_and_semantic() {
-        let a = Schema::chunked().text("front").text("back").build().unwrap();
-        let b = Schema::chunked().text("back").text("front").build().unwrap();
+        let a = Schema::chunked()
+            .text("front")
+            .text("back")
+            .build()
+            .unwrap();
+        let b = Schema::chunked()
+            .text("back")
+            .text("front")
+            .build()
+            .unwrap();
         // Field declaration order does not change identity.
         assert_eq!(a.fingerprint(), b.fingerprint());
         // Storage mode is semantic identity.

@@ -335,11 +335,16 @@ pub(crate) fn bump_dict_generation(conn: &Connection, ns: &Namespace) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Schema;
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         rusqlite::vtab::array::load_module(&c).unwrap();
         c
+    }
+
+    fn schema() -> Schema {
+        Schema::flat()
     }
 
     fn count(conn: &Connection, table: &str) -> i64 {
@@ -351,8 +356,8 @@ mod tests {
     fn create_tables_is_idempotent() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
-        create_tables(&c, &ns).unwrap(); // second call must not error
+        create_tables(&c, &ns, &schema()).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap(); // second call must not error
         assert_eq!(count(&c, ns.seg()), 0);
     }
 
@@ -360,7 +365,7 @@ mod tests {
     fn meta_round_trips_and_missing_is_none() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         assert_eq!(meta_get(&c, &ns, "k").unwrap(), None);
         meta_set(&c, &ns, "k", "v1").unwrap();
         assert_eq!(meta_get(&c, &ns, "k").unwrap().as_deref(), Some("v1"));
@@ -372,19 +377,20 @@ mod tests {
     fn stamps_round_trip_including_u64_max() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
-        write_stamps(&c, &ns, u64::MAX, 0xDEAD_BEEF_CAFE_F00D).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
+        write_stamps(&c, &ns, u64::MAX, 0xDEAD_BEEF_CAFE_F00D, 0x1234_5678).unwrap();
         let s = read_stamps(&c, &ns).unwrap();
         assert_eq!(s.schema_version, Some(SCHEMA_VERSION));
         assert_eq!(s.data_version, Some(u64::MAX));
         assert_eq!(s.fingerprint, Some(0xDEAD_BEEF_CAFE_F00D));
+        assert_eq!(s.schema_fingerprint, Some(0x1234_5678));
     }
 
     #[test]
     fn read_stamps_on_fresh_store_is_all_none() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         assert_eq!(read_stamps(&c, &ns).unwrap(), Stamps::default());
     }
 
@@ -392,7 +398,7 @@ mod tests {
     fn alloc_ids_is_monotonic_and_never_reuses() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         assert_eq!(alloc_ids(&c, &ns, 3).unwrap(), 1); // [1,2,3]
         assert_eq!(alloc_ids(&c, &ns, 2).unwrap(), 4); // [4,5]
         assert_eq!(alloc_ids(&c, &ns, 1).unwrap(), 6); // [6]
@@ -404,7 +410,7 @@ mod tests {
     fn alloc_ids_overflow_is_a_clean_error_not_a_wrap() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         // Ids land in u32 roaring postings, so the ceiling is u32::MAX, not i64::MAX.
         set_next_id(&c, &ns, u32::MAX as i64).unwrap();
         // The last legal id, leaving next_id one past u32::MAX.
@@ -421,7 +427,7 @@ mod tests {
     fn set_next_id_rejects_marks_past_u32() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         // One past the last legal id (the "exhausted" high-water) is allowed; beyond it
         // means an id that does not fit u32 was already in use.
         assert!(set_next_id(&c, &ns, u32::MAX as i64 + 1).is_ok());
@@ -432,17 +438,17 @@ mod tests {
     fn reset_empties_data_but_keeps_meta() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         c.execute(
             &format!(
-                "INSERT INTO {}(id, doc_id, source, ref, txt) VALUES(1, 1, 's', 'r', 't')",
+                "INSERT INTO {}(id, doc_id, label, txt) VALUES(1, 1, 'l', 't')",
                 ns.seg()
             ),
             [],
         )
         .unwrap();
         meta_set(&c, &ns, "keep", "yes").unwrap();
-        reset(&c, &ns).unwrap();
+        reset(&c, &ns, &schema()).unwrap();
         assert_eq!(count(&c, ns.seg()), 0);
         assert_eq!(meta_get(&c, &ns, "keep").unwrap().as_deref(), Some("yes"));
     }
@@ -451,26 +457,26 @@ mod tests {
     fn shadow_build_and_swap_replaces_live_atomically() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         // Live has one row; the shadow will carry a different one.
         c.execute(
             &format!(
-                "INSERT INTO {}(id, doc_id, source, ref, txt) VALUES(1, 1, 's', 'r', 'old')",
+                "INSERT INTO {}(id, doc_id, label, txt) VALUES(1, 1, 'l', 'old')",
                 ns.seg()
             ),
             [],
         )
         .unwrap();
-        create_shadows(&c, &ns).unwrap();
+        create_shadows(&c, &ns, &schema()).unwrap();
         c.execute(
             &format!(
-                "INSERT INTO {}(id, doc_id, source, ref, txt) VALUES(9, 2, 's', 'r', 'new')",
+                "INSERT INTO {}(id, doc_id, label, txt) VALUES(9, 2, 'l', 'new')",
                 ns.seg_shadow()
             ),
             [],
         )
         .unwrap();
-        swap_shadows(&c, &ns).unwrap();
+        swap_shadows(&c, &ns, &schema()).unwrap();
         // Live now reflects the shadow's content, and the index exists again.
         let (id, txt): (i64, String) = c
             .query_row(&format!("SELECT id, txt FROM {}", ns.seg()), [], |r| {
@@ -496,7 +502,7 @@ mod tests {
     fn drop_shadows_is_a_safe_noop_when_absent() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         drop_shadows(&c, &ns).unwrap(); // no shadows yet — must not error
     }
 }

@@ -15,29 +15,50 @@
 //! # Quick start
 //!
 //! ```
-//! use trifle::{Config, Index, SearchOpts};
+//! use trifle::{Config, Index, Schema, SearchOpts};
 //!
 //! # fn main() -> trifle::Result<()> {
 //! let dir = tempfile::tempdir().unwrap();
-//! let index = Index::open_at(&dir.path().join("trifle.db"), Config::default())?;
+//! // Declare a schema (here: an integer key + any text field, stored), then open.
+//! let index = Index::open_at(&dir.path().join("trifle.db"), Schema::flat(), Config::default())?;
 //!
-//! index.insert(1, "field", &[("front", "the quick brown fox")])?;
-//! index.insert(2, "field", &[("front", "the quack brown ox")])?;
+//! // Writes go through a short-lived writer lease; commit makes them durable + visible.
+//! let mut w = index.writer()?;
+//! w.insert(1, &[("front", "the quick brown fox")])?;
+//! w.insert(2, &[("front", "the quack brown ox")])?;
+//! w.commit()?;
+//! drop(w);
 //!
-//! // A typo'd query still matches.
-//! let hits = index.search("quikc brown", SearchOpts::new(10))?;
-//! assert!(hits.iter().any(|m| m.doc_id == 1));
+//! // Reads go through a reader lease. A typo'd query still matches.
+//! let hits = index.reader()?.search("quikc brown", SearchOpts::new(10))?;
+//! assert!(hits.iter().any(|m| m.key.as_i64() == Some(1)));
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! # The document model
+//! # The data model
 //!
-//! A segment is `(doc_id, source, ref, text)`. `source` and `ref` are two
-//! caller-defined, opaque provenance labels (intended: `source` a category like
-//! `"field"` or `"ocr"`, `ref` a sub-location like a field name) returned on a
-//! match. [`insert`](Index::insert) replaces all segments under a `(doc_id, source)`
-//! pair; [`remove`](Index::remove) removes all segments of a `doc_id`.
+//! A [`Schema`] declares a **key** (its shape — `Integer`/`Text`/`Blob` — is the one
+//! declared type, because the key is what trifle compares) plus named **text fields**.
+//! A [`Document`] is a [`Key`] and a set of named segments (`label → text`); a match
+//! comes back as a [`Match`] carrying the document key, the matched segment's label, the
+//! matched byte span, and (per the field's [`StorageMode`]) optionally its text.
+//!
+//! Reads and writes go through **leases** — [`Index::writer`] (the exclusive
+//! single-writer lock, with commit-and-continue) and [`Index::reader`] /
+//! [`Index::session`] — so coordination is structural, not conventional.
+//!
+//! # Ingest & maintenance
+//!
+//! Writes are cheap (a small delta append, `O(tokens)`) and **instantly visible** — a
+//! committed write is searchable by the very next [`reader`](Index::reader). This
+//! supports both write-infrequent and continual-drip ingest; "write-infrequent" is about
+//! *fold amortization*, not write capability. Fold pending deltas into the base postings
+//! with [`compact`](Index::compact) on a cadence driven by
+//! [`Stats::delta_backlog`](Stats); [`rebuild`](Index::rebuild) fully reindexes via an
+//! atomic shadow swap (required after a tokenizer or `data_version`/schema change, which
+//! drop the cache on open). A sustained *high-rate* ingest regime would want an
+//! LSM-structured posting store — a documented future path, not part of v0.2.
 //!
 //! # What trifle leaves to the caller
 //!
@@ -76,11 +97,11 @@ use rusqlite::{Connection, OptionalExtension};
 /// use exactly the right `Connection` type.
 pub use rusqlite;
 
+use dict::{Dictionary, TermId};
 pub use error::{Error, Result};
 pub use model::{
     CmpOp, Document, Filter, FilterType, Key, KeyShape, Match, Schema, SchemaBuilder, StorageMode,
 };
-use dict::{Dictionary, TermId};
 use rank::{Bm25Ranker, Candidates, OverlapRanker, QueryContext, Ranker, Survivor, overlap_search};
 use schema::SCHEMA_VERSION;
 use select::{SelectParams, select};
@@ -664,7 +685,10 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     ) -> Result<Option<i64>> {
         Ok(conn
             .query_row(
-                &format!("SELECT id FROM {} WHERE doc_id = ?1 AND label = ?2", ns.seg()),
+                &format!(
+                    "SELECT id FROM {} WHERE doc_id = ?1 AND label = ?2",
+                    ns.seg()
+                ),
                 rusqlite::params![doc, label],
                 |r| r.get(0),
             )
@@ -740,7 +764,12 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     /// The internal doc ids matching a structured [`Filter`] over the schema's filterable
     /// columns (Tier 2). Field names are validated against the schema (the injection
     /// guard); a value-less / unsatisfiable filter yields an empty set.
-    fn filter_docs(&self, conn: &Connection, ns: &Namespace, filter: &Filter) -> Result<RoaringBitmap> {
+    fn filter_docs(
+        &self,
+        conn: &Connection,
+        ns: &Namespace,
+        filter: &Filter,
+    ) -> Result<RoaringBitmap> {
         let (where_sql, params) = filter.compile(&self.schema)?;
         let sql = format!("SELECT id FROM {} WHERE {}", ns.doc(), where_sql);
         let mut stmt = conn.prepare(&sql)?;
@@ -1090,8 +1119,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
             }
 
             out.push(self.rank_to_matches(
-                &survivors, &present, selected, query, min_shared, ranker, opts.limit,
-                n_segments,
+                &survivors, &present, selected, query, min_shared, ranker, opts.limit, n_segments,
             ));
         }
         Ok(out)
@@ -1410,8 +1438,10 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
             .index
             .doc_id_for(conn, ns, &key, true)?
             .expect("create=true always yields a doc id");
-        let owned: Vec<(String, Value)> =
-            fields.iter().map(|(n, v)| (n.to_string(), v.clone())).collect();
+        let owned: Vec<(String, Value)> = fields
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.clone()))
+            .collect();
         self.index.set_doc_fields(conn, ns.doc(), doc, &owned)?;
         self.dirty = true;
         Ok(())
@@ -1538,8 +1568,15 @@ impl<T: Tokenizer, B: Backend> SearchSession<'_, T, B> {
             Index::<T, B>::query_grams(queries, |q| self.index.distinct_tokens(q));
         self.index
             .search_read_on(&self.conn, &all_grams, |conn, ns, resolved, class_snap| {
-                self.index
-                    .run_search(conn, ns, resolved, class_snap, queries, &query_tokens, &opts)
+                self.index.run_search(
+                    conn,
+                    ns,
+                    resolved,
+                    class_snap,
+                    queries,
+                    &query_tokens,
+                    &opts,
+                )
             })
     }
 }

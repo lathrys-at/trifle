@@ -235,8 +235,11 @@ impl InternStage<'_> {
             return Err(crate::Error::corrupt("term id space exhausted"));
         }
         let id = candidate as TermId;
-        conn.prepare_cached(&format!("INSERT INTO {}(id, gram) VALUES(?1, ?2)", ns.dict()))?
-            .execute(rusqlite::params![id as i64, key.to_be_bytes().as_slice()])?;
+        conn.prepare_cached(&format!(
+            "INSERT INTO {}(id, gram) VALUES(?1, ?2)",
+            ns.dict()
+        ))?
+        .execute(rusqlite::params![id as i64, key.to_be_bytes().as_slice()])?;
         self.new_index.insert(key, id);
         self.new.push((key, id));
         Ok(id)
@@ -252,7 +255,11 @@ impl InternStage<'_> {
         if self.new.is_empty() {
             return;
         }
-        let mut guard = self.dict.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self
+            .dict
+            .inner
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         for (key, id) in self.new {
             guard.map.entry(key).or_insert(id);
             guard.class_of.entry(id).or_insert((key >> 120) as u8);

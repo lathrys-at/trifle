@@ -1,10 +1,11 @@
 //! The crate error type.
 //!
 //! Every fallible operation in trifle returns [`Result`]. The variants separate
-//! the three failure classes a caller reasons about differently: a transient or
-//! environmental store fault ([`Error::Sqlite`]), bad input the caller can fix
-//! ([`Error::InvalidInput`], [`Error::Namespace`]), and an internal invariant
-//! violation that should be impossible ([`Error::Corrupt`], [`Error::Posting`]).
+//! the failure classes a caller reasons about differently: a transient or
+//! environmental store fault ([`Error::Sqlite`], [`Error::Busy`]), bad input the caller
+//! can fix ([`Error::InvalidInput`], [`Error::Namespace`], [`Error::Schema`]), and an
+//! internal invariant violation that should be impossible ([`Error::Corrupt`],
+//! [`Error::Posting`]).
 
 /// A specialized [`Result`](std::result::Result) for trifle operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -49,6 +50,13 @@ pub enum Error {
     /// [`rebuild`](crate::Index::rebuild) restores a consistent store.
     #[error("index inconsistent: {0}")]
     Corrupt(String),
+
+    /// A **transient** condition that did not settle within the internal retry budget —
+    /// for example a read racing a concurrent [`rebuild`](crate::Index::rebuild)'s
+    /// id-reassignment. Unlike [`Corrupt`](Error::Corrupt) the store is fine; **retry the
+    /// operation on a fresh [`reader`](crate::Index::reader)** and it will succeed.
+    #[error("transient (retry): {0}")]
+    Busy(String),
 }
 
 impl Error {
@@ -60,6 +68,11 @@ impl Error {
     /// Construct an [`Error::Corrupt`] from anything string-like.
     pub(crate) fn corrupt(msg: impl Into<String>) -> Self {
         Error::Corrupt(msg.into())
+    }
+
+    /// Construct an [`Error::Busy`] (transient; retry on a fresh reader) from a string.
+    pub(crate) fn busy(msg: impl Into<String>) -> Self {
+        Error::Busy(msg.into())
     }
 
     /// Construct an [`Error::Schema`] from anything string-like.

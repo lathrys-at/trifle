@@ -512,6 +512,20 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         key: &Key,
         create: bool,
     ) -> Result<Option<i64>> {
+        // The key variant must match the schema's declared shape; otherwise SQLite affinity
+        // silently coerces it (e.g. an Integer key into a Text column comes back as a string
+        // key), a caller footgun. Debug-asserted (a caller contract, not a recoverable input
+        // error).
+        debug_assert!(
+            matches!(
+                (key, self.schema.key_shape()),
+                (Key::Integer(_), KeyShape::Integer)
+                    | (Key::Text(_), KeyShape::Text)
+                    | (Key::Blob(_), KeyShape::Blob)
+            ),
+            "key variant {key:?} does not match the schema's declared key shape {:?}",
+            self.schema.key_shape()
+        );
         let found: Option<i64> = conn
             .query_row(
                 &format!("SELECT id FROM {} WHERE key = ?1", ns.doc()),
@@ -1240,8 +1254,12 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 // snapshot — retry on a fresh snapshot on the same connection.
                 drop(tx);
                 if attempt >= RETRY_MAX {
-                    return Err(Error::corrupt(
-                        "dictionary generation skew did not settle across retries",
+                    // The store is consistent; only the in-memory dictionary raced a
+                    // concurrent rebuild's id-reassignment. This is transient — a fresh
+                    // reader resolves against the settled generation — so surface it as
+                    // retryable, NOT Corrupt (which would wrongly imply an unrepairable store).
+                    return Err(Error::busy(
+                        "dictionary generation skew did not settle across retries; retry on a fresh reader",
                     ));
                 }
                 attempt += 1;
@@ -1290,6 +1308,10 @@ pub struct Writer<'a, T: Tokenizer = DefaultTokenizer, B: Backend = Sidecar> {
     pending_df: Vec<(TermId, i64, i64)>,
     /// Whether uncommitted work exists since the last `BEGIN`.
     dirty: bool,
+    /// Whether a transaction is currently open. `false` only if a re-`BEGIN` after a
+    /// `commit()` failed — the writer is then poisoned and every method returns an error
+    /// rather than silently running in autocommit (which would lose atomicity).
+    txn_open: bool,
 }
 
 impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
@@ -1303,7 +1325,41 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
             stage: Some(index.dict.stage()),
             pending_df: Vec::new(),
             dirty: false,
+            txn_open: true,
         })
+    }
+
+    /// Run one write method's body inside a `SAVEPOINT`, so a mid-call error rolls back
+    /// *all* of that call's effects — both the SQL (`ROLLBACK TO`) and the in-memory intern
+    /// staging + pending df deltas — leaving the store exactly as before the call. Without
+    /// this, a caller that catches the error and later `commit()`s would persist a torn,
+    /// internally-inconsistent partial write (orphan segments, negative df).
+    fn atomic<R>(&mut self, body: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
+        if !self.txn_open {
+            return Err(Error::corrupt(
+                "writer transaction is not open (a prior commit failed to re-begin); re-acquire the writer",
+            ));
+        }
+        let stage_mark = self.stage.as_ref().expect("writer stage present").mark();
+        let df_mark = self.pending_df.len();
+        self.guard.execute_batch("SAVEPOINT trifle_w")?;
+        match body(self) {
+            Ok(r) => {
+                self.guard.execute_batch("RELEASE trifle_w")?;
+                Ok(r)
+            }
+            Err(e) => {
+                // Undo the SQL and the in-memory staging this call accumulated.
+                let _ = self
+                    .guard
+                    .execute_batch("ROLLBACK TO trifle_w; RELEASE trifle_w");
+                if let Some(stage) = self.stage.as_mut() {
+                    stage.rollback_to(stage_mark);
+                }
+                self.pending_df.truncate(df_mark);
+                Err(e)
+            }
+        }
     }
 
     /// Add the given `(label, text)` segments to the document keyed `key` (creating it if
@@ -1313,13 +1369,15 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
     /// passing a duplicate label in one call is a contract violation asserted in debug
     /// builds.
     pub fn insert(&mut self, key: impl Into<Key>, segments: &[(&str, &str)]) -> Result<()> {
-        self.write_doc(key.into(), segments, false)
+        let key = key.into();
+        self.atomic(|w| w.write_doc(key, segments, false))
     }
 
     /// Add a single segment `(key, label) = text` (creating the document if absent).
     /// Errors if `(key, label)` already exists.
     pub fn insert_segment(&mut self, key: impl Into<Key>, label: &str, text: &str) -> Result<()> {
-        self.write_doc(key.into(), &[(label, text)], false)
+        let key = key.into();
+        self.atomic(|w| w.write_doc(key, &[(label, text)], false))
     }
 
     /// Insert-or-replace the given `(label, text)` segments of the document keyed `key`
@@ -1330,12 +1388,14 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
     /// passing a duplicate label in one call is a contract violation asserted in debug
     /// builds.
     pub fn upsert(&mut self, key: impl Into<Key>, segments: &[(&str, &str)]) -> Result<()> {
-        self.write_doc(key.into(), segments, true)
+        let key = key.into();
+        self.atomic(|w| w.write_doc(key, segments, true))
     }
 
     /// Insert-or-replace a single segment `(key, label) = text`.
     pub fn upsert_segment(&mut self, key: impl Into<Key>, label: &str, text: &str) -> Result<()> {
-        self.write_doc(key.into(), &[(label, text)], true)
+        let key = key.into();
+        self.atomic(|w| w.write_doc(key, &[(label, text)], true))
     }
 
     /// The shared body of the four insert/upsert methods.
@@ -1371,59 +1431,65 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
     /// Remove the document keyed `key` and all its segments. A nonexistent key is a no-op.
     pub fn remove(&mut self, key: impl Into<Key>) -> Result<()> {
         let key = key.into();
-        let ns = self.index.backend.namespace();
-        let conn: &Connection = &self.guard;
-        let mut changes = TokenChanges::default();
-        if let Some(doc) = self.index.doc_id_for(conn, ns, &key, false)? {
-            for (id, tokens) in self.index.doc_segments(conn, ns, doc)? {
-                changes.remove(id, &tokens);
+        self.atomic(|w| {
+            let ns = w.index.backend.namespace();
+            let conn: &Connection = &w.guard;
+            let mut changes = TokenChanges::default();
+            if let Some(doc) = w.index.doc_id_for(conn, ns, &key, false)? {
+                for (id, tokens) in w.index.doc_segments(conn, ns, doc)? {
+                    changes.remove(id, &tokens);
+                }
+                w.index.delete_doc_rows(conn, ns, doc)?;
+                conn.execute(
+                    &format!("DELETE FROM {} WHERE id = ?1", ns.doc()),
+                    rusqlite::params![doc],
+                )?;
             }
-            self.index.delete_doc_rows(conn, ns, doc)?;
-            conn.execute(
-                &format!("DELETE FROM {} WHERE id = ?1", ns.doc()),
-                rusqlite::params![doc],
-            )?;
-        }
-        let df = changes.apply(conn, ns)?;
-        self.pending_df.extend(df);
-        self.dirty = true;
-        Ok(())
+            let df = changes.apply(conn, ns)?;
+            w.pending_df.extend(df);
+            w.dirty = true;
+            Ok(())
+        })
     }
 
     /// Set the document's filterable field values (Tier 2), creating the document if
     /// absent. Undeclared field names are ignored. Independent of the segment methods.
     pub fn set_fields(&mut self, key: impl Into<Key>, fields: &[(&str, Value)]) -> Result<()> {
         let key = key.into();
-        let ns = self.index.backend.namespace();
-        let conn: &Connection = &self.guard;
-        let doc = self
-            .index
-            .doc_id_for(conn, ns, &key, true)?
-            .expect("create=true always yields a doc id");
-        let owned: Vec<(String, Value)> = fields
-            .iter()
-            .map(|(n, v)| (n.to_string(), v.clone()))
-            .collect();
-        self.index.set_doc_fields(conn, ns.doc(), doc, &owned)?;
-        self.dirty = true;
-        Ok(())
+        self.atomic(|w| {
+            let ns = w.index.backend.namespace();
+            let conn: &Connection = &w.guard;
+            let doc = w
+                .index
+                .doc_id_for(conn, ns, &key, true)?
+                .expect("create=true always yields a doc id");
+            let owned: Vec<(String, Value)> = fields
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.clone()))
+                .collect();
+            w.index.set_doc_fields(conn, ns.doc(), doc, &owned)?;
+            w.dirty = true;
+            Ok(())
+        })
     }
 
     /// Remove the segment `(key, label)`. A nonexistent key or label is a no-op; the
     /// document's other segments are left intact.
     pub fn remove_segment(&mut self, key: impl Into<Key>, label: &str) -> Result<()> {
         let key = key.into();
-        let ns = self.index.backend.namespace();
-        let conn: &Connection = &self.guard;
-        let mut changes = TokenChanges::default();
-        if let Some(doc) = self.index.doc_id_for(conn, ns, &key, false)? {
-            self.index
-                .remove_one_segment(conn, ns, doc, label, &mut changes)?;
-        }
-        let df = changes.apply(conn, ns)?;
-        self.pending_df.extend(df);
-        self.dirty = true;
-        Ok(())
+        self.atomic(|w| {
+            let ns = w.index.backend.namespace();
+            let conn: &Connection = &w.guard;
+            let mut changes = TokenChanges::default();
+            if let Some(doc) = w.index.doc_id_for(conn, ns, &key, false)? {
+                w.index
+                    .remove_one_segment(conn, ns, doc, label, &mut changes)?;
+            }
+            let df = changes.apply(conn, ns)?;
+            w.pending_df.extend(df);
+            w.dirty = true;
+            Ok(())
+        })
     }
 
     /// Commit the open transaction and continue under a fresh one (commit-and-continue),
@@ -1436,6 +1502,10 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
     /// Returns an error if the commit or the re-`BEGIN` fails.
     pub fn commit(&mut self) -> Result<()> {
         self.guard.execute_batch("COMMIT")?;
+        // The COMMIT succeeded; the txn is now closed. If the re-`BEGIN` below fails we must
+        // not leave the writer silently in autocommit, so mark it closed up front and only
+        // re-open on success.
+        self.txn_open = false;
         // Order matters: merge the staged interns first (advancing the shared high-water
         // mark), then snapshot a fresh stage off the advanced mark.
         if let Some(old) = self.stage.take() {
@@ -1446,6 +1516,7 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
         self.stage = Some(self.index.dict.stage());
         self.dirty = false;
         self.guard.execute_batch("BEGIN IMMEDIATE")?;
+        self.txn_open = true;
         Ok(())
     }
 }
@@ -1453,8 +1524,11 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
 impl<T: Tokenizer, B: Backend> Drop for Writer<'_, T, B> {
     fn drop(&mut self) {
         // Roll back the uncommitted tail; the staged interns + df are dropped unmerged,
-        // so a write that was never committed leaves no trace (in-memory or on disk).
-        let _ = self.guard.execute_batch("ROLLBACK");
+        // so a write that was never committed leaves no trace (in-memory or on disk). Skip
+        // if a failed re-begin already left no open transaction.
+        if self.txn_open {
+            let _ = self.guard.execute_batch("ROLLBACK");
+        }
     }
 }
 

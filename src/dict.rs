@@ -158,6 +158,15 @@ impl Dictionary {
     /// allocations are buffered locally and merged into the shared map only on
     /// [`InternStage::commit`]. Only ever called on a write path (which holds the
     /// single-writer lease), so the snapshotted `next_id` cannot move under the stage.
+    ///
+    /// **Audit I17 (reader/writer fault split):** §4 of the design wanted interning to be
+    /// `&mut self` so a shared reader ref *cannot* intern at the type level. Here `stage`
+    /// takes `&self` (the dictionary lives behind a shared `&Index`), so exclusivity is
+    /// enforced by reachability rather than the type: `stage`/`InternStage` are
+    /// `pub(crate)`, only [`Writer::begin`](crate::Writer) calls `stage` (under the
+    /// single-writer lease), and the read pool hands out `SQLITE_OPEN_READ_ONLY`
+    /// connections, so an intern's `INSERT` would fail at runtime regardless. No reader path
+    /// can intern; the guarantee holds, just not structurally.
     pub(crate) fn stage(&self) -> InternStage<'_> {
         let guard = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         InternStage {
@@ -214,6 +223,22 @@ impl InternStage<'_> {
         ns: &Namespace,
     ) -> Result<TermId> {
         self.intern_key(term.0, conn, ns)
+    }
+
+    /// A rollback marker — the count of grams staged so far. Pair with
+    /// [`rollback_to`](Self::rollback_to) to undo the staging of one failed write call,
+    /// matching a SQL `SAVEPOINT`/`ROLLBACK TO` that undoes its `dict` rows.
+    pub(crate) fn mark(&self) -> usize {
+        self.new.len()
+    }
+
+    /// Discard grams staged after `mark` (a failed write call's allocations), so a later
+    /// [`commit`](Self::commit) never merges an id whose `dict` row was rolled back. The
+    /// freed id range is reused by the next allocation.
+    pub(crate) fn rollback_to(&mut self, mark: usize) {
+        for (key, _) in self.new.drain(mark..) {
+            self.new_index.remove(&key);
+        }
     }
 
     /// The shared body of [`intern_term`](Self::intern_term): resolve `key`, allocating +

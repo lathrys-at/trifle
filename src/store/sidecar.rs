@@ -87,10 +87,6 @@ impl Backend for Sidecar {
     fn namespace(&self) -> &Namespace {
         self.store.namespace()
     }
-
-    fn init_conn(&self, conn: &Connection) -> Result<()> {
-        setup_read_conn(conn)
-    }
 }
 
 /// Per-connection setup shared by read connections (and the non-WAL part of the

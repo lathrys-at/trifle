@@ -52,18 +52,15 @@ pub trait Backend: Send + Sync {
 
     /// The table-naming namespace for this backend.
     fn namespace(&self) -> &Namespace;
-
-    /// Per-connection setup that registers the `carray`/`rarray` vtab (for batched
-    /// `WHERE id IN rarray(?1)` hydration) and, in [`Sidecar`] mode, sets pragmas.
-    ///
-    /// **The backend is responsible for running this** (or equivalent setup) on every
-    /// connection it hands out from [`write`](Backend::write) / [`read`](Backend::read)
-    /// before first use — the built-in backends do so in their connection factories.
-    /// trifle never calls it for you; it relies on the backend having upheld the
-    /// invariant. Exposed on the trait so a wrapping/custom backend can reuse the
-    /// setup. Must be idempotent.
-    fn init_conn(&self, conn: &Connection) -> Result<()>;
 }
+
+// NOTE (audit I9): a `Backend::init_conn` hook was removed in v0.2. trifle never opened
+// connections itself, so it could never call the hook — leaving an author who implemented
+// it but didn't *also* run the same setup in their connection factory with a runtime
+// "no such function: rarray" at the first batched read. Every connection a custom backend
+// hands out from `write`/`read` **must already** have the `carray`/`rarray` vtab registered
+// (`rusqlite::vtab::array::load_module`, what [`register_carray`] does); the built-in
+// backends do this in their connection factories, which is the one place it belongs.
 
 /// One-time, process-global SQLite tuning. Best-effort and behavior-transparent.
 ///

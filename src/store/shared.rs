@@ -63,8 +63,4 @@ impl Backend for Shared {
     fn namespace(&self) -> &Namespace {
         self.store.namespace()
     }
-
-    fn init_conn(&self, conn: &Connection) -> Result<()> {
-        register_carray(conn)
-    }
 }

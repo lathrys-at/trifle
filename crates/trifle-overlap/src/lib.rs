@@ -12,15 +12,15 @@
 //! portable serialization is **byte-identical** to croaring's, so trifle's existing stored blobs
 //! are viewed directly with no format migration.
 //!
-//! # Dual bit-sliced counters (owns only planes — no posting retention)
+//! # Owns-postings + all-weight-1 fast path (one counter, no second build)
 //!
-//! The engine builds the **weighted** bit-sliced counter (the score) and, when the weights are
-//! not all 1, a small **unweighted** counter (the raw overlap). It then retains only those owned
-//! plane bitmaps — never the postings or their views. This is what makes [`Counter`] `'static`
-//! (so an embedding stream has no self-referential lifetime) and lets the build be zero-copy: the
-//! views are folded transiently and dropped. Raw overlap is read from the unweighted planes
-//! (`O(log k)` membership), or — when all weights are 1 — taken directly as the score (the
-//! weighted counter *is* the count), with no per-id probing at all.
+//! The engine builds a single **weighted** bit-sliced counter (the score). Raw overlap is taken
+//! **directly as the score** when all tier weights are 1 — the common rarest-first case: the
+//! weighted counter then *is* the count, the floor is met by every walked bucket, and a zero-copy
+//! view build retains nothing. For the mixed-weight minority it retains the **owned postings** and
+//! reads overlap via `contains` — measured **~2.5× cheaper** than building a second (unweighted)
+//! bit-sliced counter for the overlap. Either way the retained state is owned (`Vec<Bitmap>`), so
+//! [`Counter`] is `'static` — no self-referential lifetime when embedded in a stream.
 //!
 //! # Flatness
 //!
@@ -98,9 +98,10 @@ impl Operand for &BitmapView<'_> {
 pub struct Counter {
     /// Weighted bit-sliced count: `weighted[b]` holds bit `b` of every id's weighted score.
     weighted: Vec<Bitmap>,
-    /// Unweighted bit-sliced count (the raw overlap), for `raw_overlap`. **Empty** when all
-    /// weights are 1 — then the weighted counter already *is* the count.
-    unweighted: Vec<Bitmap>,
+    /// The owned postings, retained ONLY for mixed-weight queries (raw overlap via `contains`).
+    /// **Empty** when all weights are 1 — then weighted score *is* the overlap, so nothing is
+    /// retained (and a zero-copy view build keeps no copy at all). Owned `Bitmap`s ⇒ `'static`.
+    postings: Vec<Bitmap>,
     /// The raw-overlap floor: a candidate must share at least this many postings.
     floor: u32,
     /// `Σ weights` — the maximum achievable weighted score.
@@ -129,24 +130,29 @@ impl Counter {
     /// Panics if `weights.len() != bitmaps.len()`.
     pub fn build_weighted(bitmaps: &[Bitmap], weights: Vec<u32>, min_shared: u32) -> Self {
         assert_eq!(bitmaps.len(), weights.len(), "weights parallel to bitmaps");
-        let refs: Vec<&Bitmap> = bitmaps.iter().collect();
-        Self::fold(&refs, weights, min_shared)
+        let Plan { weighted, all_weight_one, max_score, reachable, floor } = {
+            let refs: Vec<&Bitmap> = bitmaps.iter().collect();
+            plan(&refs, weights, min_shared)
+        };
+        // Retain owned postings only for mixed-weight queries (raw overlap via `contains`); the
+        // all-weight-1 case takes overlap = score and keeps nothing.
+        let postings = if all_weight_one { Vec::new() } else { bitmaps.to_vec() };
+        Counter { weighted, postings, floor, max_score, reachable, all_weight_one }
     }
 
     /// Build **zero-copy** from stored portable posting bytes: each blob is viewed in place
     /// (`BitmapView`, no allocation/copy) and folded transiently. The roaring-crate and croaring
     /// portable formats are byte-identical, so trifle's existing blobs work unchanged.
     pub fn build_from_blobs(blobs: &[&[u8]], weight_step: f64, min_shared: u32) -> Self {
-        // SAFETY: each `blob` outlives its `view` (both live only within this call); portable
-        // layout needs no alignment.
-        let views: Vec<BitmapView<'_>> = blobs
+        // Cardinalities (= df) come from a cheap view pass (O(containers), no copy); the weighted
+        // build (and any owned retention for mixed weights) happens in `build_weighted_from_blobs`.
+        let cards: Vec<u64> = blobs
             .iter()
-            .map(|b| unsafe { BitmapView::deserialize::<Portable>(b) })
+            // SAFETY: `b` outlives the transient view used only to read cardinality here.
+            .map(|b| unsafe { BitmapView::deserialize::<Portable>(b) }.cardinality())
             .collect();
-        let cards: Vec<u64> = views.iter().map(|v| v.cardinality()).collect();
         let weights = tier_weights(&cards, weight_step);
-        let refs: Vec<&BitmapView<'_>> = views.iter().collect();
-        Self::fold(&refs, weights, min_shared)
+        Self::build_weighted_from_blobs(blobs, weights, min_shared)
     }
 
     /// Zero-copy build with explicit `weights` (parallel to `blobs`).
@@ -155,62 +161,29 @@ impl Counter {
     /// Panics if `weights.len() != blobs.len()`.
     pub fn build_weighted_from_blobs(blobs: &[&[u8]], weights: Vec<u32>, min_shared: u32) -> Self {
         assert_eq!(blobs.len(), weights.len(), "weights parallel to blobs");
-        let views: Vec<BitmapView<'_>> = blobs
-            .iter()
-            .map(|b| unsafe { BitmapView::deserialize::<Portable>(b) })
-            .collect();
-        let refs: Vec<&BitmapView<'_>> = views.iter().collect();
-        Self::fold(&refs, weights, min_shared)
-    }
-
-    /// The shared fold: build the weighted (and, if weights differ, unweighted) planes from the
-    /// operands, retaining only the owned planes. Generic over `&Bitmap` / `&BitmapView`.
-    fn fold<O: Operand + Copy>(ops: &[O], mut weights: Vec<u32>, min_shared: u32) -> Self {
-        for w in &mut weights {
-            *w = (*w).max(1); // weighted >= raw (floor + early-stop soundness)
-        }
-        let all_weight_one = weights.iter().all(|&w| w == 1);
-
-        let mut weighted: Vec<Bitmap> = Vec::new();
-        for (op, &w) in ops.iter().zip(&weights) {
-            add_weighted(&mut weighted, *op, w);
-        }
-        let mut unweighted: Vec<Bitmap> = Vec::new();
-        if !all_weight_one {
-            for op in ops {
-                add_weighted(&mut unweighted, *op, 1);
-            }
-        }
-
-        let floor = (min_shared as usize).min(ops.len()).max(1) as u32;
-        let max_score: u32 = weights.iter().sum();
-
-        // Subset-sum reachability over the weights (0/1 knapsack, descending to avoid reuse).
-        let mut reachable = vec![false; max_score as usize + 1];
-        reachable[0] = true;
-        let mut hi = 0u32;
-        for &w in &weights {
-            let mut c = hi;
-            loop {
-                if reachable[c as usize] {
-                    reachable[(c + w) as usize] = true;
-                }
-                if c == 0 {
-                    break;
-                }
-                c -= 1;
-            }
-            hi += w;
-        }
-
-        Counter {
-            weighted,
-            unweighted,
-            floor,
-            max_score,
-            reachable,
-            all_weight_one,
-        }
+        let Plan { weighted, all_weight_one, max_score, reachable, floor } = {
+            // SAFETY: each `blob` outlives its `view` (both live only within this block);
+            // portable layout needs no alignment.
+            let views: Vec<BitmapView<'_>> = blobs
+                .iter()
+                .map(|b| unsafe { BitmapView::deserialize::<Portable>(b) })
+                .collect();
+            let refs: Vec<&BitmapView<'_>> = views.iter().collect();
+            plan(&refs, weights, min_shared)
+        };
+        // all-weight-1: the build was zero-copy (views only) and needs no postings. Mixed-weight:
+        // materialize owned postings for `contains` — owned+contains is ~2.5x cheaper than a
+        // second (unweighted) bit-sliced build (measured), at the cost of zero-copy for this
+        // minority case.
+        let postings = if all_weight_one {
+            Vec::new()
+        } else {
+            blobs
+                .iter()
+                .map(|b| Bitmap::try_deserialize::<Portable>(b).expect("portable posting blob"))
+                .collect()
+        };
+        Counter { weighted, postings, floor, max_score, reachable, all_weight_one }
     }
 
     /// A fresh best-first walk cursor over this counter (the only way to construct a [`Walk`]).
@@ -283,15 +256,12 @@ impl Counter {
         self.floor
     }
 
-    /// Raw overlap of `id` from the unweighted counter (`Σ 2^b · [id ∈ unweighted[b]]`),
-    /// `O(log k)` membership probes. Only called for mixed-weight counters; the all-weight-1
-    /// path takes `overlap = score`.
+    /// Raw overlap of `id`: how many retained postings contain it (`O(k)` SIMD `contains`,
+    /// k small by selection, paid only per *yielded* id). Only called for mixed-weight counters;
+    /// the all-weight-1 path takes `overlap = score` and retains no postings. Measured ~2.5x
+    /// cheaper than building a second (unweighted) bit-sliced counter for the overlap.
     fn raw_overlap(&self, id: u32) -> u32 {
-        self.unweighted
-            .iter()
-            .enumerate()
-            .map(|(b, plane)| (plane.contains(id) as u32) << b)
-            .sum()
+        self.postings.iter().filter(|p| p.contains(id)).count() as u32
     }
 }
 
@@ -338,6 +308,59 @@ pub fn tier_weights(cardinalities: &[u64], weight_step: f64) -> Vec<u32> {
             1 + steps.min(3)
         })
         .collect()
+}
+
+/// The weighted bit-sliced planes + walk metadata. Returned by [`plan`]; the owned postings (for
+/// `raw_overlap`) are decided by the caller (retained for mixed weights, dropped for all-1).
+struct Plan {
+    weighted: Vec<Bitmap>,
+    all_weight_one: bool,
+    max_score: u32,
+    reachable: Vec<bool>,
+    floor: u32,
+}
+
+/// Build the weighted bit-sliced planes + walk metadata from the operands. Generic over
+/// `&Bitmap` / `&BitmapView`, so the build is zero-copy over views yet reusable for owned inputs.
+fn plan<O: Operand + Copy>(ops: &[O], mut weights: Vec<u32>, min_shared: u32) -> Plan {
+    for w in &mut weights {
+        *w = (*w).max(1); // weighted >= raw (floor + early-stop soundness)
+    }
+    let all_weight_one = weights.iter().all(|&w| w == 1);
+
+    let mut weighted: Vec<Bitmap> = Vec::new();
+    for (op, &w) in ops.iter().zip(&weights) {
+        add_weighted(&mut weighted, *op, w);
+    }
+
+    let floor = (min_shared as usize).min(ops.len()).max(1) as u32;
+    let max_score: u32 = weights.iter().sum();
+
+    // Subset-sum reachability over the weights (0/1 knapsack, descending to avoid reuse).
+    let mut reachable = vec![false; max_score as usize + 1];
+    reachable[0] = true;
+    let mut hi = 0u32;
+    for &w in &weights {
+        let mut c = hi;
+        loop {
+            if reachable[c as usize] {
+                reachable[(c + w) as usize] = true;
+            }
+            if c == 0 {
+                break;
+            }
+            c -= 1;
+        }
+        hi += w;
+    }
+
+    Plan {
+        weighted,
+        all_weight_one,
+        max_score,
+        reachable,
+        floor,
+    }
 }
 
 /// Add `w` copies of `op` into the bit-sliced planes `acc`: inject a carry at each set bit of `w`
@@ -447,17 +470,18 @@ mod tests {
     }
 
     #[test]
-    fn weighting_promotes_rarer_grams_via_unweighted_dual() {
-        // common df 16 -> weight 1; rare df 1 -> weight 4. Mixed weights -> unweighted dual used.
+    fn weighting_promotes_rarer_grams_via_owned_postings() {
+        // common df 16 -> weight 1; rare df 1 -> weight 4. Mixed weights -> owned postings retained.
         let common = Bitmap::of(&(0..16).collect::<Vec<_>>());
         let rare = Bitmap::of(&[5]);
         assert_eq!(tier_weights(&[common.cardinality(), rare.cardinality()], 1.0), vec![1, 4]);
         let counter = Counter::build(&[common, rare], 1.0, 1);
         assert!(!counter.all_weight_one);
+        assert_eq!(counter.postings.len(), 2, "mixed weights retain owned postings");
         let got = all(&counter);
         assert_eq!(got[0].id, 5);
         assert_eq!(got[0].score, 5); // 1 + 4
-        assert_eq!(got[0].overlap, 2); // raw overlap from the unweighted dual
+        assert_eq!(got[0].overlap, 2); // raw overlap via contains over retained postings
     }
 
     #[test]

@@ -2,11 +2,14 @@
 //!
 //! Run with: `cargo run -p trifle-overlap --example flatness --release`
 //!
-//! Demonstrates the engine's central claim: candidate generation is `O(k·log k)` bitmap ops,
-//! **independent of posting cardinality**. Three experiments:
-//!   1. flatness vs cardinality (BSI build+top-10 vs a naive HashMap overlap counter);
-//!   2. scaling in `k` (number of selected postings);
-//!   3. lazy early-stop (top-10 vs full drain).
+//! Demonstrates the engine's real property: candidate generation is a fixed *count* of bitmap
+//! operations (`O(k·log k)`, cardinality-independent), so wall-clock is sublinear in cardinality
+//! (sparse regime) and flat in the dense bitmap-container regime — pulling away from a naive
+//! per-id counter as postings densify. Experiments:
+//!   - sparse regime (#1): build+top-10 vs cardinality (vs a naive HashMap overlap counter);
+//!   - dense regime (#1b): one roaring container, vary density — BSI wall-clock stays flat;
+//!   - scaling in `k` (#2): number of selected postings;
+//!   - lazy early-stop (#3): top-10 vs full drain.
 //!
 //! Debug numbers are meaningless — always `--release`.
 
@@ -96,7 +99,7 @@ fn main() {
     println!("trifle-overlap flatness benchmark (release)\n");
 
     // ---- Experiment 1: flatness vs cardinality (fixed k) ---------------------------------
-    println!("== 1. build + top-{TOPN}, vs posting cardinality (k = 8 postings) ==");
+    println!("== 1. sparse regime: build + top-{TOPN} vs cardinality (k = 8 postings) ==");
     println!(
         "{:>10} | {:>12} | {:>12} | {:>10}",
         "card", "BSI (µs)", "naive (µs)", "speedup"
@@ -143,6 +146,49 @@ fn main() {
          posting size\" — its cost tracks the bitmap representation (containers × density), not\n  \
          a per-result cost. trifle feeds the engine the RAREST (sparsest) postings by selection,\n  \
          so the cheap left of this table is the real operating point.\n"
+    );
+
+    // ---- Experiment 1b: the TRUE flatness regime (one dense container) -------------------
+    // A small universe puts every id in a single roaring container; past ~4096 ids it is a
+    // dense bitmap container (fixed 1024-word ops). So BSI wall-clock stays flat as density
+    // rises, while naive grows with set-bit count — the literal "fixed op count" invariant.
+    println!("== 1b. dense regime: one roaring container, vary density (k = 8) ==");
+    println!(
+        "{:>10} | {:>12} | {:>12} | {:>10}",
+        "card", "BSI (µs)", "naive (µs)", "speedup"
+    );
+    println!("{:->10}-+-{:->12}-+-{:->12}-+-{:->10}", "", "", "", "");
+    const DENSE_U: u32 = 65_536; // exactly one roaring container
+    for &card in &[4_000u32, 12_000, 24_000, 48_000] {
+        let postings = make_postings(8, card, DENSE_U, 400, 0xDED5 ^ card as u64);
+        let bsi = median(ITERS, || {
+            let counter = Counter::build(postings.clone(), 1.0, 2);
+            let mut w = counter.walk();
+            let mut n = 0;
+            while n < TOPN && counter.advance(&mut w).is_some() {
+                n += 1;
+            }
+            std::hint::black_box(n);
+        });
+        let clone_only = median(ITERS, || {
+            std::hint::black_box(postings.clone());
+        });
+        let bsi = bsi.saturating_sub(clone_only);
+        let naive = median(ITERS, || {
+            std::hint::black_box(naive_topk(&postings, TOPN));
+        });
+        println!(
+            "{:>10} | {:>12.1} | {:>12.1} | {:>9.1}x",
+            card,
+            us(bsi),
+            us(naive),
+            us(naive) / us(bsi).max(1e-9)
+        );
+    }
+    println!(
+        "\n  Density rose 12x; BSI wall-clock stays ~flat (each posting is one fixed-width bitmap\n  \
+         container — the op count is constant), while naive grows ~linearly in set bits. This is\n  \
+         the literal invariant: a fixed COUNT of cardinality-independent bitmap ops.\n"
     );
 
     // ---- Experiment 2: scaling in k (fixed cardinality) ----------------------------------

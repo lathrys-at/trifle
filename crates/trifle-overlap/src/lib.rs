@@ -11,8 +11,11 @@
 //! Each id's *weighted overlap score* is `Σ_i weight_i · [id ∈ posting_i]`, where `weight_i`
 //! is the posting's IDF tier weight (rarer grams weigh more; see [`tier_weights`]). The score
 //! is accumulated in a **bit-sliced counter** (counts held across bitmap "bit planes"; adding a
-//! posting `w` times is a ripple-carry binary add), so building the counter is `O(k·log k)`
-//! bitmap ops — *independent of posting cardinality* (the **flatness** property). A high→low
+//! posting `w` times is a ripple-carry binary add), so building the counter takes `O(k·log k)`
+//! bitmap *operations* — the operation **count** is independent of posting cardinality. Wall-clock
+//! is *sublinear* in cardinality (in the sparse/array-container regime each op's cost scales with
+//! the representation) and genuinely **flat** in the dense bitmap-container regime (fixed-width
+//! ops); either way it pulls away from a naive per-id counter as postings densify. A high→low
 //! walk over the score buckets then streams candidates lazily: pulling the top-`k` only
 //! materializes the high-score head.
 //!
@@ -80,8 +83,8 @@ impl Counter {
     /// cardinality, by trifle's monotonic-id contract; knob `D = weight_step`, see
     /// [`tier_weights`]). `min_shared` is the raw-overlap floor.
     ///
-    /// `O(k·log k)` bitmap ops to build, independent of posting cardinality (the flatness
-    /// property).
+    /// Builds in `O(k·log k)` bitmap *operations* (the op count is cardinality-independent;
+    /// wall-clock is sublinear in cardinality, flat in the dense bitmap-container regime).
     pub fn build(postings: Vec<RoaringBitmap>, weight_step: f64, min_shared: u32) -> Self {
         let cards: Vec<u64> = postings.iter().map(RoaringBitmap::len).collect();
         let weights = tier_weights(&cards, weight_step);

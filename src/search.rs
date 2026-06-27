@@ -138,6 +138,7 @@ fn prepare<T: Tokenizer>(
         min_shared,
         typo_damage: TYPO_DAMAGE,
         t_max: opts.t_max.unwrap_or(DEFAULT_T_MAX),
+        df_budget: opts.df_budget,
     };
 
     // One batched df read over every resolved term-id in the batch.

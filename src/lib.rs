@@ -140,6 +140,11 @@ pub struct SearchOpts<'a> {
     /// `t_max` — the number of rarest query tokens selection keeps, above the typo floor
     /// `F = m + d`. `None` → `12`. The selection breadth (recall/cost) knob.
     pub t_max: Option<usize>,
+    /// `B` — an optional cap on the cumulative document frequency (`Σdf`) of the selected
+    /// tokens, which is what candidate generation scans — so this bounds *work* directly
+    /// (`t_max` bounds count). Rarest-first tokens are kept while `Σdf` stays within budget; the
+    /// typo floor is always kept. `None` (the default) = no cap.
+    pub df_budget: Option<u64>,
     /// `D` — df-doublings per IDF weight step in the overlap counter. `1.0` (the default) means
     /// each weight level is one more halving of df relative to the query's commonest survivor.
     /// `N`-invariant. [`Stats::weight_step_hint`] suggests a corpus-fitted value.
@@ -155,6 +160,7 @@ impl<'a> SearchOpts<'a> {
         SearchOpts {
             min_shared: None,
             t_max: None,
+            df_budget: None,
             weight_step: DEFAULT_WEIGHT_STEP,
             filter: None,
         }
@@ -169,6 +175,12 @@ impl<'a> SearchOpts<'a> {
     /// Set `t_max` — the number of rarest query tokens selection keeps.
     pub fn t_max(mut self, t_max: usize) -> Self {
         self.t_max = Some(t_max);
+        self
+    }
+
+    /// Set `df_budget` `B` — cap the cumulative `Σdf` of the selected tokens (bounds scan work).
+    pub fn df_budget(mut self, budget: u64) -> Self {
+        self.df_budget = Some(budget);
         self
     }
 

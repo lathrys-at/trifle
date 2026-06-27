@@ -31,6 +31,11 @@ pub(crate) struct SelectParams {
     pub typo_damage: u32,
     /// `t_max` — the number of rarest tokens to keep (never fewer than the typo floor).
     pub t_max: usize,
+    /// `B` — an optional cap on the cumulative document frequency (`Σdf`) of the kept present
+    /// tokens. The scan cost is `Σdf`, so this caps *work* directly (rather than count, as
+    /// `t_max` does). The typo floor is always kept even if it exceeds `B`; beyond the floor,
+    /// rarest-first tokens are kept while `Σdf` stays within budget. `None` = no cap.
+    pub df_budget: Option<u64>,
 }
 
 /// Select the tokens to scan, from each distinct query token paired with its live
@@ -70,11 +75,26 @@ pub(crate) fn select<Tk: Clone + Ord>(
     let floor = f.max(params.min_shared as usize).min(present.len());
     let keep = params.t_max.max(floor).min(present.len());
 
-    let mut kept: Vec<Tk> = present
-        .into_iter()
-        .take(keep)
-        .map(|(tok, _, _)| tok.clone())
-        .collect();
+    // Keep the rarest-first prefix up to `keep` (the count cap), but once past the floor stop
+    // as soon as the cumulative df (`Σdf` — the scan cost) would exceed the `df_budget`. The
+    // floor is kept unconditionally so a typo'd query never loses its tolerance to the cap.
+    let mut kept: Vec<Tk> = Vec::with_capacity(keep);
+    let mut cum_df: u64 = 0;
+    for (i, (tok, df, _)) in present.iter().enumerate() {
+        if i >= keep {
+            break;
+        }
+        let df = (*df).max(0) as u64;
+        if i >= floor {
+            if let Some(budget) = params.df_budget {
+                if cum_df + df > budget {
+                    break;
+                }
+            }
+        }
+        kept.push(tok.clone());
+        cum_df += df;
+    }
 
     // Append the absent tokens (deterministic token order), charged nothing.
     let mut absent: Vec<Tk> = tokens
@@ -97,6 +117,7 @@ mod tests {
             min_shared,
             typo_damage: 4,
             t_max,
+            df_budget: None,
         }
     }
 
@@ -197,6 +218,41 @@ mod tests {
         let t = toks(&[("a", 1), ("b", 2), ("c", 3)]);
         let kept = select(&t, params(u32::MAX, 12), &snap());
         assert_eq!(kept, ["a", "b", "c"]); // clamped to present.len()
+    }
+
+    #[test]
+    fn df_budget_caps_sigma_df_but_never_drops_below_the_floor() {
+        // Rarest-first dfs 1,2,3,4,5,6,7,8; m=2 → floor F=6. With typo_damage 0 the floor is m=2.
+        let t = toks(&[
+            ("a", 1),
+            ("b", 2),
+            ("c", 3),
+            ("d", 4),
+            ("e", 5),
+            ("f", 6),
+        ]);
+        let p = |budget: Option<u64>| SelectParams {
+            min_shared: 2,
+            typo_damage: 0,
+            t_max: 12,
+            df_budget: budget,
+        };
+        // No budget: all six present tokens kept (Σdf = 21).
+        assert_eq!(select(&t, p(None), &snap()).len(), 6);
+        // Budget 6 keeps the floor (a,b = Σdf 3) then c (Σdf 6); d would push Σdf to 10 > 6.
+        assert_eq!(select(&t, p(Some(6)), &snap()), ["a", "b", "c"]);
+        // A budget below the floor's own Σdf still keeps the whole floor (typo tolerance wins).
+        let floor3 = select(
+            &t,
+            SelectParams {
+                min_shared: 3,
+                typo_damage: 0,
+                t_max: 12,
+                df_budget: Some(1),
+            },
+            &snap(),
+        );
+        assert_eq!(floor3, ["a", "b", "c"], "the floor (m=3) is kept despite the tiny budget");
     }
 
     #[test]

@@ -3,10 +3,11 @@
 //!
 //! A [`Term`] is the identity the interning dictionary keys on. UTF-32 (fixed 4-byte
 //! slots) over UTF-8 gives fixed-offset decode and unambiguous zero-fill — an all-zero
-//! slot means "no codepoint" (U+0000 is normalized out). The script byte is the
-//! most-significant byte, so terms sort script-contiguously *as `u128` values*; stored
-//! as the `u128`'s big-endian bytes, the on-disk BLOB's memcmp order equals the value
-//! order.
+//! slot means "no codepoint", which is sound because [`encode_term`] *rejects* any gram
+//! containing U+0000 (a present codepoint is never 0, so it can't collide with the padding).
+//! The script byte is the most-significant byte, so terms sort script-contiguously *as `u128`
+//! values*; stored as the `u128`'s big-endian bytes, the on-disk BLOB's memcmp order equals
+//! the value order.
 //!
 //! **Storage-format ceiling:** UTF-32 makes "max 3 codepoints" a *storage* ceiling, not
 //! just a tokenizer fact — [`encode_term`] returns `None` for a wider gram (callers
@@ -78,7 +79,16 @@ pub(crate) fn encode_term(gram: &str) -> Option<Term> {
         if n == 3 {
             return None; // storage-format ceiling
         }
-        cps[n] = ch as u32; // U+0000 normalized out, so 0 always means "no codepoint"
+        if ch == '\0' {
+            // U+0000 is the packed layout's "absent codepoint" sentinel, so a gram that
+            // actually contains it is unrepresentable: it would pack identically to its
+            // NUL-padded shorter prefix (`"a"`, `"a\0"`, `"a\0\0"` → the same `Term`),
+            // colliding distinct grams onto one posting. Reject it like the codepoint ceiling
+            // (callers treat `None` as an absent / unindexable gram), so a present codepoint
+            // is never 0 and `0` always means "no codepoint" (audit F3).
+            return None;
+        }
+        cps[n] = ch as u32;
     }
     let script = script_of(gram);
     Some(Term(pack(cps[0], cps[1], cps[2], script)))
@@ -145,6 +155,17 @@ mod tests {
         // Three multi-byte codepoints still fit (the ceiling is codepoints, not bytes).
         assert!(encode_term("日本語").is_some());
         assert!(encode_term("日本語学").is_none());
+    }
+
+    #[test]
+    fn rejects_grams_containing_u0000_so_padding_cannot_collide() {
+        // A gram with U+0000 is unrepresentable: it must not pack to the same Term as its
+        // NUL-padded shorter prefix (the audit-F3 collision). Reject it, like the ceiling.
+        assert!(encode_term("a").is_some());
+        assert!(encode_term("a\u{0}").is_none());
+        assert!(encode_term("a\u{0}\u{0}").is_none());
+        assert!(encode_term("\u{0}").is_none());
+        assert!(encode_term("ab\u{0}").is_none());
     }
 
     #[test]

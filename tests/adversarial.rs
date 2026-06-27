@@ -155,16 +155,12 @@ fn reads_continue_across_a_rebuild_swap() {
             thread::spawn(move || {
                 let mut seen = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    // A read must never error across the swap: the rename keeps the same
-                    // table names/shape so rusqlite re-prepares transparently, and
-                    // read_retry absorbs any transient SQLITE_SCHEMA/BUSY. And because the
-                    // token is in BOTH corpora, every consistent read finds it — the swap is
-                    // complete-old or complete-new, never partial.
-                    let hits = idx
-                        .reader()
-                        .unwrap()
-                        .search("persistent token", SearchOpts::new(10))
-                        .unwrap();
+                    // A read racing the swap may surface a retryable Error::Busy (a dictionary
+                    // generation skew) — the library does NOT sleep to retry internally; the
+                    // caller does (search_retrying, on a fresh reader). Because the token is in
+                    // BOTH corpora, every consistent read finds it — the swap is complete-old or
+                    // complete-new, never partial.
+                    let hits = search_retrying(&idx, "persistent token", 10);
                     assert!(
                         !hits.is_empty(),
                         "the always-present token vanished mid-swap"
@@ -196,18 +192,17 @@ fn reads_continue_across_a_rebuild_swap() {
     }
 }
 
-// T6: a reader tolerating dictionary-generation skew during a concurrent rebuild must not
-// spuriously error `Busy`. The skew window equals the writer's in-memory dict reload, whose
-// duration grows with the vocabulary; the reader's retry is now time-bounded (not a fixed
-// attempt count), so a slow reload still settles. This probe runs readers against repeated
-// rebuilds over a larger vocabulary and asserts no spurious busy.
+// T6 / OD1 (no library sleeps): a search racing a concurrent rebuild's dictionary reload may
+// hit a generation skew. The library must NOT sleep/spin to retry internally — it surfaces a
+// retryable Error::Busy and the caller backs off. This probe asserts the contract under churn:
+// every search either (a) succeeds with the always-present token, or (b) returns the retryable
+// Error::Busy — NEVER a non-retryable error and NEVER a wrong/empty result; and a caller-side
+// retry (search_retrying) always makes progress.
 //
-// #[ignore]: rebuild churn is slow; run on demand. It can't cheaply reach the
-// millions-of-grams scale where the *old* fixed budget broke, so it guards against future
-// regressions in the retry logic rather than reproducing the original failure.
+// #[ignore]: rebuild churn is slow; run on demand.
 #[test]
 #[ignore = "slow: rebuild churn over a larger vocabulary"]
-fn concurrent_search_under_rebuild_churn_does_not_spuriously_busy() {
+fn concurrent_search_under_rebuild_churn_surfaces_only_retryable_busy() {
     let (idx, _dir) = shared_index();
     // A larger vocabulary: a per-doc unique gram across 2k docs, plus a token present in every
     // generation so a correct read always finds it (complete-old or complete-new, never partial).
@@ -227,7 +222,7 @@ fn concurrent_search_under_rebuild_churn_does_not_spuriously_busy() {
     idx.rebuild(corpus()).unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
-    let busy = Arc::new(AtomicU64::new(0));
+    let busy = Arc::new(AtomicU64::new(0)); // observed for visibility; Busy is allowed, not a failure
     let readers: Vec<_> = (0..4)
         .map(|_| {
             let idx = Arc::clone(&idx);
@@ -235,21 +230,22 @@ fn concurrent_search_under_rebuild_churn_does_not_spuriously_busy() {
             let busy = Arc::clone(&busy);
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
+                    // Raw single attempt, classified to prove the contract.
                     match idx
                         .reader()
-                        .unwrap()
-                        .search("persistent token", SearchOpts::new(10))
+                        .and_then(|r| r.search("persistent token", SearchOpts::new(10)))
                     {
                         Ok(hits) => assert!(
                             !hits.is_empty(),
-                            "the always-present token vanished mid-swap"
+                            "the always-present token vanished mid-swap (wrong result, not Busy)"
                         ),
-                        // A skew that doesn't settle within the budget is retryable, not fatal.
                         Err(trifle::Error::Busy(_)) => {
                             busy.fetch_add(1, Ordering::Relaxed);
+                            // The caller owns backoff: a fresh-reader retry must succeed.
+                            assert!(!search_retrying(&idx, "persistent token", 10).is_empty());
                         }
                         Err(e) => {
-                            panic!("unexpected non-retryable error under rebuild churn: {e:?}")
+                            panic!("non-retryable error under rebuild churn (must be Busy): {e:?}")
                         }
                     }
                 }
@@ -263,9 +259,10 @@ fn concurrent_search_under_rebuild_churn_does_not_spuriously_busy() {
     for r in readers {
         r.join().unwrap();
     }
-    let busy = busy.load(Ordering::Relaxed);
-    assert_eq!(
-        busy, 0,
-        "the time-bounded retry must not spuriously Busy at this vocabulary (saw {busy})"
+    // Busy is permitted (the no-sleep contract); we only require the run completed with no
+    // non-retryable error and no wrong result. Report the count for visibility.
+    eprintln!(
+        "rebuild-churn probe: {} retryable Busy events (all recovered)",
+        busy.load(Ordering::Relaxed)
     );
 }

@@ -82,6 +82,7 @@ pub mod store;
 pub mod tokenize;
 
 mod dict;
+mod hash;
 mod model;
 mod postings;
 mod schema;
@@ -90,8 +91,8 @@ mod select;
 mod term;
 mod welford;
 
+use crate::hash::{FxHashMap, FxHashSet};
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -121,8 +122,11 @@ const TYPO_DAMAGE: u32 = 4;
 const DEFAULT_T_MAX: usize = 12;
 /// Default `D` — df-doublings per IDF weight step in the overlap counter.
 const DEFAULT_WEIGHT_STEP: f64 = 1.0;
-/// Buckets in the per-query band-spread histogram (the [`Stats`] weight-step hint).
-const HINT_BUCKETS: usize = 13;
+/// Buckets in the per-query band-spread histogram (the [`Stats`] weight-step hint). 33 × 0.5 =
+/// 16.5 df-doublings of range (a df ratio up to ~92 000:1), so a realistic rare-vs-common query
+/// band doesn't saturate the top bucket and cap the suggested `D` (audit F-r2). Beyond that the
+/// top bucket still absorbs the tail; a streaming quantile (T14) is the durable sharpening.
+const HINT_BUCKETS: usize = 33;
 /// Width of each band-spread histogram bucket, in df-doublings (`log2` units).
 const HINT_BUCKET_WIDTH: f64 = 0.5;
 
@@ -525,19 +529,22 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     }
 
     /// Record one query's band-spread (`log2(df_max/df_min)` over its present postings) into
-    /// the in-memory histogram that backs the [`Stats`] weight-step hint. A no-op for a query
-    /// with no present postings. Cheap: one `log2` + one atomic increment per query.
+    /// the in-memory histogram that backs the [`Stats`] weight-step hint. Cheap: one `log2` +
+    /// one atomic increment. Only a query with **≥ 2** present postings is sampled — a band
+    /// needs two endpoints, and a single-posting query (spread 0) would only bias the suggested
+    /// `D` toward the floor without informing the weighting (audit F-r1).
     fn observe_band_spread(&self, present: &[(&str, &RoaringBitmap)]) {
-        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        let (mut lo, mut hi, mut n) = (u64::MAX, 0u64, 0u32);
         for (_, bm) in present {
             let df = bm.len();
             if df > 0 {
                 lo = lo.min(df);
                 hi = hi.max(df);
+                n += 1;
             }
         }
-        if hi == 0 {
-            return; // no present postings — nothing to sample
+        if n < 2 {
+            return; // no measurable band (0 or 1 present posting) — not an informative sample
         }
         let spread = (hi as f64 / lo.max(1) as f64).log2();
         let bucket = ((spread / HINT_BUCKET_WIDTH) as usize).min(HINT_BUCKETS - 1);
@@ -549,6 +556,12 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     /// samples would bias the [`weight_step_hint`](Self::weight_step_hint) (audit T15). A
     /// [`compact`](Self::compact) deliberately does **not** call this — a fold leaves every df
     /// unchanged, so its samples stay valid.
+    ///
+    /// The reset is **best-effort** under concurrent reads: a reader on the pre-rebuild snapshot
+    /// can land one stale sample just after the zeroing (lock-free `Relaxed` atomics), so "the
+    /// hint is empty immediately after rebuild" holds for a quiescent index but not necessarily
+    /// under live concurrent search. The hint is advisory telemetry, so this is acceptable; a
+    /// hot-path lock to make it exact is not worth it (audit F-r3).
     fn reset_band_spread_hist(&self) {
         for b in &self.band_spread_hist {
             b.store(0, Ordering::Relaxed);
@@ -583,8 +596,11 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         Writer::begin(self)
     }
 
-    /// Acquire a [`Reader`] lease for issuing searches. Each search runs under its own
-    /// consistent WAL snapshot; acquire a fresh reader to see newer writes.
+    /// Acquire a [`Reader`] lease for issuing searches. The snapshot is **per search**, not
+    /// per lease: each `search`/`search_batch` opens its own consistent WAL snapshot at call
+    /// time, so a held reader's *next* search observes writes committed since its previous one
+    /// (the lease pins no lifetime snapshot). For one consistent snapshot across several related
+    /// queries, use a single [`search_batch`](Reader::search_batch).
     ///
     /// # Errors
     ///
@@ -596,7 +612,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
 
     /// Acquire a [`SearchSession`] — like a [`Reader`] but holding a **warm** pooled
     /// connection across calls, the right shape for an as-you-type burst (no per-search
-    /// checkout). Drop and re-acquire to see newer writes.
+    /// checkout). The snapshot is still **per search** (each search opens its own on the held
+    /// connection), so newer writes are visible to the next search without re-acquiring.
     ///
     /// # Errors
     ///
@@ -708,7 +725,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         text: &str,
         mut assign: impl FnMut(Term) -> Result<TermId>,
     ) -> Result<(Vec<TermId>, i64)> {
-        let mut distinct: HashSet<T::Token> = HashSet::new();
+        let mut distinct: FxHashSet<T::Token> = FxHashSet::default();
         let mut seg_len: i64 = 0;
         for tok in self.tokenizer.tokenize(text) {
             seg_len += 1;
@@ -718,7 +735,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         for tok in &distinct {
             let term = tok.term().ok_or_else(|| {
                 Error::InvalidInput(format!(
-                    "gram {:?} exceeds the 3-codepoint term-encoding ceiling",
+                    "gram {:?} is not encodable as a term (over the 3-codepoint ceiling, or it \
+                     contains U+0000)",
                     tok.borrow()
                 ))
             })?;
@@ -894,7 +912,7 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
     /// themselves (not strings): the read path resolves and selects in term-space and
     /// stringifies only the tokens that reach the ranker (audit T2 / I10).
     fn distinct_tokens(&self, text: &str) -> Vec<T::Token> {
-        let distinct: HashSet<T::Token> = self.tokenizer.tokenize(text).collect();
+        let distinct: FxHashSet<T::Token> = self.tokenizer.tokenize(text).collect();
         distinct.into_iter().collect()
     }
 
@@ -945,9 +963,9 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         // shadow tables. Three id spaces are reassigned dense (doc, segment, term); the
         // inverted index is keyed by segment id and the dictionary by the gram's packed
         // u128 (stored as the 16-byte big-endian blob).
-        let mut local: HashMap<u128, TermId> = HashMap::new();
+        let mut local: FxHashMap<u128, TermId> = FxHashMap::default();
         let mut next_term: u64 = 1;
-        let mut inverted: HashMap<TermId, RoaringBitmap> = HashMap::new();
+        let mut inverted: FxHashMap<TermId, RoaringBitmap> = FxHashMap::default();
         let mut next_doc: i64 = 1;
         let mut next_seg: i64 = 1;
         let mut total_seg_len: i64 = 0;
@@ -1179,6 +1197,12 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         queries: &[&str],
         opts: &SearchOpts<'_>,
     ) -> Result<Vec<Vec<Match>>> {
+        // Re-check poison on every search, not just at lease acquisition: a `rebuild` whose
+        // post-commit in-memory reload failed can poison the index *while a Reader/SearchSession
+        // is held*, and a caller retrying a held lease on `Error::Busy` must then escalate to
+        // `Corrupt` rather than spin on the generation skew forever (audit FINDING-B). The
+        // caller's clean recovery is to acquire a *fresh* reader on `Busy`.
+        self.check_poisoned()?;
         if queries.is_empty() {
             return Ok(Vec::new());
         }
@@ -1196,8 +1220,8 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
         conn: &Connection,
         ns: &Namespace,
         ids: &[u32],
-    ) -> Result<HashMap<u32, Vec<TermId>>> {
-        let mut out = HashMap::with_capacity(ids.len());
+    ) -> Result<FxHashMap<u32, Vec<TermId>>> {
+        let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         if ids.is_empty() {
             return Ok(out);
         }
@@ -1365,8 +1389,20 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
                 .iter()
                 .map(|(l, t)| (l.as_str(), t.as_str()))
                 .collect();
+            // A document with filterable payload but no segments has no searchable content and
+            // would only create a payload-only ghost doc row — reject it, mirroring the T3
+            // `set_fields` contract (audit F1). An empty document with no payload is a harmless
+            // no-op (handled by `write_doc` below).
+            if segs.is_empty() && !doc.payload.is_empty() {
+                return Err(Error::InvalidInput(
+                    "a document with filterable payload but no segments has no searchable \
+                     content; insert at least one segment before setting filterable fields"
+                        .to_string(),
+                ));
+            }
             w.write_doc(doc.key.clone(), &segs, replace)?;
             if !doc.payload.is_empty() {
+                // `segs` is non-empty here, so `write_doc` materialized the doc row.
                 let ns = w.index.backend.namespace();
                 let conn: &Connection = &w.guard;
                 let did = w
@@ -1381,6 +1417,14 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
 
     /// The shared body of the four insert/upsert methods.
     fn write_doc(&mut self, key: Key, segments: &[(&str, &str)], replace: bool) -> Result<()> {
+        // A document is materialized by its segments, so writing zero segments is the fold of
+        // zero segment-inserts and must be a no-op — never a payload-less "ghost" doc row that
+        // no search can return (audit F1 / §8 batch≡fold-of-single; mirrors the T3 set_fields
+        // contract). `insert_segment`/`upsert_segment` always pass exactly one segment, so this
+        // only short-circuits a caller's empty `insert`/`upsert` slice.
+        if segments.is_empty() {
+            return Ok(());
+        }
         let ns = self.index.backend.namespace();
         let conn: &Connection = &self.guard;
         let stage = self.stage.as_mut().expect("writer stage present");
@@ -1546,8 +1590,10 @@ impl<T: Tokenizer, B: Backend> Drop for Writer<'_, T, B> {
     }
 }
 
-/// A read lease (§8): the surface for searches. Each search runs under its own consistent
-/// WAL snapshot; acquire a fresh reader to observe newer writes.
+/// A read lease (§8): the surface for searches. The snapshot is **per search**, not per lease
+/// — each search opens its own consistent WAL snapshot, so a held reader's next search sees
+/// writes committed since its last (no need to re-acquire). A single
+/// [`search_batch`](Self::search_batch) is the one-snapshot-across-related-queries mechanism.
 pub struct Reader<'a, T: Tokenizer = DefaultTokenizer, B: Backend = Sidecar> {
     index: &'a Index<T, B>,
 }
@@ -1620,7 +1666,7 @@ impl<T: Tokenizer, B: Backend> SearchSession<'_, T, B> {
 /// the segment ids added and removed for that term.
 #[derive(Default)]
 struct TokenChanges {
-    map: HashMap<TermId, (Vec<u32>, Vec<u32>)>,
+    map: FxHashMap<TermId, (Vec<u32>, Vec<u32>)>,
 }
 
 impl TokenChanges {
@@ -1715,6 +1761,49 @@ mod poison_tests {
         idx.rebuild(std::iter::empty()).unwrap();
         assert!(idx.reader().is_ok(), "rebuild cleared the poison");
         assert!(idx.writer().is_ok());
+    }
+
+    /// FINDING-B: a `Reader`/`SearchSession` acquired *before* a poison (a post-commit dict
+    /// reload failure during a concurrent rebuild) must fail its **searches** closed with
+    /// `Corrupt`. The search path re-checks poison on every call (not just at acquisition), so a
+    /// caller retrying a held lease on `Error::Busy` escalates to `Corrupt` instead of looping
+    /// on the generation skew forever.
+    #[test]
+    fn a_held_lease_search_fails_closed_after_a_mid_lease_poison() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx =
+            Index::open_at(&dir.path().join("t.db"), Schema::flat(), Config::default()).unwrap();
+        {
+            let mut w = idx.writer().unwrap();
+            w.insert(1, &[("body", "alpha bravo charlie")]).unwrap();
+            w.commit().unwrap();
+        }
+        // Acquire the leases while healthy (they pass the acquisition-time poison gate).
+        let reader = idx.reader().unwrap();
+        let session = idx.session().unwrap();
+        assert!(
+            !reader
+                .search("alpha bravo", SearchOpts::new(10))
+                .unwrap()
+                .is_empty()
+        );
+
+        // A concurrent rebuild's post-commit in-memory reload fails → poisoned, mid-lease.
+        idx.poisoned.store(true, Ordering::Release);
+
+        // The held leases' searches must now fail CLOSED (Corrupt), not return Ok or loop on Busy.
+        assert!(matches!(
+            reader.search("alpha bravo", SearchOpts::new(10)),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            reader.search_batch(&["alpha bravo"], SearchOpts::new(10)),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            session.search("alpha bravo", SearchOpts::new(10)),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     /// A stranded writer (a `commit()` that committed durably but could not re-`BEGIN`, or a

@@ -86,6 +86,32 @@ impl Default for Harness {
     }
 }
 
+/// Caller-side retry for the library's no-sleeps contract: a search racing a concurrent
+/// `rebuild` can surface a retryable [`trifle::Error::Busy`] (a dictionary-generation skew)
+/// instead of the library blocking the caller's thread to retry. The application owns the
+/// backoff — so the test backs off briefly and retries on a **fresh** reader. A sleep in a
+/// *test* is fine; only library code must never sleep. Panics on any non-retryable error or if
+/// `Busy` never clears.
+pub fn search_retrying(
+    index: &Index<DefaultTokenizer, Sidecar>,
+    query: &str,
+    limit: usize,
+) -> Vec<Match> {
+    for _ in 0..2000 {
+        match index
+            .reader()
+            .and_then(|r| r.search(query, SearchOpts::new(limit)))
+        {
+            Ok(hits) => return hits,
+            Err(trifle::Error::Busy(_)) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => panic!("unexpected non-retryable error from search: {e:?}"),
+        }
+    }
+    panic!("search never cleared Error::Busy within the caller retry budget");
+}
+
 /// The matched doc keys (as integers), in result order.
 pub fn ids(matches: &[Match]) -> Vec<i64> {
     matches.iter().map(|m| m.key.as_i64().unwrap()).collect()

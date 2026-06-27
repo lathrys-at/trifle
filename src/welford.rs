@@ -12,7 +12,7 @@
 //! calibrated truth; whether it helps mixed-script recall is an empirical question (the
 //! benchmark eval), not an assumption. Degenerate classes fall back to raw DF.
 
-use std::collections::HashMap;
+use crate::hash::FxHashMap;
 
 /// Classes with fewer than this many sampled terms fall back to raw DF — too sparse to
 /// normalize. Treated as "not enough data," **not** a Gaussian-validity threshold: Zipf's
@@ -105,7 +105,7 @@ impl ClassStats {
 
     /// Snapshot the given classes' stats for one query (then lock-free).
     pub(crate) fn snapshot_for(&self, classes: impl IntoIterator<Item = u8>) -> ClassSnap {
-        let mut by_class = HashMap::new();
+        let mut by_class = FxHashMap::default();
         for c in classes {
             by_class
                 .entry(c)
@@ -117,7 +117,7 @@ impl ClassStats {
 
 /// A per-query, immutable snapshot of the class stats the query's tokens touch.
 pub(crate) struct ClassSnap {
-    by_class: HashMap<u8, (u64, f64, f64)>, // class -> (n, mean, σ_eff)
+    by_class: FxHashMap<u8, (u64, f64, f64)>, // class -> (n, mean, σ_eff)
 }
 
 impl ClassSnap {
@@ -126,7 +126,7 @@ impl ClassSnap {
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
         ClassSnap {
-            by_class: HashMap::new(),
+            by_class: FxHashMap::default(),
         }
     }
 

@@ -15,11 +15,12 @@
 //! query's survivors, the most-common (least discriminative) gram gets weight 1 and rarer
 //! grams get more, spaced in absolute df-doublings (`log2(df_max/df_i)`). Because IDF *gaps*
 //! are `N`-independent (`log(N/df_i) − log(N/df_j) = log(df_j/df_i)`), this needs no corpus
-//! size, nothing stored, and nothing precomputed — just the survivor df's already fetched for
-//! pruning, and one knob `D` (df-doublings per weight step;
+//! size, nothing stored, and nothing precomputed — just each survivor posting's cardinality
+//! (its df, by the monotonic-id contract — read straight off the in-hand bitmap, not re-fetched)
+//! and one knob `D` (df-doublings per weight step;
 //! [`weight_step`](crate::SearchOpts::weight_step)).
 
-use std::collections::HashMap;
+use crate::hash::FxHashMap;
 use std::rc::Rc;
 
 use roaring::RoaringBitmap;
@@ -260,11 +261,11 @@ pub(crate) fn overlap_search(
     let acc = weighted_overlap(&bitmaps, &weights);
 
     // internal doc id -> its best (highest weighted score, lowest-seg-id) segment.
-    let mut best: HashMap<u32, Survivor> = HashMap::new();
+    let mut best: FxHashMap<u32, Survivor> = FxHashMap::default();
     // Memoized Tier-2 verdict per candidate doc id. The filter is evaluated lazily, scoped to
     // the candidate ids each bucket hydrates (one small `WHERE id IN rarray(...)` per bucket),
     // so its total cost is bounded by the hydrated pool — not the corpus (audit T5 / I12).
-    let mut filter_memo: HashMap<u32, bool> = HashMap::new();
+    let mut filter_memo: FxHashMap<u32, bool> = FxHashMap::default();
     for c in (floor..=max_score).rev() {
         let bucket = count_eq(&acc, c);
         if !bucket.is_empty() {
@@ -346,8 +347,8 @@ fn hydrate_provenance(
     ns: &Namespace,
     ids: &[u32],
     key_shape: KeyShape,
-) -> Result<HashMap<u32, (u32, Key, String)>> {
-    let mut out = HashMap::with_capacity(ids.len());
+) -> Result<FxHashMap<u32, (u32, Key, String)>> {
+    let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
     if ids.is_empty() {
         return Ok(out);
     }

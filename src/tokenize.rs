@@ -44,6 +44,13 @@ pub trait Tokenizer: Send + Sync {
     /// probe a `HashMap<Token, _>` by `&str` and the [`term`](IntoTerm::term) packing the
     /// interning dictionary needs; `Hash + Eq` make it a map key; `Ord` gives selection a
     /// stable tie-break.
+    ///
+    /// `Ord` **must be a total order consistent with `Eq`** (and, for a custom token, ideally
+    /// with its `Borrow<str>` view): selection deduplicates tokens through a hash set, whose
+    /// iteration order is nondeterministic, and recovers a deterministic result *only* because
+    /// it then sorts by `(rarity, Token)`. An `Ord` that returns `Equal` for two `Eq`-distinct
+    /// tokens would let that nondeterministic order leak into results. The built-in tokens
+    /// satisfy this (their `Ord` delegates to `str`).
     type Token: IntoTerm + std::hash::Hash + Eq + Ord + Clone;
 
     /// Tokenize `text` into a lazy stream of grams. May yield duplicates (a repeated gram

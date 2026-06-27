@@ -7,7 +7,7 @@
 //! touches only the small `term.df` and `delta` rows; the big `post.base` is
 //! rewritten only by [`fold`] or a rebuild.
 
-use std::collections::HashMap;
+use crate::hash::FxHashMap;
 use std::rc::Rc;
 
 use roaring::RoaringBitmap;
@@ -47,8 +47,8 @@ pub(crate) fn read_dfs(
     conn: &Connection,
     ns: &Namespace,
     ids: &[TermId],
-) -> Result<HashMap<TermId, i64>> {
-    let mut out = HashMap::with_capacity(ids.len());
+) -> Result<FxHashMap<TermId, i64>> {
+    let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
     if ids.is_empty() {
         return Ok(out);
     }
@@ -69,8 +69,9 @@ pub(crate) fn effective_postings(
     conn: &Connection,
     ns: &Namespace,
     ids: &[TermId],
-) -> Result<HashMap<TermId, RoaringBitmap>> {
-    let mut out: HashMap<TermId, RoaringBitmap> = HashMap::with_capacity(ids.len());
+) -> Result<FxHashMap<TermId, RoaringBitmap>> {
+    let mut out: FxHashMap<TermId, RoaringBitmap> =
+        FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
     if ids.is_empty() {
         return Ok(out);
     }
@@ -139,8 +140,8 @@ pub(crate) fn apply_writes(
     }
     // Batch-load the existing deltas for every touched term-id.
     let arr = id_array(writes.iter().map(|w| w.id));
-    let mut deltas: HashMap<TermId, (RoaringBitmap, RoaringBitmap)> =
-        HashMap::with_capacity(writes.len());
+    let mut deltas: FxHashMap<TermId, (RoaringBitmap, RoaringBitmap)> =
+        FxHashMap::with_capacity_and_hasher(writes.len(), Default::default());
     let load_sql = format!(
         "SELECT id, added, removed FROM {} WHERE id IN rarray(?1)",
         ns.delta()
@@ -606,7 +607,7 @@ mod tests {
     #[test]
     fn write_base_postings_populates_dense_tables() {
         let (conn, ns) = harness();
-        let mut map: HashMap<TermId, RoaringBitmap> = HashMap::new();
+        let mut map: FxHashMap<TermId, RoaringBitmap> = FxHashMap::default();
         map.insert(1, [1u32, 2].into_iter().collect());
         map.insert(2, [3u32].into_iter().collect());
         write_base_postings(

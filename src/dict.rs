@@ -21,7 +21,7 @@
 //! on open/rebuild, maintained incrementally via [`Dictionary::apply_df_changes`]) and
 //! the id→class table both need.
 
-use std::collections::HashMap;
+use crate::hash::FxHashMap;
 use std::sync::{PoisonError, RwLock};
 
 use rusqlite::Connection;
@@ -50,9 +50,9 @@ pub(crate) struct Dictionary {
 }
 
 struct DictInner {
-    map: HashMap<u128, TermId>,
+    map: FxHashMap<u128, TermId>,
     /// id → script-class byte, for maintaining [`ClassStats`] by term-id on writes.
-    class_of: HashMap<TermId, u8>,
+    class_of: FxHashMap<TermId, u8>,
     classes: ClassStats,
     /// The next id to assign (high-water mark), as `u64` so it can represent the
     /// exhausted sentinel `u32::MAX + 1` without wrapping.
@@ -67,8 +67,8 @@ impl Dictionary {
     pub(crate) fn empty() -> Self {
         Dictionary {
             inner: RwLock::new(DictInner {
-                map: HashMap::new(),
-                class_of: HashMap::new(),
+                map: FxHashMap::default(),
+                class_of: FxHashMap::default(),
                 classes: ClassStats::new(),
                 next_id: 1,
                 generation: 0,
@@ -88,8 +88,8 @@ impl Dictionary {
             dict = ns.dict(),
             term = ns.term(),
         );
-        let mut map: HashMap<u128, TermId> = HashMap::new();
-        let mut class_of: HashMap<TermId, u8> = HashMap::new();
+        let mut map: FxHashMap<u128, TermId> = FxHashMap::default();
+        let mut class_of: FxHashMap<TermId, u8> = FxHashMap::default();
         let mut classes = ClassStats::new();
         let mut max_id: u32 = 0;
         {
@@ -139,9 +139,12 @@ impl Dictionary {
     /// Keyed by the term's packed `u128` so the read path resolves straight from a tokenizer
     /// token's [`term()`](crate::IntoTerm::term) — no `Token → String → re-encode` round-trip,
     /// matching what the write path already does (audit T2 / I10).
-    pub(crate) fn resolve_terms(&self, terms: &[Term]) -> (HashMap<u128, TermId>, u64, ClassSnap) {
+    pub(crate) fn resolve_terms(
+        &self,
+        terms: &[Term],
+    ) -> (FxHashMap<u128, TermId>, u64, ClassSnap) {
         let guard = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        let mut out = HashMap::with_capacity(terms.len());
+        let mut out = FxHashMap::with_capacity_and_hasher(terms.len(), Default::default());
         let mut classes_seen: Vec<u8> = Vec::new();
         for t in terms {
             classes_seen.push(t.class());
@@ -172,7 +175,7 @@ impl Dictionary {
             dict: self,
             base_next_id: guard.next_id,
             new: Vec::new(),
-            new_index: HashMap::new(),
+            new_index: FxHashMap::default(),
         }
     }
 
@@ -201,7 +204,7 @@ pub(crate) struct InternStage<'a> {
     base_next_id: u64,
     /// Grams allocated this transaction (key, id), in assignment order.
     new: Vec<(u128, TermId)>,
-    new_index: HashMap<u128, TermId>,
+    new_index: FxHashMap<u128, TermId>,
 }
 
 impl InternStage<'_> {

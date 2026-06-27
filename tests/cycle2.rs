@@ -306,6 +306,80 @@ fn set_fields_requires_an_existing_document() {
     );
 }
 
+// F1 (audit): empty-segment writes must NOT create a ghost doc row — the §8 fold-of-empty is a
+// no-op — and must not back-door the T3 set_fields guard. insert_document with payload-but-no-
+// segments is rejected, mirroring T3. (The insert/upsert family was the sibling path T3 missed.)
+#[test]
+fn empty_segment_writes_create_no_ghost_doc_row() {
+    let h = Harness::with_schema(schema_with_deck(), Config::default());
+    let path = h.db_path();
+    let doc_rows = |p: &std::path::Path| -> i64 {
+        Connection::open(p)
+            .unwrap()
+            .query_row("SELECT count(*) FROM doc", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    // (a) empty insert / upsert / insert_document(no payload) are no-ops — no doc row created.
+    {
+        let mut w = h.index.writer().unwrap();
+        w.insert(1, &[]).unwrap();
+        w.upsert(2, &[]).unwrap();
+        w.insert_document(Document::new(3, vec![])).unwrap();
+        w.commit().unwrap();
+    }
+    assert_eq!(
+        doc_rows(&path),
+        0,
+        "empty-segment writes created ghost doc rows"
+    );
+
+    // (b) insert_document with payload but no segments is rejected (mirrors T3).
+    {
+        let mut w = h.index.writer().unwrap();
+        let err = w
+            .insert_document(
+                Document::new(4, vec![]).with_payload(vec![("deck".into(), Value::Integer(7))]),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, trifle::Error::InvalidInput(_)),
+            "a payload-only document must be rejected, got {err:?}"
+        );
+        w.commit().unwrap();
+    }
+    assert_eq!(
+        doc_rows(&path),
+        0,
+        "a rejected payload-only doc left a ghost row"
+    );
+
+    // (c) the empty-insert back door around the T3 set_fields guard is closed.
+    {
+        let mut w = h.index.writer().unwrap();
+        w.insert(5, &[]).unwrap();
+        let err = w.set_fields(5, &[("deck", Value::Integer(9))]).unwrap_err();
+        assert!(
+            matches!(err, trifle::Error::InvalidInput(_)),
+            "empty insert + set_fields bypassed the T3 guard, got {err:?}"
+        );
+        w.commit().unwrap();
+    }
+    assert_eq!(doc_rows(&path), 0);
+
+    // (d) a real segment still works (sanity).
+    {
+        let mut w = h.index.writer().unwrap();
+        w.insert(6, &[("body", "alpha bravo charlie")]).unwrap();
+        w.commit().unwrap();
+    }
+    assert_eq!(doc_rows(&path), 1);
+    assert!(hit(
+        &h.search("alpha bravo", SearchOpts::new(10)).unwrap(),
+        6
+    ));
+}
+
 // ----- IDF-weighted overlap ranking -----
 
 #[test]

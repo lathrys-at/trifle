@@ -12,9 +12,9 @@
 //! from that query's own tokens and the shared snapshot, so a query in a batch ranks
 //! identically to the same query run alone.
 
+use crate::hash::FxHashMap;
 use std::borrow::Borrow;
-use std::collections::{BTreeSet, HashMap};
-use std::time::{Duration, Instant};
+use std::collections::BTreeSet;
 
 use roaring::RoaringBitmap;
 use rusqlite::Connection;
@@ -34,20 +34,18 @@ use crate::{
     TYPO_DAMAGE, Term, is_retryable, postings, schema,
 };
 
-/// The reader's retry budget for a transient store fault or a dictionary-generation skew
-/// window. The skew window equals the writer's in-memory dictionary reload, whose duration
-/// *grows with the vocabulary*, so the budget is time-bounded rather than a fixed attempt
-/// count — a slow reload still settles instead of spuriously erroring `Busy` at a large vocab
-/// (audit T6). Backoff grows exponentially from [`RETRY_BACKOFF_START`] and is capped at
-/// [`RETRY_BACKOFF_CAP`]; a non-retryable error still returns immediately.
-const RETRY_BUDGET: Duration = Duration::from_secs(2);
-const RETRY_BACKOFF_START: Duration = Duration::from_millis(1);
-const RETRY_BACKOFF_CAP: Duration = Duration::from_millis(50);
-
-/// Sleep the current backoff, then grow it (exponential, capped at [`RETRY_BACKOFF_CAP`]).
-fn backoff_sleep(backoff: &mut Duration) {
-    std::thread::sleep(*backoff);
-    *backoff = (*backoff * 2).min(RETRY_BACKOFF_CAP);
+/// Map a transient store fault to a retryable [`Error::Busy`] (the single "retry me" signal the
+/// caller backs off on); pass every other error through unchanged. The library **never** sleeps
+/// or spins to retry internally — that would block the caller's thread and bake in a backoff
+/// policy the caller can't override — so it surfaces `Busy` and the application owns the retry
+/// (on a fresh reader), per the no-sleeps contract (audit OD1 / T6).
+fn retryable_to_busy(e: Error) -> Error {
+    match e {
+        Error::Sqlite(se) if is_retryable(&se) => Error::busy(format!(
+            "transient store fault (retry on a fresh reader): {se}"
+        )),
+        other => other,
+    }
 }
 
 /// The distinct tokens per query and the batch-wide distinct **term** set (the resolution
@@ -81,7 +79,7 @@ pub(crate) struct SearchCtx<'a, T: Tokenizer, B: Backend> {
     conn: &'a Connection,
     ns: &'a Namespace,
     /// The query's distinct terms resolved to ids, keyed by the packed term `u128`.
-    resolved: &'a HashMap<u128, TermId>,
+    resolved: &'a FxHashMap<u128, TermId>,
     class_snap: &'a ClassSnap,
     opts: &'a SearchOpts<'a>,
 }
@@ -91,7 +89,7 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
         index: &'a Index<T, B>,
         conn: &'a Connection,
         ns: &'a Namespace,
-        resolved: &'a HashMap<u128, TermId>,
+        resolved: &'a FxHashMap<u128, TermId>,
         class_snap: &'a ClassSnap,
         opts: &'a SearchOpts<'a>,
     ) -> Self {
@@ -284,7 +282,8 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
             "SELECT id, txt, len FROM {} WHERE id IN rarray(?1)",
             self.ns.seg()
         );
-        let mut texts: HashMap<u32, (String, u32)> = HashMap::with_capacity(ids.len());
+        let mut texts: FxHashMap<u32, (String, u32)> =
+            FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         {
             let mut stmt = self.conn.prepare_cached(&sql)?;
             let mut rows = stmt.query(rusqlite::params![arr])?;
@@ -305,10 +304,9 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
     }
 }
 
-/// The retry/snapshot/generation-guard loop on a **given** connection — used by the
+/// The snapshot/generation guard on a **given** connection — used by the
 /// [`Reader`](crate::Reader) (a fresh pooled checkout per call) and by the warm
 /// [`SearchSession`](crate::SearchSession) (a held connection reused across keystrokes).
-/// Retries open a fresh snapshot on the same connection.
 ///
 /// The whole read runs inside one DEFERRED transaction so every statement (token df's,
 /// postings, segment count, hydration) sees a single snapshot; without it they could straddle
@@ -318,63 +316,36 @@ impl<'a, T: Tokenizer, B: Backend> SearchCtx<'a, T, B> {
 ///
 /// Because the term dictionary is in memory (out of the SQL snapshot), the terms are resolved
 /// and the dictionary generation captured atomically, then compared to the snapshot's stored
-/// `dict_generation`. A mismatch means a rebuild/reset reassigned ids relative to this
-/// snapshot — the read retries on a fresh snapshot, where the generations agree. Transient
-/// busy/locked/schema-change faults are retried too. Retries are bounded by an elapsed-time
-/// budget ([`RETRY_BUDGET`]) with exponential backoff, not a fixed count, so a dictionary
-/// reload whose duration scales with the vocabulary still settles (audit T6).
+/// `dict_generation`. A mismatch means a concurrent rebuild/reset reassigned term-ids relative
+/// to this snapshot. The store is consistent — only this reader raced the reassignment — so it
+/// is transient: the library surfaces a retryable [`Error::Busy`] and the **caller** retries on
+/// a fresh reader (which re-resolves against the settled generation). It does **not** sleep or
+/// spin to retry internally; blocking the caller's thread, and baking in a backoff the caller
+/// can't override, is exactly what the no-sleeps contract forbids (audit OD1 / T6). Transient
+/// busy/locked/schema faults are likewise mapped to `Busy` for the caller to back off on.
 pub(crate) fn search_read_on<T: Tokenizer, B: Backend, R>(
     index: &Index<T, B>,
     conn: &Connection,
     all_terms: &[Term],
-    mut f: impl FnMut(&Connection, &Namespace, &HashMap<u128, TermId>, &ClassSnap) -> Result<R>,
+    f: impl FnOnce(&Connection, &Namespace, &FxHashMap<u128, TermId>, &ClassSnap) -> Result<R>,
 ) -> Result<R> {
     let ns = index.backend.namespace();
-    let deadline = Instant::now() + RETRY_BUDGET;
-    let mut backoff = RETRY_BACKOFF_START;
-    loop {
-        let tx = match conn.unchecked_transaction() {
-            Ok(tx) => tx,
-            Err(e) => return Err(Error::from(e)),
-        };
-        // Resolve the terms in memory + capture the generation and per-class stats
-        // snapshot atomically, then read the snapshot's generation to compare.
-        let (resolved, gen_mem, class_snap) = index.dict.resolve_terms(all_terms);
-        let gen_snap = match schema::dict_generation(&tx, ns) {
-            Ok(g) => g,
-            Err(e) => {
-                let retry = Instant::now() < deadline
-                    && matches!(&e, Error::Sqlite(se) if is_retryable(se));
-                drop(tx);
-                if retry {
-                    backoff_sleep(&mut backoff);
-                    continue;
-                }
-                return Err(e);
-            }
-        };
-        if gen_snap != gen_mem {
-            // A rebuild/reset reassigned ids between the in-memory capture and this
-            // snapshot — retry on a fresh snapshot on the same connection.
-            drop(tx);
-            if Instant::now() >= deadline {
-                // The store is consistent; only the in-memory dictionary raced a
-                // concurrent rebuild's id-reassignment. This is transient — a fresh
-                // reader resolves against the settled generation — so surface it as
-                // retryable, NOT Corrupt (which would wrongly imply an unrepairable store).
-                return Err(Error::busy(
-                    "dictionary generation skew did not settle within the retry budget; retry on a fresh reader",
-                ));
-            }
-            backoff_sleep(&mut backoff);
-            continue;
-        }
-        match f(&tx, ns, &resolved, &class_snap) {
-            Err(Error::Sqlite(e)) if Instant::now() < deadline && is_retryable(&e) => {
-                drop(tx);
-                backoff_sleep(&mut backoff);
-            }
-            other => return other,
-        }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| retryable_to_busy(Error::from(e)))?;
+    // Resolve the terms in memory + capture the generation and per-class stats snapshot
+    // atomically, then read the snapshot's generation (the tx's first statement, which pins the
+    // WAL snapshot) to compare.
+    let (resolved, gen_mem, class_snap) = index.dict.resolve_terms(all_terms);
+    let gen_snap = schema::dict_generation(&tx, ns).map_err(retryable_to_busy)?;
+    if gen_snap != gen_mem {
+        // A concurrent rebuild/reset reassigned term-ids vs this snapshot — surface as
+        // retryable (NOT Corrupt: the store is the consistent new generation); the caller
+        // retries on a fresh reader, where the generations agree.
+        return Err(Error::busy(
+            "dictionary generation skew: a concurrent rebuild reassigned term-ids; retry on a \
+             fresh reader",
+        ));
     }
+    f(&tx, ns, &resolved, &class_snap).map_err(retryable_to_busy)
 }

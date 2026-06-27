@@ -13,7 +13,7 @@
 //! document→segment hierarchy. `flat()` and `chunked()` are ergonomic front-ends that
 //! both lower to the same engine.
 
-use std::collections::HashSet;
+use crate::hash::FxHashSet;
 
 use rusqlite::types::Value;
 
@@ -255,9 +255,12 @@ pub enum Filter {
     /// `params`, never format values into it); and it **couples you to trifle's column
     /// names**. Advanced and may break across versions — prefer the structured variants.
     Sql {
-        /// The SQL predicate fragment, with `?` placeholders for `params`.
+        /// The SQL predicate fragment. Use **anonymous `?` placeholders** for `params` (in
+        /// order) — **not** numbered `?N`. The fragment is spliced after an internal
+        /// candidate-scoping parameter, so a numbered `?1` would collide with it and fail with
+        /// a parameter-count error; anonymous `?` are renumbered correctly (audit F2).
         fragment: String,
-        /// The bound parameters, in placeholder order.
+        /// The bound parameters, in `?`-placeholder order.
         params: Vec<Value>,
     },
     /// Both sub-filters.
@@ -453,7 +456,7 @@ pub struct Match {
 pub struct Schema {
     key_shape: KeyShape,
     /// Declared text-field labels (all stored + indexed).
-    fields: HashSet<String>,
+    fields: FxHashSet<String>,
     /// Whether labels not explicitly declared are accepted (`flat()`); `false` rejects them.
     default_text: bool,
     /// Declared filterable fields (Tier 2): materialized as indexed `doc` columns, in
@@ -567,9 +570,9 @@ impl SchemaBuilder {
         // Every schema-derived name is interpolated into DDL / WHERE, so validate it as a
         // safe identifier (the new injection surface).
         crate::store::validate_ident(&key_name)?;
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         seen.insert(key_name.clone());
-        let mut fields = HashSet::new();
+        let mut fields = FxHashSet::default();
         for name in &self.fields {
             crate::store::validate_ident(name)?;
             if !seen.insert(name.clone()) {

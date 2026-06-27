@@ -313,6 +313,83 @@ fn rebuild_preserves_filterable_payload() {
     assert!(!hit(&deck7, 2), "the NULL-deck doc is excluded by deck=7");
 }
 
+// C3-WP1: rebuild must honor the no-ghost invariant — skip a segment-less document, and reject
+// a payload-only one, so it can't materialize a ghost doc row a later insert would inherit
+// (the C2-RA-1 leak via the rebuild create path).
+#[test]
+fn rebuild_skips_empty_and_rejects_payload_only_documents() {
+    use trifle::FilterType;
+    use trifle::rusqlite::types::Value;
+    let mk_schema = || {
+        Schema::chunked()
+            .text("body")
+            .filterable("deck", FilterType::Int)
+            .build()
+            .unwrap()
+    };
+
+    // (a) a segment-less document WITH payload is rejected (no payload-only ghost row).
+    {
+        let h = Harness::with_schema(mk_schema(), Config::default());
+        let err = h
+            .index
+            .rebuild(vec![
+                Document::new(1, vec![("body".into(), "alpha bravo".into())]),
+                Document::new(2, vec![]).with_payload(vec![("deck".into(), Value::Integer(3))]),
+            ])
+            .unwrap_err();
+        assert!(
+            matches!(err, trifle::Error::InvalidInput(_)),
+            "payload-only rebuild doc must be rejected, got {err:?}"
+        );
+    }
+
+    // (b) a segment-less document with NO payload is skipped; the rest build; no ghost.
+    {
+        let h = Harness::with_schema(mk_schema(), Config::default());
+        h.index
+            .rebuild(vec![
+                Document::new(1, vec![("body".into(), "alpha bravo charlie".into())]),
+                Document::new(2, vec![]), // empty → skipped
+            ])
+            .unwrap();
+        assert_eq!(
+            h.index.stats().unwrap().segments,
+            1,
+            "only the non-empty document built"
+        );
+        assert!(finds(&h, "alpha bravo", 1));
+        assert!(
+            !finds(&h, "alpha bravo", 2),
+            "the skipped empty doc is absent"
+        );
+    }
+}
+
+// C3-1: rebuild with duplicate keys fails fast with a clear InvalidInput (not an opaque, late
+// UNIQUE-constraint error), and leaves the live index intact.
+#[test]
+fn rebuild_rejects_duplicate_keys() {
+    let h = Harness::new();
+    h.put(1, "field", "f", "preexisting live content");
+    let err = h
+        .index
+        .rebuild(vec![
+            doc(7, "body", "delta echo foxtrot"),
+            doc(7, "body", "golf hotel india"), // duplicate key 7
+        ])
+        .unwrap_err();
+    assert!(
+        matches!(err, trifle::Error::InvalidInput(_)),
+        "duplicate rebuild key must be InvalidInput, got {err:?}"
+    );
+    // The failed rebuild rolled back; the live index is intact and usable.
+    assert!(
+        finds(&h, "preexisting live", 1),
+        "live index survived the failed rebuild"
+    );
+}
+
 #[test]
 fn rebuild_on_an_empty_corpus_empties_and_stays_usable() {
     let h = Harness::new();

@@ -1000,7 +1000,36 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                 "INSERT INTO {}(id, tokens) VALUES(?1, ?2)",
                 ns.fwd_shadow()
             ))?;
+            let mut seen_keys: FxHashSet<Key> = FxHashSet::default();
             for doc in corpus {
+                // A segment-less document must not materialize a (payload-only) ghost doc row —
+                // the same no-ghost invariant the incremental path enforces (F1/T3/C2-WP1), which
+                // rebuild's own create path must honor too or a later insert reuses the ghost and
+                // inherits its stale payload (C2-RA-1 via rebuild — audit C3-WP1). Skip an empty
+                // document (no id allocated, dense space stays contiguous); reject a payload-only
+                // one, mirroring the incremental contract.
+                if doc.segments.is_empty() {
+                    if !doc.payload.is_empty() {
+                        return Err(Error::InvalidInput(format!(
+                            "rebuild corpus document with key {:?} has filterable payload but no \
+                             segments (no searchable content); every document needs at least one \
+                             segment",
+                            doc.key
+                        )));
+                    }
+                    continue;
+                }
+                // rebuild reassigns a dense id per document, so a duplicate key is a caller error;
+                // fail fast with a clear message naming the key, rather than the opaque, late
+                // `UNIQUE constraint failed: doc.key` the shadow swap would otherwise raise after
+                // building the whole index (audit C3-1).
+                if !seen_keys.insert(doc.key.clone()) {
+                    return Err(Error::InvalidInput(format!(
+                        "duplicate key {:?} in the rebuild corpus; each document must have a \
+                         unique key",
+                        doc.key
+                    )));
+                }
                 let doc_id = next_doc;
                 next_doc += 1;
                 let mut doc_params: Vec<Value> = Vec::with_capacity(2 + filt_cols.len());

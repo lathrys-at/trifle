@@ -3,7 +3,7 @@
 //! strong invariants checked after **every** op.
 //!
 //! This is the one deliberately expensive integration test. The oracle is the model of
-//! expected state — `key -> {label -> text}`, mirroring trifle's v0.2 document/segment
+//! expected state — `key -> {label -> text}`, mirroring trifle's document/segment
 //! model — and the invariants are the ones an independent model can verify without
 //! reimplementing ranking:
 //!

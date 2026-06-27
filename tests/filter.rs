@@ -38,7 +38,7 @@ fn key_in_rarray_restricts_to_an_allowed_set() {
 #[test]
 fn anonymous_placeholder_binds_alongside_the_scope_param() {
     // `txt LIKE ?` is an anonymous placeholder; it must bind correctly even though trifle appends
-    // the candidate-scope param after the fragment (the F3 audit-footgun fix).
+    // the candidate-scope param after the fragment.
     let h = fixture();
     let pat = "%fox%";
     let params: Vec<&dyn ToSql> = vec![&pat];

@@ -8,10 +8,9 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-# CRoaring (SIMD) backend. Permissive `^2.6` per the dependency policy: trifle keeps MSRV 1.85
-# (croaring 2.6 has no MSRV floor), a consumer's MSRV-aware resolver lands each on the right
-# croaring for its toolchain. 2.7+ requires Rust 1.95. croaring views the `roaring`-crate's own
-# portable bytes zero-copy (byte-identical format) — no storage migration.
+# CRoaring (SIMD). Permissive `^2.6` to keep MSRV 1.85: croaring 2.6 has no MSRV floor, while
+# 2.7+ requires Rust 1.95, so a consumer's MSRV-aware resolver lands each on the right croaring
+# for its toolchain. The engine views stored portable bytes zero-copy.
 croaring = "2.6"
 
 [lints]

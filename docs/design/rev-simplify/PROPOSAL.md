@@ -108,7 +108,8 @@ pub struct Counter {
 impl Counter {
     /// Weight each posting by per-query df rarity (df = posting cardinality, by the monotonic-id
     /// contract; knob `D = weight_step`), then accumulate the weighted bit-sliced counter.
-    /// `O(k·log k)` bitmap ops, INDEPENDENT of posting cardinality (the flatness claim).
+    /// `O(k·log k)` bitmap ops; the op COUNT is cardinality-independent (wall-clock sublinear,
+    /// flat in the dense bitmap-container regime — validated by the spike, not "independent of size").
     pub fn build(postings: Vec<RoaringBitmap>, weight_step: f64, min_shared: u32) -> Self;
 
     /// Build with explicit per-posting weights (escape hatch for a caller-supplied idf, e.g.
@@ -153,10 +154,14 @@ walk would terminate **before yielding a valid result** — a *missing* result o
 query (wrong, not merely "missing-then-self-healing"). Documenting "use weights ≥ 1" is
 insufficient; the engine enforces it.
 
-### Flatness — preserved and sharpened
+### Flatness — preserved and sharpened (claim refined by the v0.3 spike)
 
-- **Build** stays `O(k·log k)` roaring ops, each sublinear in cardinality (`popcount(w) ≤ 2`
-  ripples per posting for `w ∈ 1..=4`) — independent of posting size.
+- **Build** stays `O(k·log k)` roaring ops (`popcount(w) ≤ 2` ripples per posting for
+  `w ∈ 1..=4`). The spike (`crates/trifle-overlap/examples/flatness.rs`) showed the precise
+  invariant: the **operation count** is cardinality-independent, so wall-clock is *sublinear* in
+  the sparse/array-container regime (and *flat* in the dense bitmap-container regime), pulling
+  away from a naive per-id counter as postings densify (up to ~16× sparse, ~160× dense). It is
+  **not** literally "independent of posting size" — the old `rank.rs` comment overclaimed.
 - **Bucket walk** skips unreachable scores: precompute `reachable[floor..=max_score]` by DP over
   `weights` (≤ 48 entries) so `count_eq` runs only for achievable subset-sums of `{1,2,3,4}`,
   not every integer — fewer plane clones.
@@ -533,7 +538,7 @@ ratio. On the **control-plane** surface the brief targets (`lib`+`model`+`rank`+
 | 4 | monotonic id + shadow swap | preserved (rebuild reassigns seg+term ids; unique index on `(key,label)`) |
 | 5 | drift-reset | preserved (schema fingerprint drops payload/columns from its inputs) |
 | 6 | no sleeps / `Error::Busy` | preserved (no `busy_timeout`, no internal retry; stream surfaces `Busy`) |
-| 7 | flatness | preserved + sharpened (reachable-bucket skip; engine benchable in isolation) |
+| 7 | flatness | preserved + sharpened (reachable-bucket skip; engine benchable in isolation). Spike refined the claim: op-count is cardinality-independent; wall-clock sublinear (sparse) / flat (dense), not "independent of size" |
 | 8 | single tokenizer | preserved (unchanged) |
 
 ---

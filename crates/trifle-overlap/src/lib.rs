@@ -76,6 +76,10 @@ pub struct Counter {
     /// skip weighted scores no candidate can hold (subset-sums of `{weights}`), cutting
     /// `count_eq` calls. Indexed `0..=max_score`.
     reachable: Vec<bool>,
+    /// True iff every weight is exactly 1 (a common collapsed-tier query). Then weighted score
+    /// **equals** raw overlap for every id, so the walk can take `overlap = score` directly and
+    /// skip the per-id `raw_overlap` `contains` probes — the walk's dominant cost.
+    all_weight_one: bool,
 }
 
 impl Counter {
@@ -143,6 +147,7 @@ impl Counter {
             hi += w;
         }
 
+        let all_weight_one = weights.iter().all(|&w| w == 1);
         Counter {
             postings,
             planes,
@@ -150,6 +155,7 @@ impl Counter {
             floor,
             max_score,
             reachable,
+            all_weight_one,
         }
     }
 
@@ -162,6 +168,7 @@ impl Counter {
             cur_score: 0,
             bucket: Vec::new(),
             pos: 0,
+            scratch: RoaringBitmap::new(),
         }
     }
 
@@ -179,7 +186,14 @@ impl Counter {
             while w.pos < w.bucket.len() {
                 let id = w.bucket[w.pos];
                 w.pos += 1;
-                let overlap = self.raw_overlap(id);
+                // When all weights are 1, weighted score == raw overlap, and the walk only
+                // visits c >= floor, so every id in the bucket clears the floor — no `contains`
+                // probes needed. Otherwise fall back to the exact raw-overlap count.
+                let overlap = if self.all_weight_one {
+                    w.cur_score
+                } else {
+                    self.raw_overlap(id)
+                };
                 if overlap >= self.floor {
                     return Some(Scored {
                         id,
@@ -196,11 +210,12 @@ impl Counter {
                 if !self.reachable[c as usize] {
                     continue; // no subset of weights sums to c — count_eq would be empty
                 }
-                let bucket = count_eq(&self.planes, c);
-                if !bucket.is_empty() {
+                count_eq_into(&mut w.scratch, &self.planes, c);
+                if !w.scratch.is_empty() {
                     w.cur_score = c;
-                    w.bucket = bucket.iter().collect(); // ascending (bitmap order)
                     w.pos = 0;
+                    w.bucket.clear(); // reuse the Vec allocation
+                    w.bucket.extend(w.scratch.iter()); // ascending (bitmap order)
                     refilled = true;
                     break;
                 }
@@ -252,10 +267,14 @@ pub struct Walk {
     next_c: i64,
     /// The weighted score of the bucket currently being drained.
     cur_score: u32,
-    /// The ids of `cur_score`'s bucket (ascending), being drained.
+    /// The ids of `cur_score`'s bucket (ascending), being drained. Reused across buckets (the
+    /// `Vec` allocation is kept, only `clear`ed) to avoid per-bucket allocation.
     bucket: Vec<u32>,
     /// The drain position within `bucket`.
     pos: usize,
+    /// Reused output bitmap for `count_eq_into`, so the walk allocates its working bitmap once
+    /// rather than once per bucket.
+    scratch: RoaringBitmap,
 }
 
 /// The owning iterator returned by [`Counter::stream`].
@@ -328,31 +347,47 @@ fn add_weighted(acc: &mut Vec<RoaringBitmap>, posting: &RoaringBitmap, w: u32) {
     }
 }
 
-/// The ids whose bit-sliced count is exactly `c`: AND the planes `c` has set, then subtract
-/// every plane it has clear — an id survives iff its plane membership is exactly `c`'s bit
-/// pattern. `c == 0` selects nothing.
-fn count_eq(acc: &[RoaringBitmap], c: u32) -> RoaringBitmap {
-    if c == 0 {
-        return RoaringBitmap::new();
+/// Write into `out` (reusing its allocation) the ids whose bit-sliced count is exactly `c`:
+/// intersect the planes `c` has set, then subtract every plane it has clear — an id survives iff
+/// its plane membership is exactly `c`'s bit pattern. `c == 0` selects nothing.
+///
+/// Two cheap wins over the naive form: the intersection starts from the **smallest-cardinality**
+/// set-bit plane (so the working set shrinks fastest), and both the AND and ANDNOT loops
+/// **early-exit** the moment the result empties (a common case deep in the walk).
+fn count_eq_into(out: &mut RoaringBitmap, acc: &[RoaringBitmap], c: u32) {
+    // A count of 0, or one whose highest set bit is beyond the planes, cannot exist.
+    if c == 0 || 32 - c.leading_zeros() > acc.len() as u32 {
+        out.clear();
+        return;
     }
-    // A count whose highest set bit is beyond the planes cannot exist.
-    if 32 - c.leading_zeros() > acc.len() as u32 {
-        return RoaringBitmap::new();
+    // Base = the smallest-cardinality set-bit plane.
+    let mut base: Option<usize> = None;
+    for (b, plane) in acc.iter().enumerate() {
+        if (c >> b) & 1 == 1 && base.is_none_or(|cur| plane.len() < acc[cur].len()) {
+            base = Some(b);
+        }
     }
-    let set: Vec<usize> = (0..acc.len()).filter(|&b| (c >> b) & 1 == 1).collect();
-    let Some((&first, rest)) = set.split_first() else {
-        return RoaringBitmap::new();
+    let Some(base) = base else {
+        out.clear();
+        return;
     };
-    let mut out = acc[first].clone();
-    for &b in rest {
-        out &= &acc[b];
+    out.clone_from(&acc[base]);
+    for (b, plane) in acc.iter().enumerate() {
+        if b != base && (c >> b) & 1 == 1 {
+            *out &= plane;
+            if out.is_empty() {
+                return;
+            }
+        }
     }
     for (b, plane) in acc.iter().enumerate() {
         if (c >> b) & 1 == 0 {
-            out -= plane;
+            *out -= plane;
+            if out.is_empty() {
+                return;
+            }
         }
     }
-    out
 }
 
 #[cfg(test)]

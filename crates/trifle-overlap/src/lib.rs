@@ -292,12 +292,28 @@ pub fn tier_weights(cardinalities: &[u64], weight_step: f64) -> Vec<u32> {
 /// Add `w` copies of `posting` into the bit-sliced planes `acc` (weighted accumulation): inject
 /// a carry at each set bit of `w` and ripple it up (XOR = sum bit, AND = carry). Cost is
 /// `popcount(w)` ripples — for `w ∈ 1..=4` that is `≤ 2`.
+///
+/// The first ripple level XORs the **borrowed** `posting` straight into the plane and derives the
+/// carry-out from the pre-XOR intersection — so the hot weight-1 path costs one AND + one
+/// XOR-assign and **no clone of `posting`** (the old code cloned it into a mutable carry). The
+/// carry that propagates to higher planes is the intersection, which is typically far smaller
+/// than the posting (often empty), so only it is materialized.
 fn add_weighted(acc: &mut Vec<RoaringBitmap>, posting: &RoaringBitmap, w: u32) {
+    if posting.is_empty() {
+        return; // contributes nothing at any weight
+    }
     let mut bit = 0u32;
     while (w >> bit) != 0 {
         if (w >> bit) & 1 == 1 {
-            let mut carry = posting.clone();
-            let mut level = bit as usize;
+            let start = bit as usize;
+            while acc.len() <= start {
+                acc.push(RoaringBitmap::new());
+            }
+            // First level: carry-out = already-set AND incoming, then XOR the borrowed posting in.
+            // (Inlining the old loop's first iteration, but XOR-ing `&posting` instead of a clone.)
+            let mut carry = &acc[start] & posting;
+            acc[start] ^= posting;
+            let mut level = start + 1;
             while !carry.is_empty() {
                 while acc.len() <= level {
                     acc.push(RoaringBitmap::new());

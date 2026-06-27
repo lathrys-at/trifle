@@ -230,8 +230,7 @@ impl Counter {
                 if !w.scratch.is_empty() {
                     w.cur_score = c;
                     w.pos = 0;
-                    w.bucket.clear();
-                    w.bucket.extend(w.scratch.iter());
+                    fill_bucket(&mut w.bucket, &w.scratch);
                     refilled = true;
                     break;
                 }
@@ -308,6 +307,26 @@ pub fn tier_weights(cardinalities: &[u64], weight_step: f64) -> Vec<u32> {
             1 + steps.min(3)
         })
         .collect()
+}
+
+/// Materialize `src`'s ids (ascending) into `bucket`, reusing its allocation. Uses croaring's
+/// bulk cursor `read_many` — for a large bucket this fills the `Vec` far faster than per-id
+/// iteration (measured ~1.8× at 200 ids, ~4.5× at 1000); neutral for small buckets. Walk cost is
+/// a small fraction of a shallow top-k query, so this is a deep-pull / large-result win.
+fn fill_bucket(bucket: &mut Vec<u32>, src: &Bitmap) {
+    let card = src.cardinality() as usize;
+    bucket.clear();
+    bucket.resize(card, 0);
+    let mut cursor = src.cursor();
+    let mut filled = 0;
+    while filled < card {
+        let n = cursor.read_many(&mut bucket[filled..]);
+        if n == 0 {
+            break; // exhausted (defensive; one read fills a card-sized buffer)
+        }
+        filled += n;
+    }
+    bucket.truncate(filled);
 }
 
 /// The weighted bit-sliced planes + walk metadata. Returned by [`plan`]; the owned postings (for

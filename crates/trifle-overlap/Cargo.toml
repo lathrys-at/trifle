@@ -3,20 +3,19 @@ name = "trifle-overlap"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Pure IDF-weighted bit-sliced overlap engine for trifle. Roaring-only: no SQL, no provenance, no String."
+description = "IDF-weighted bit-sliced overlap engine for trifle, on the CRoaring (SIMD) backend with zero-copy posting views."
 license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-# The ONLY dependency. The engine cannot name `rusqlite`, `Connection`, `Key`, or any
-# provenance/`String` type — the isolation the design wants is enforced by the dependency
-# graph, not by discipline. (no_std is a future aspiration, contingent on `roaring`.)
-roaring = "0.11"
+# CRoaring (SIMD) backend. Permissive `^2.6` per the dependency policy: trifle keeps MSRV 1.85
+# (croaring 2.6 has no MSRV floor), a consumer's MSRV-aware resolver lands each on the right
+# croaring for its toolchain. 2.7+ requires Rust 1.95. croaring views the `roaring`-crate's own
+# portable bytes zero-copy (byte-identical format) — no storage migration.
+croaring = "2.6"
 
 [lints]
 workspace = true
 
-# A dependency-free flatness benchmark (run with --release): demonstrates that candidate
-# generation is O(k·log k) bitmap ops, independent of posting cardinality, vs a naive counter.
 [[example]]
 name = "flatness"

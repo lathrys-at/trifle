@@ -15,6 +15,13 @@ All numbers below are from throwaway probes (`/tmp/bsi-probe`, `roaring` 0.11.4,
 median of thousands of iters, clone baselines subtracted). They are *relative* signals on this
 machine, not absolute SLAs.
 
+**Where the time goes (real-engine split, k=12, shallow top-10, floor=2):** build is **~100%** of
+per-query cost; the walk is negligible — a shallow top-10 over a sparse rarest-first selection
+issues **one** `count_eq` (the planted high-overlap head fills the top bucket), 4 plane ops, and
+~120 `contains` probes (10 yielded ids × k), at ~0.12 µs/probe. So **every systems lever that is
+not the build is chasing single-digit percent**; the build is the sparse array-container merges of
+§1. (Deep pulls walk more buckets and shift this — see §2.)
+
 ---
 
 ## TL;DR — the honest headline

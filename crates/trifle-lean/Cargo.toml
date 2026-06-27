@@ -12,7 +12,8 @@ trifle-overlap = { path = "../trifle-overlap" }
 # `array` registers the rarray vtab used for batched `WHERE id IN rarray(?)` reads and for the
 # caller's `key IN rarray(?)` filter mode.
 rusqlite = { version = "0.37", features = ["bundled", "array"] }
-roaring = "0.11"
+# CRoaring backend (matches trifle-overlap). Permissive `^2.6`, MSRV 1.85.
+croaring = "2.6"
 
 [lints]
 workspace = true

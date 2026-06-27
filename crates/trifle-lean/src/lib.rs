@@ -5,7 +5,7 @@
 //!
 //! - **Flattened single `seg` table** (`id, key, label, txt`) — no `doc` table, so the
 //!   no-ghost invariant is trivially true (§3.1).
-//! - The storage layer feeds owned roaring postings into [`trifle_overlap::Counter`] and exposes
+//! - The storage layer feeds croaring postings into [`trifle_overlap::Counter`] and exposes
 //!   a **lazy [`CandidateStream`]** that owns the connection + the counter with **no
 //!   self-referential lifetime** — achieved by issuing `BEGIN`/`ROLLBACK` manually on the owned
 //!   connection and *never storing a `Transaction` object* (the trap that would otherwise force
@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Mutex;
 
-use roaring::RoaringBitmap;
+use croaring::Bitmap;
 use rusqlite::types::Value;
 use rusqlite::{Connection, ToSql};
 use trifle_overlap::{Counter, Scored};
@@ -94,7 +94,7 @@ pub struct LeanIndex {
     /// trigram → term id.
     dict: Mutex<HashMap<String, u32>>,
     /// term id → the seg ids containing that trigram (the owned roaring inverted index).
-    postings: Mutex<HashMap<u32, RoaringBitmap>>,
+    postings: Mutex<HashMap<u32, Bitmap>>,
     next_seg: Mutex<u32>,
 }
 
@@ -144,20 +144,20 @@ impl LeanIndex {
         for gram in distinct_trigrams(text) {
             let next = dict.len() as u32 + 1;
             let tid = *dict.entry(gram).or_insert(next);
-            postings.entry(tid).or_default().insert(seg_id);
+            postings.entry(tid).or_default().add(seg_id);
         }
         Ok(())
     }
 
     /// Resolve a query to its selected (rarest-first) postings, owned for the engine.
-    fn select_postings(&self, query: &str, t_max: usize) -> Vec<RoaringBitmap> {
+    fn select_postings(&self, query: &str, t_max: usize) -> Vec<Bitmap> {
         let dict = self.dict.lock().unwrap();
         let postings = self.postings.lock().unwrap();
         // distinct query trigrams → (term id, df) for the ones present in the corpus.
         let mut present: Vec<(u32, u64)> = distinct_trigrams(query)
             .into_iter()
             .filter_map(|g| dict.get(&g).copied())
-            .filter_map(|tid| postings.get(&tid).map(|bm| (tid, bm.len())))
+            .filter_map(|tid| postings.get(&tid).map(|bm| (tid, bm.cardinality())))
             .collect();
         // rarest-first (smallest df), deterministic tie-break by term id.
         present.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
@@ -173,7 +173,7 @@ impl LeanIndex {
     /// self-referential lifetime, because it never stores a `Transaction` object.
     pub fn candidates(&self, query: &str, opts: SearchOpts) -> Result<CandidateStream<'_>> {
         let postings = self.select_postings(query, opts.t_max);
-        let counter = Counter::build(postings, opts.weight_step, opts.min_shared);
+        let counter = Counter::build(&postings, opts.weight_step, opts.min_shared);
         let guard = self.conn.lock().unwrap();
         guard.execute_batch("BEGIN DEFERRED")?; // pin a snapshot for the stream's life
         let walk = counter.walk();

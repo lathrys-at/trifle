@@ -1,0 +1,24 @@
+# EXPERIMENTAL, QUARANTINED bench — NOT part of the trifle workspace.
+#
+# Its own [workspace] table makes it a standalone workspace so the C-FFI `croaring`
+# dependency never enters the main `cargo build`/`cargo-deny` graph (trifle-overlap stays
+# pure-Rust / roaring-only). Run explicitly:
+#   cargo run --manifest-path crates/croaring-bsi-bench/Cargo.toml --release
+[workspace]
+
+[package]
+name = "croaring-bsi-bench"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A/B bench: croaring SIMD + zero-copy Portable views vs roaring for the BSI overlap build."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# Pinned: 2.7+ requires Rust 1.95 (> trifle MSRV 1.85). 2.6.0 builds on 1.85.
+croaring = "=2.6.0"
+roaring = "0.11"
+
+[profile.release]
+opt-level = 3

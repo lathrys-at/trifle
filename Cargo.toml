@@ -1,5 +1,8 @@
 [workspace]
 members = ["benchmarks", "crates/trifle-overlap", "crates/trifle-lean"]
+# Quarantined experimental bench (own [workspace]); keeps the C-FFI croaring dep out of the
+# main build / cargo-deny graph. Run via its own manifest path.
+exclude = ["crates/croaring-bsi-bench"]
 
 # Shared lint bar, inherited by every workspace member (incl. the benchmark crate).
 [workspace.lints.rust]

@@ -3,14 +3,20 @@
 //!
 //! Every token resolves to `(base ∪ added) \ removed`, always fresh — the delta is
 //! written in the same transaction as the segment, so a read needs no freshness
-//! gate and no decode step (an owned roaring posting *is* the bitmap). A write
+//! gate and no decode step (an owned croaring posting *is* the bitmap). A write
 //! touches only the small `term.df` and `delta` rows; the big `post.base` is
 //! rewritten only by [`fold`] or a rebuild.
+//!
+//! Bitmaps are [`croaring::Bitmap`] (CRoaring/SIMD) throughout. Blobs are the
+//! **portable** serialization — byte-identical to the old `roaring`-crate format, so an
+//! existing store reads back unchanged — and an effective posting is handed straight to
+//! the [`trifle_overlap`] engine with no re-serialization.
 
 use crate::hash::FxHashMap;
+use std::io;
 use std::rc::Rc;
 
-use roaring::RoaringBitmap;
+use croaring::{Bitmap, Portable};
 use rusqlite::Connection;
 use rusqlite::types::Value;
 
@@ -18,16 +24,22 @@ use crate::dict::TermId;
 use crate::error::{Error, Result};
 use crate::store::Namespace;
 
-/// Serialize a roaring bitmap to its on-disk blob form.
-pub(crate) fn serialize(bm: &RoaringBitmap) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(bm.serialized_size());
-    bm.serialize_into(&mut buf).map_err(Error::Posting)?;
-    Ok(buf)
+/// Serialize a bitmap to its on-disk blob form (CRoaring **portable** format —
+/// byte-identical to the legacy `roaring`-crate blobs). Infallible (allocates).
+pub(crate) fn serialize(bm: &Bitmap) -> Vec<u8> {
+    bm.serialize::<Portable>()
 }
 
-/// Deserialize a roaring bitmap from its on-disk blob form.
-pub(crate) fn deserialize(bytes: &[u8]) -> Result<RoaringBitmap> {
-    RoaringBitmap::deserialize_from(bytes).map_err(Error::Posting)
+/// Deserialize a bitmap from its on-disk blob form. A malformed blob is an internal
+/// invariant violation (trifle wrote the bytes it is reading back), surfaced as
+/// [`Error::Posting`] rather than panicked.
+pub(crate) fn deserialize(bytes: &[u8]) -> Result<Bitmap> {
+    Bitmap::try_deserialize::<Portable>(bytes).ok_or_else(|| {
+        Error::Posting(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "corrupt portable roaring blob",
+        ))
+    })
 }
 
 /// An `Rc`'d carray of term-ids for an `IN rarray(?1)` bind — one prepared statement
@@ -69,8 +81,8 @@ pub(crate) fn effective_postings(
     conn: &Connection,
     ns: &Namespace,
     ids: &[TermId],
-) -> Result<FxHashMap<TermId, RoaringBitmap>> {
-    let mut out: FxHashMap<TermId, RoaringBitmap> =
+) -> Result<FxHashMap<TermId, Bitmap>> {
+    let mut out: FxHashMap<TermId, Bitmap> =
         FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
     if ids.is_empty() {
         return Ok(out);
@@ -127,9 +139,8 @@ pub(crate) struct TermWrite<'a> {
 /// base posting. Each `writes` entry must name a distinct term-id and honor the
 /// [`TermWrite`] monotonic-id contract.
 ///
-/// Returns the `(term-id, old_df, new_df)` of every touched term, so the caller can
-/// maintain the per-class document-frequency statistics (the live df is the single
-/// source of truth those accumulators derive from).
+/// Returns the `(term-id, old_df, new_df)` of every touched term (a signal a caller may
+/// fold into auxiliary statistics; the live df is the single source of truth).
 pub(crate) fn apply_writes(
     conn: &Connection,
     ns: &Namespace,
@@ -140,7 +151,7 @@ pub(crate) fn apply_writes(
     }
     // Batch-load the existing deltas for every touched term-id.
     let arr = id_array(writes.iter().map(|w| w.id));
-    let mut deltas: FxHashMap<TermId, (RoaringBitmap, RoaringBitmap)> =
+    let mut deltas: FxHashMap<TermId, (Bitmap, Bitmap)> =
         FxHashMap::with_capacity_and_hasher(writes.len(), Default::default());
     let load_sql = format!(
         "SELECT id, added, removed FROM {} WHERE id IN rarray(?1)",
@@ -156,7 +167,7 @@ pub(crate) fn apply_writes(
             deltas.insert(id, (deserialize(&added)?, deserialize(&removed)?));
         }
     }
-    // Old df per touched term-id (the value the class stats move *from*).
+    // Old df per touched term-id.
     let touched: Vec<TermId> = writes.iter().map(|w| w.id).collect();
     let old_dfs = read_dfs(conn, ns, &touched)?;
     let mut changes: Vec<(TermId, i64, i64)> = Vec::with_capacity(writes.len());
@@ -193,11 +204,11 @@ pub(crate) fn apply_writes(
         let id_param = w.id as i64;
         let (mut added, mut removed) = deltas.remove(&w.id).unwrap_or_default();
         for &id in w.remove {
-            removed.insert(id);
+            removed.add(id);
             added.remove(id);
         }
         for &id in w.add {
-            added.insert(id);
+            added.add(id);
             removed.remove(id);
         }
         let df_delta = w.add.len() as i64 - w.remove.len() as i64;
@@ -211,8 +222,8 @@ pub(crate) fn apply_writes(
         } else {
             upsert.execute(rusqlite::params![
                 id_param,
-                serialize(&added)?,
-                serialize(&removed)?
+                serialize(&added),
+                serialize(&removed)
             ])?;
         }
     }
@@ -278,7 +289,7 @@ pub(crate) fn fold(conn: &Connection, ns: &Namespace) -> Result<FoldStats> {
             })?;
         let mut bm = match base_blob {
             Some(b) => deserialize(&b)?,
-            None => RoaringBitmap::new(),
+            None => Bitmap::new(),
         };
         let (added_blob, removed_blob): (Vec<u8>, Vec<u8>) =
             delta_sel.query_row([id_param], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -287,9 +298,9 @@ pub(crate) fn fold(conn: &Connection, ns: &Namespace) -> Result<FoldStats> {
         let removed = deserialize(&removed_blob)?;
 
         bm |= &added;
-        let before = bm.len();
+        let before = bm.cardinality();
         bm -= &removed;
-        stats.ids_purged += before - bm.len();
+        stats.ids_purged += before - bm.cardinality();
 
         if bm.is_empty() {
             // Drop the emptied base posting; the token's `df` is already 0 (the write
@@ -298,7 +309,7 @@ pub(crate) fn fold(conn: &Connection, ns: &Namespace) -> Result<FoldStats> {
             // dropped — term-ids are permanent until a rebuild reassigns them.
             base_del.execute([id_param])?;
         } else {
-            base_upsert.execute(rusqlite::params![id_param, serialize(&bm)?])?;
+            base_upsert.execute(rusqlite::params![id_param, serialize(&bm)])?;
         }
         delta_del.execute([id_param])?;
         stats.tokens_folded += 1;
@@ -321,7 +332,7 @@ pub(crate) fn write_base_postings<'a>(
     conn: &Connection,
     post_table: &str,
     term_table: &str,
-    postings: impl Iterator<Item = (TermId, &'a RoaringBitmap)>,
+    postings: impl Iterator<Item = (TermId, &'a Bitmap)>,
 ) -> Result<()> {
     let post_sql = format!("INSERT INTO {post_table}(id, base) VALUES(?1, ?2)");
     let term_sql = format!("INSERT INTO {term_table}(id, df) VALUES(?1, ?2)");
@@ -331,8 +342,8 @@ pub(crate) fn write_base_postings<'a>(
         if bm.is_empty() {
             continue;
         }
-        post_stmt.execute(rusqlite::params![id as i64, serialize(bm)?])?;
-        term_stmt.execute(rusqlite::params![id as i64, bm.len() as i64])?;
+        post_stmt.execute(rusqlite::params![id as i64, serialize(bm)])?;
+        term_stmt.execute(rusqlite::params![id as i64, bm.cardinality() as i64])?;
     }
     Ok(())
 }
@@ -384,8 +395,8 @@ mod tests {
 
     #[test]
     fn bitmap_blob_round_trips() {
-        let bm: RoaringBitmap = [1u32, 5, 100, 70_000].into_iter().collect();
-        let blob = serialize(&bm).unwrap();
+        let bm: Bitmap = [1u32, 5, 100, 70_000].into_iter().collect();
+        let blob = serialize(&bm);
         assert_eq!(deserialize(&blob).unwrap(), bm);
     }
 
@@ -607,7 +618,7 @@ mod tests {
     #[test]
     fn write_base_postings_populates_dense_tables() {
         let (conn, ns) = harness();
-        let mut map: FxHashMap<TermId, RoaringBitmap> = FxHashMap::default();
+        let mut map: FxHashMap<TermId, Bitmap> = FxHashMap::default();
         map.insert(1, [1u32, 2].into_iter().collect());
         map.insert(2, [3u32].into_iter().collect());
         write_base_postings(

@@ -1,8 +1,12 @@
 [workspace]
-members = ["benchmarks", "crates/trifle-overlap", "crates/trifle-lean"]
-# Quarantined experimental bench (own [workspace]); keeps the C-FFI croaring dep out of the
-# main build / cargo-deny graph. Run via its own manifest path.
-exclude = ["crates/croaring-bsi-bench"]
+members = ["crates/trifle-overlap", "crates/trifle-lean"]
+# `benchmarks/` is temporarily excluded: its harness is built around the removed `Effort`
+# rerank-pool sweep, the `Shared` backend, and the `Ranker` trait, so it does not compile against
+# the rev-v0.3 streaming API. Reworking it (rerank becomes a caller-side `take(pool)` over
+# `candidates`; bench `trifle-overlap` directly; the `dfsweep` eval) is a tracked follow-up — see
+# docs/design/rev-simplify/HANDOFF-integration.md. `croaring-bsi-bench` is the quarantined A/B
+# (its own [workspace]); run both via their own manifest paths.
+exclude = ["crates/croaring-bsi-bench", "benchmarks"]
 
 # Shared lint bar, inherited by every workspace member (incl. the benchmark crate).
 [workspace.lints.rust]
@@ -43,8 +47,14 @@ tracing = ["dep:tracing"]
 # whole id list to one prepared `WHERE id IN rarray(?1)` statement (batched
 # provenance hydration), avoiding a temp btree on the page-cache mutex.
 rusqlite = { version = "0.37", features = ["bundled", "array"] }
-# The owned inverted index: one base+delta roaring posting per token.
-roaring = "0.11"
+# The IDF-weighted bit-sliced overlap engine (Layer 1): postings -> scored candidate ids.
+trifle-overlap = { path = "crates/trifle-overlap" }
+# CRoaring (SIMD) bitmaps — the bitmap library EVERYWHERE: the owned inverted index
+# (one base+delta posting per token) AND the engine. The croaring portable format is
+# byte-identical to the old `roaring`-crate blobs, so storage needs no migration, and an
+# effective posting feeds the engine directly with no serialize-bridge. Permissive `^2.6`
+# (MSRV 1.85; 2.7+ needs Rust 1.95). See docs/design/rev-simplify/HANDOFF-integration.md.
+croaring = "2.6"
 # NFC/NFD normalization so canonically-equivalent forms match (configurable per
 # tokenizer; the default folds to NFC + lowercase).
 unicode-normalization = "0.1"

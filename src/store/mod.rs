@@ -1,19 +1,15 @@
-//! Storage backends — where connections come from and how trifle's tables are
-//! named.
+//! Storage: the owned-sidecar SQLite store and how trifle's tables are named.
 //!
-//! trifle's SQLite surface is small and self-contained, so *where connections come
-//! from* (an owned file, or a database the caller owns) is abstracted behind
-//! [`Backend`]. With no virtual tables, that surface is plain tables and BLOBs,
-//! which makes the backend genuinely portable.
+//! trifle owns its own SQLite file ([`Sidecar`]): it sets WAL / `mmap` / pragmas and runs a
+//! single mutexed write connection plus a pool of read-only connections that, under WAL, run
+//! concurrently with the writer. The whole surface is plain tables and BLOBs (no virtual
+//! tables beyond the `carray`/`rarray` helper), so it is genuinely portable.
 //!
-//! - [`Sidecar`] (default, recommended) — trifle opens and owns its own file,
-//!   sets WAL / `mmap` / pragmas, and runs a single-writer connection plus a
-//!   read-only pool. The caller passes a path.
-//! - [`Shared`] (opt-in) — trifle's tables live, [namespaced](Namespace), inside a
-//!   database the caller owns; the caller supplies connection access. Only for a
-//!   hard co-location requirement.
+//! (rev v0.3 dropped the `Backend` trait and the `Shared` backend: the only store is the
+//! concrete [`Sidecar`], so no generic `B` threads through the public types. Co-locating
+//! trifle's tables inside a caller-owned database is recovered, if needed, by an `ATTACH`
+//! on the read-connection factory rather than a second backend.)
 
-use std::ops::{Deref, DerefMut};
 use std::sync::Once;
 
 use rusqlite::Connection;
@@ -21,56 +17,10 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 mod pool;
-mod shared;
 mod sidecar;
 
 pub use pool::ReadConn;
-pub use shared::Shared;
 pub use sidecar::Sidecar;
-
-/// Abstracts where trifle's SQLite connections come from and how its tables are
-/// named.
-///
-/// trifle is single-writer: [`write`](Backend::write) hands out the one exclusive
-/// writer, [`read`](Backend::read) a pooled read-only connection that (under WAL)
-/// runs concurrently with the writer and with other readers.
-///
-/// # Implementing a custom backend
-///
-/// trifle never opens connections itself, so it cannot run any per-connection setup for
-/// you. **Every connection handed out by [`write`](Backend::write) and [`read`](Backend::read)
-/// must already have the `carray`/`rarray` virtual table registered** — call
-/// [`register_carray`] in your connection factory (the built-in [`Sidecar`]/[`Shared`]
-/// backends do exactly this). Without it, the first batched read (`WHERE id IN rarray(?1)`,
-/// used by hydration and delete) fails with `no such function: rarray`. The connections must
-/// also be WAL-mode for the single-writer / concurrent-reader contract to hold.
-pub trait Backend: Send + Sync {
-    /// The exclusive write connection guard; derefs to the [`Connection`].
-    type WriteGuard<'a>: DerefMut<Target = Connection>
-    where
-        Self: 'a;
-    /// A pooled read-only connection guard; derefs to the [`Connection`].
-    type ReadGuard<'a>: Deref<Target = Connection>
-    where
-        Self: 'a;
-
-    /// Acquire the exclusive write connection. Blocks until the writer is free. The
-    /// returned connection must already have `carray`/`rarray` registered (see the trait
-    /// docs and [`register_carray`]).
-    fn write(&self) -> Result<Self::WriteGuard<'_>>;
-
-    /// Acquire a pooled read-only connection. The returned connection must already have
-    /// `carray`/`rarray` registered (see the trait docs and [`register_carray`]).
-    fn read(&self) -> Result<Self::ReadGuard<'_>>;
-
-    /// The table-naming namespace for this backend.
-    fn namespace(&self) -> &Namespace;
-}
-
-// NOTE (audit I9): a `Backend::init_conn` hook was removed in v0.2 — trifle never opens
-// connections itself, so it could never call the hook. The per-connection obligation a custom
-// backend must meet (register `carray`/`rarray`) now lives in the `Backend` trait rustdoc, and
-// `register_carray` (below) is the public helper to satisfy it from a connection factory.
 
 /// One-time, process-global SQLite tuning. Best-effort and behavior-transparent.
 ///
@@ -95,9 +45,8 @@ pub(crate) fn configure_sqlite_perf() {
 /// Register the `carray`/`rarray` virtual table on a connection so a whole id list
 /// binds to one prepared `WHERE id IN rarray(?1)` statement. Idempotent.
 ///
-/// A custom [`Backend`] **must** call this on every connection its `write`/`read` factory
-/// produces (the built-in backends do); otherwise trifle's batched reads fail with
-/// `no such function: rarray`. See the [`Backend`] trait docs.
+/// trifle's batched reads (provenance, hydration, delete) rely on it; [`Sidecar`] calls this
+/// on every connection it opens. Exposed for an embedder wiring an `ATTACH` factory.
 pub fn register_carray(conn: &Connection) -> Result<()> {
     rusqlite::vtab::array::load_module(conn)?;
     Ok(())
@@ -112,9 +61,8 @@ pub fn register_carray(conn: &Connection) -> Result<()> {
 pub struct TableMap {
     /// Key/value metadata: schema/data/tokenizer version stamps, rolling counters.
     pub meta: String,
-    /// One row per document: the internal dense id and the caller's key.
-    pub doc: String,
-    /// One row per indexed segment (id, doc_id, label, snapshot text).
+    /// One row per indexed segment (id, caller key, label, snapshot text, gram length).
+    /// `seg.id` is the roaring posting id. (rev v0.3 folded the former `doc` table here.)
     pub seg: String,
     /// Per-segment forward index: the interned `u32` term-id set of each segment, as a
     /// roaring posting. Read by delete, so delete needs neither the text nor the tokenizer.
@@ -134,10 +82,9 @@ pub struct TableMap {
 
 impl TableMap {
     /// Every persistent table name, in a stable order.
-    fn names(&self) -> [&str; 8] {
+    fn names(&self) -> [&str; 7] {
         [
             &self.meta,
-            &self.doc,
             &self.seg,
             &self.fwd,
             &self.term,
@@ -159,7 +106,6 @@ impl TableMap {
 pub struct Namespace {
     map: TableMap,
     // Derived transient rebuild-shadow names, parallel to the persistent tables.
-    doc_shadow: String,
     seg_shadow: String,
     fwd_shadow: String,
     term_shadow: String,
@@ -192,7 +138,6 @@ impl Namespace {
         let t = |name: &str| format!("{prefix}{name}");
         Namespace::explicit(TableMap {
             meta: t("meta"),
-            doc: t("doc"),
             seg: t("seg"),
             fwd: t("fwd"),
             term: t("term"),
@@ -219,7 +164,6 @@ impl Namespace {
             validate_ident(name)?;
         }
         let ns = Namespace {
-            doc_shadow: format!("{}_shadow", map.doc),
             seg_shadow: format!("{}_shadow", map.seg),
             fwd_shadow: format!("{}_shadow", map.fwd),
             term_shadow: format!("{}_shadow", map.term),
@@ -232,7 +176,6 @@ impl Namespace {
         // can still push its `_shadow` suffix past it, which would only fail at DDL
         // time, far from this call. Validate here so the caller hears it immediately.
         for shadow in [
-            &ns.doc_shadow,
             &ns.seg_shadow,
             &ns.fwd_shadow,
             &ns.term_shadow,
@@ -255,19 +198,16 @@ impl Namespace {
     }
 
     /// Every table name trifle will create under this namespace — the persistent
-    /// tables and the two-per-table rebuild shadows. Useful for a caller's
-    /// collision check or migration tooling.
+    /// tables and the rebuild shadows. Useful for a caller's collision check.
     pub fn table_names(&self) -> impl Iterator<Item = &str> {
         [
             self.map.meta.as_str(),
-            self.map.doc.as_str(),
             self.map.seg.as_str(),
             self.map.fwd.as_str(),
             self.map.term.as_str(),
             self.map.post.as_str(),
             self.map.delta.as_str(),
             self.map.dict.as_str(),
-            self.doc_shadow.as_str(),
             self.seg_shadow.as_str(),
             self.fwd_shadow.as_str(),
             self.term_shadow.as_str(),
@@ -281,9 +221,6 @@ impl Namespace {
     // Accessors used by the schema/postings SQL builders.
     pub(crate) fn meta(&self) -> &str {
         &self.map.meta
-    }
-    pub(crate) fn doc(&self) -> &str {
-        &self.map.doc
     }
     pub(crate) fn seg(&self) -> &str {
         &self.map.seg
@@ -302,9 +239,6 @@ impl Namespace {
     }
     pub(crate) fn dict(&self) -> &str {
         &self.map.dict
-    }
-    pub(crate) fn doc_shadow(&self) -> &str {
-        &self.doc_shadow
     }
     pub(crate) fn seg_shadow(&self) -> &str {
         &self.seg_shadow
@@ -328,7 +262,7 @@ impl Namespace {
 
 /// Validate a SQL identifier: ASCII, starts with a letter or `_`, then letters /
 /// digits / `_`, length-bounded, and not a reserved `sqlite_` name. Used for table
-/// names and for schema-derived column names (key / field labels).
+/// names and for schema-derived names (the key field label).
 pub(crate) fn validate_ident(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::namespace("empty table name"));
@@ -391,7 +325,7 @@ mod tests {
         let names: Vec<&str> = ns.table_names().collect();
         assert!(names.contains(&"seg"));
         assert!(names.contains(&"seg_shadow"));
-        assert_eq!(names.len(), 15); // 8 persistent + 7 shadows
+        assert_eq!(names.len(), 13); // 7 persistent + 6 shadows
     }
 
     #[test]
@@ -406,7 +340,6 @@ mod tests {
     fn explicit_rejects_collisions() {
         let map = TableMap {
             meta: "a".into(),
-            doc: "g".into(),
             seg: "a".into(), // collides with meta
             fwd: "b".into(),
             term: "c".into(),
@@ -422,7 +355,6 @@ mod tests {
         // `seg` derives `seg_shadow`; naming another table `seg_shadow` collides.
         let map = TableMap {
             meta: "meta".into(),
-            doc: "doc".into(),
             seg: "seg".into(),
             fwd: "seg_shadow".into(),
             term: "term".into(),

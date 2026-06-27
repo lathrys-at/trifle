@@ -6,6 +6,20 @@ cross-review in this directory: `proposal-{core,storage,filter}.md`,
 
 **Baseline:** `feat/rev-v0.2`, 8,052 src LOC across 18 modules.
 
+> **Superseded on one point (post-spike, ren):** this document describes the engine as
+> `roaring`-only. The spike + perf rounds moved the engine to the **`croaring`** crate (CRoaring
+> SIMD), and the integration uses **croaring everywhere — storage and engine — dropping the
+> `roaring` crate entirely** (byte-identical portable format ⇒ no migration). Wherever this spec
+> says `roaring` / "roaring-only" / lists `roaring` in deps, read **croaring**. See
+> `perf-findings.md` and `HANDOFF-integration.md`.
+>
+> **Also retained (ren):** `welford.rs` + the **per-class multi-script rarity** normalization is
+> **NOT deleted** — it is a key feature. Deletion item #4 (§8) and risk #2 (§11) below, which list
+> it as a benchmark-gated cut, are **overruled**: keep `ClassStats`/`ClassSnap` and the class-aware
+> rarest-first selection. The only v0.3 module deletion is `rank.rs` (engine → `trifle-overlap`).
+> Likewise the **band-spread telemetry + `WeightStepHint`** (deletion #6 / §5) is **retained** — it
+> tunes the weighted-overlap `weight_step` and is not dropped.
+
 ---
 
 ## 0. Executive summary

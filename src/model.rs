@@ -6,12 +6,13 @@
 //! (`Integer`/`Text`/`Blob`), because the key is the one field trifle *compares* (dedup /
 //! replace / delete / return). Everything else is a **text field** (tokenized; its name is
 //! the label returned on a match). Every indexed text field's text is **stored** and is
-//! always returned on a match (and available to a custom ranker); filterable **payload**
-//! columns (Tier 2) are stored separately for filtering only and are never ranked or returned.
+//! always returned on a match.
 //!
-//! A document is a `key` plus a set of named segments (`label → text`) — the two-level
-//! document→segment hierarchy. `flat()` and `chunked()` are ergonomic front-ends that
-//! both lower to the same engine.
+//! A document is a `key` plus a set of named segments (`label → text`). `flat()` and
+//! `chunked()` are ergonomic front-ends that both lower to the same engine.
+//!
+//! (rev v0.3 removed the filterable-payload columns and the `Filter` grammar — filtering is
+//! now an opt-in raw-SQL fragment over the caller's *live* data; see [`SqlFilter`](crate::SqlFilter).)
 
 use crate::hash::FxHashSet;
 
@@ -100,7 +101,7 @@ impl From<Vec<u8>> for Key {
 }
 
 /// The declared shape of the [`Key`] — the one place a SQL type is declared. It picks
-/// the `doc.key` column type and settles comparability (native for int/text, memcmp for
+/// the `seg.key` column type and settles comparability (native for int/text, memcmp for
 /// blob).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyShape {
@@ -130,304 +131,23 @@ impl KeyShape {
     }
 }
 
-/// The declared type of a **filterable** field (Tier 2 of the filtering ladder): it
-/// materializes as a real, indexed `doc` column the search can `WHERE` against. Picks the
-/// column's SQLite affinity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FilterType {
-    /// Integer-affinity column.
-    Int,
-    /// Real-affinity column.
-    Real,
-    /// Text-affinity column.
-    Text,
-    /// A datetime, stored as a **sortable scalar** so the plain `<`/`>`/`=` comparisons
-    /// order chronologically. Sugar for an epoch-`INTEGER` column (the canonical
-    /// encoding); for ISO-8601 strings — which sort chronologically as text — declare
-    /// [`Text`](FilterType::Text) instead. SQLite has no datetime type, so no special
-    /// operators are needed: the sortable encoding *is* the mechanism.
-    Timestamp,
-}
-
-impl FilterType {
-    pub(crate) fn sql_type(self) -> &'static str {
-        match self {
-            FilterType::Int | FilterType::Timestamp => "INTEGER",
-            FilterType::Real => "REAL",
-            FilterType::Text => "TEXT",
-        }
-    }
-    fn code(self) -> u8 {
-        match self {
-            FilterType::Int => 1,
-            FilterType::Real => 2,
-            FilterType::Text => 3,
-            FilterType::Timestamp => 4,
-        }
-    }
-}
-
-/// A comparison operator for a [`Filter`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CmpOp {
-    /// `=`
-    Eq,
-    /// `<>`
-    Ne,
-    /// `<`
-    Lt,
-    /// `<=`
-    Le,
-    /// `>`
-    Gt,
-    /// `>=`
-    Ge,
-}
-
-impl CmpOp {
-    fn sql(self) -> &'static str {
-        match self {
-            CmpOp::Eq => "=",
-            CmpOp::Ne => "<>",
-            CmpOp::Lt => "<",
-            CmpOp::Le => "<=",
-            CmpOp::Gt => ">",
-            CmpOp::Ge => ">=",
-        }
-    }
-}
-
-/// A structured filter over **filterable** fields (Tier 2). Compiles to a parameterized
-/// `WHERE` over the materialized `doc` columns and is applied as a doc-id set
-/// intersection between candidate generation and rerank/hydration (it prunes before
-/// ranking; it does not save the candidate-generation overlap work — that needs a
-/// partition). Only declared-filterable fields are addressable, via this restricted
-/// grammar — never arbitrary SQL.
-#[derive(Clone, Debug)]
-pub enum Filter {
-    /// `field op value`.
-    Cmp {
-        /// The filterable field name.
-        field: String,
-        /// The comparison operator.
-        op: CmpOp,
-        /// The bound value.
-        value: Value,
-    },
-    /// `field IN (values…)`.
-    In {
-        /// The filterable field name.
-        field: String,
-        /// The candidate values.
-        values: Vec<Value>,
-    },
-    /// `field BETWEEN low AND high` (inclusive) — the clean form for a range, including a
-    /// datetime range over a [`Timestamp`](FilterType::Timestamp) field.
-    Between {
-        /// The filterable field name.
-        field: String,
-        /// The inclusive lower bound.
-        low: Value,
-        /// The inclusive upper bound.
-        high: Value,
-    },
-    /// `field IS NULL`.
-    IsNull {
-        /// The filterable field name.
-        field: String,
-    },
-    /// `field LIKE pattern`. **Cost:** a *leading-wildcard* pattern (`"%x"`) forces a full
-    /// scan — the index cannot help — the same hidden cliff as an un-indexed path. Prefer
-    /// an anchored pattern (`"x%"`).
-    Like {
-        /// The filterable field name.
-        field: String,
-        /// The `LIKE` pattern.
-        pattern: String,
-    },
-    /// A raw, parameterized SQL predicate fragment — the escape hatch. It exposes all of
-    /// SQLite's expression language (date functions, arithmetic, …). It is spliced into the
-    /// `WHERE` of a `SELECT … FROM doc`, so the materialized filterable columns are in
-    /// scope; it is **not** sandboxed — a subquery could reference other tables, which is
-    /// why the **fragment must be a trusted constant**, not built from untrusted input.
-    /// **Costs:** *untyped* (a malformed fragment is a runtime error, not a compile error);
-    /// the **fragment is the injection surface** (keep it a constant and bind data through
-    /// `params`, never format values into it); and it **couples you to trifle's column
-    /// names**. Advanced and may break across versions — prefer the structured variants.
-    Sql {
-        /// The SQL predicate fragment. Use **anonymous `?` placeholders** for `params` (in
-        /// order) — **not** numbered `?N`. The fragment is spliced after an internal
-        /// candidate-scoping parameter, so a numbered `?1` would collide with it and fail with
-        /// a parameter-count error; anonymous `?` are renumbered correctly (audit F2).
-        fragment: String,
-        /// The bound parameters, in `?`-placeholder order.
-        params: Vec<Value>,
-    },
-    /// Both sub-filters.
-    And(Box<Filter>, Box<Filter>),
-    /// Either sub-filter.
-    Or(Box<Filter>, Box<Filter>),
-}
-
-impl Filter {
-    /// `field op value`.
-    pub fn cmp(field: impl Into<String>, op: CmpOp, value: impl Into<Value>) -> Filter {
-        Filter::Cmp {
-            field: field.into(),
-            op,
-            value: value.into(),
-        }
-    }
-    /// `field = value`.
-    pub fn eq(field: impl Into<String>, value: impl Into<Value>) -> Filter {
-        Filter::cmp(field, CmpOp::Eq, value)
-    }
-    /// `field IN (values…)`.
-    pub fn in_(field: impl Into<String>, values: impl IntoIterator<Item = Value>) -> Filter {
-        Filter::In {
-            field: field.into(),
-            values: values.into_iter().collect(),
-        }
-    }
-    /// `field BETWEEN low AND high` (inclusive).
-    pub fn between(
-        field: impl Into<String>,
-        low: impl Into<Value>,
-        high: impl Into<Value>,
-    ) -> Filter {
-        Filter::Between {
-            field: field.into(),
-            low: low.into(),
-            high: high.into(),
-        }
-    }
-    /// `field IS NULL`.
-    pub fn is_null(field: impl Into<String>) -> Filter {
-        Filter::IsNull {
-            field: field.into(),
-        }
-    }
-    /// `field LIKE pattern` (mind the leading-wildcard scan cost — see [`Filter::Like`]).
-    pub fn like(field: impl Into<String>, pattern: impl Into<String>) -> Filter {
-        Filter::Like {
-            field: field.into(),
-            pattern: pattern.into(),
-        }
-    }
-    /// A raw parameterized SQL fragment over the filterable columns (the escape hatch —
-    /// see [`Filter::Sql`] for the costs).
-    pub fn sql(fragment: impl Into<String>, params: impl IntoIterator<Item = Value>) -> Filter {
-        Filter::Sql {
-            fragment: fragment.into(),
-            params: params.into_iter().collect(),
-        }
-    }
-    /// Conjoin two filters.
-    pub fn and(self, other: Filter) -> Filter {
-        Filter::And(Box::new(self), Box::new(other))
-    }
-    /// Disjoin two filters.
-    pub fn or(self, other: Filter) -> Filter {
-        Filter::Or(Box::new(self), Box::new(other))
-    }
-
-    /// Compile to a parameterized SQL predicate over `doc` columns, validating every
-    /// referenced field against the schema's filterable set (the injection guard — only
-    /// declared idents reach SQL). Returns the predicate and its bound parameters.
-    pub(crate) fn compile(&self, schema: &Schema) -> Result<(String, Vec<Value>)> {
-        let mut params = Vec::new();
-        let sql = self.build(schema, &mut params)?;
-        Ok((sql, params))
-    }
-
-    fn build(&self, schema: &Schema, params: &mut Vec<Value>) -> Result<String> {
-        match self {
-            Filter::Cmp { field, op, value } => {
-                let col = schema.filter_column(field)?;
-                params.push(value.clone());
-                Ok(format!("\"{col}\" {} ?", op.sql()))
-            }
-            Filter::In { field, values } => {
-                let col = schema.filter_column(field)?;
-                if values.is_empty() {
-                    return Ok("0".to_string()); // empty IN matches nothing
-                }
-                let marks = vec!["?"; values.len()].join(", ");
-                for v in values {
-                    params.push(v.clone());
-                }
-                Ok(format!("\"{col}\" IN ({marks})"))
-            }
-            Filter::Between { field, low, high } => {
-                let col = schema.filter_column(field)?;
-                params.push(low.clone());
-                params.push(high.clone());
-                Ok(format!("\"{col}\" BETWEEN ? AND ?"))
-            }
-            Filter::IsNull { field } => {
-                let col = schema.filter_column(field)?;
-                Ok(format!("\"{col}\" IS NULL"))
-            }
-            Filter::Like { field, pattern } => {
-                let col = schema.filter_column(field)?;
-                params.push(Value::Text(pattern.clone()));
-                Ok(format!("\"{col}\" LIKE ?"))
-            }
-            Filter::Sql {
-                fragment,
-                params: p,
-            } => {
-                // The escape hatch: the fragment is trusted and not field-validated (it is
-                // the injection surface); only its values are parameterized. It is spliced
-                // into a `WHERE` over the `doc` table, so the filterable columns are in
-                // scope — but it is not sandboxed (a subquery could name other tables),
-                // hence the trusted-constant contract on `Filter::Sql`.
-                for v in p {
-                    params.push(v.clone());
-                }
-                Ok(format!("({fragment})"))
-            }
-            Filter::And(a, b) => Ok(format!(
-                "({} AND {})",
-                a.build(schema, params)?,
-                b.build(schema, params)?
-            )),
-            Filter::Or(a, b) => Ok(format!(
-                "({} OR {})",
-                a.build(schema, params)?,
-                b.build(schema, params)?
-            )),
-        }
-    }
-}
-
 /// A document to index: a [`Key`] plus its named segments (`label → text`). Used by
-/// [`rebuild`](crate::Index::rebuild) and the batch insert.
-#[derive(Clone, Debug, PartialEq)]
+/// [`rebuild`](crate::Index::rebuild) and the batch upsert.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
     /// The caller's key — the unit of retrieval and lifecycle.
     pub key: Key,
     /// The document's segments as `(label, text)` pairs; each `label` names a text field.
     pub segments: Vec<(String, String)>,
-    /// Values for the schema's **filterable** fields, as `(field, value)` pairs. Stored
-    /// into the materialized `doc` columns (Tier 2); undeclared names are ignored.
-    pub payload: Vec<(String, Value)>,
 }
 
 impl Document {
-    /// Construct a document with no filterable payload.
+    /// Construct a document.
     pub fn new(key: impl Into<Key>, segments: Vec<(String, String)>) -> Self {
         Document {
             key: key.into(),
             segments,
-            payload: Vec::new(),
         }
-    }
-
-    /// Set the filterable-field payload.
-    pub fn with_payload(mut self, payload: Vec<(String, Value)>) -> Self {
-        self.payload = payload;
-        self
     }
 }
 
@@ -450,8 +170,8 @@ pub struct Match {
 ///
 /// Build with [`Schema::builder`], or the [`flat`](Schema::flat) / [`chunked`](Schema::chunked)
 /// front-ends. The schema persists into `meta` and a **schema fingerprint** folds into the
-/// drift check — so reinterpreting columns (e.g. flipping a field's storage mode) drops the
-/// cache rather than silently serving a mis-indexed store.
+/// drift check — so reinterpreting columns drops the cache rather than silently serving a
+/// mis-indexed store.
 #[derive(Clone, Debug)]
 pub struct Schema {
     key_shape: KeyShape,
@@ -459,9 +179,6 @@ pub struct Schema {
     fields: FxHashSet<String>,
     /// Whether labels not explicitly declared are accepted (`flat()`); `false` rejects them.
     default_text: bool,
-    /// Declared filterable fields (Tier 2): materialized as indexed `doc` columns, in
-    /// declaration order (the order the columns are created).
-    filterable: Vec<(String, FilterType)>,
     fingerprint: u64,
 }
 
@@ -472,7 +189,6 @@ impl Schema {
             key: None,
             fields: Vec::new(),
             default_text: false,
-            filterable: Vec::new(),
         }
     }
 
@@ -501,19 +217,6 @@ impl Schema {
     pub(crate) fn accepts_label(&self, label: &str) -> bool {
         self.default_text || self.fields.contains(label)
     }
-    /// The `doc` column name for a declared filterable `field`, or an error if it is not
-    /// declared filterable (the injection guard for a compiled `WHERE`).
-    pub(crate) fn filter_column(&self, field: &str) -> Result<&str> {
-        self.filterable
-            .iter()
-            .find(|(n, _)| n == field)
-            .map(|(n, _)| n.as_str())
-            .ok_or_else(|| Error::schema(format!("{field:?} is not a filterable field")))
-    }
-    /// The declared filterable fields (name + type), in declaration / column order.
-    pub(crate) fn filterable_columns(&self) -> &[(String, FilterType)] {
-        &self.filterable
-    }
     /// The schema fingerprint (semantic identity), folded into the drift check.
     pub(crate) fn fingerprint(&self) -> u64 {
         self.fingerprint
@@ -525,7 +228,6 @@ pub struct SchemaBuilder {
     key: Option<(String, KeyShape)>,
     fields: Vec<String>,
     default_text: bool,
-    filterable: Vec<(String, FilterType)>,
 }
 
 impl SchemaBuilder {
@@ -536,7 +238,7 @@ impl SchemaBuilder {
     }
 
     /// Declare a text field named `name`. Its text is stored, indexed, and returned on a
-    /// match (and available to a custom ranker).
+    /// match.
     pub fn text(mut self, name: impl Into<String>) -> Self {
         self.fields.push(name.into());
         self
@@ -546,13 +248,6 @@ impl SchemaBuilder {
     /// front-end used by [`Schema::flat`].
     pub fn default_text(mut self) -> Self {
         self.default_text = true;
-        self
-    }
-
-    /// Declare a **filterable** field of the given type (Tier 2). It materializes as an
-    /// indexed `doc` column a search can `WHERE` against via a [`Filter`].
-    pub fn filterable(mut self, name: impl Into<String>, ty: FilterType) -> Self {
-        self.filterable.push((name.into(), ty));
         self
     }
 
@@ -567,8 +262,8 @@ impl SchemaBuilder {
             .key
             .ok_or_else(|| Error::schema("schema has no key field"))?;
 
-        // Every schema-derived name is interpolated into DDL / WHERE, so validate it as a
-        // safe identifier (the new injection surface).
+        // Every schema-derived name is interpolated into DDL, so validate it as a safe
+        // identifier (the injection surface).
         crate::store::validate_ident(&key_name)?;
         let mut seen = FxHashSet::default();
         seen.insert(key_name.clone());
@@ -585,55 +280,27 @@ impl SchemaBuilder {
                 "schema declares no text field and no default — nothing to index",
             ));
         }
-        // Filterable fields become `doc` columns: ident-safe, distinct, and not the
-        // built-in `id`/`key` columns.
-        for (name, _) in &self.filterable {
-            crate::store::validate_ident(name)?;
-            if name == "id" || name == "key" {
-                return Err(Error::schema(format!(
-                    "filterable field {name:?} collides with a built-in doc column"
-                )));
-            }
-            if !seen.insert(name.clone()) {
-                return Err(Error::schema(format!("duplicate field name {name:?}")));
-            }
-        }
 
-        let fingerprint = schema_fingerprint(
-            &key_name,
-            key_shape,
-            &self.fields,
-            self.default_text,
-            &self.filterable,
-        );
+        let fingerprint = schema_fingerprint(&key_name, key_shape, &self.fields, self.default_text);
         Ok(Schema {
             key_shape,
             fields,
             default_text: self.default_text,
-            filterable: self.filterable,
             fingerprint,
         })
     }
 }
 
 /// A stable FNV-1a over a canonical *semantic* encoding of the schema (key name + shape,
-/// the set of text-field names, the open-label default, and the filterable columns) —
-/// **not** column layout (`sqlite_schema` owns structure). The dangerous drift is
-/// same-tables / reinterpreted-columns, which this catches. (`schema-v2`: v0.2 dropped
-/// per-field storage modes — all text fields are stored.)
-fn schema_fingerprint(
-    key_name: &str,
-    key_shape: KeyShape,
-    fields: &[String],
-    default_text: bool,
-    filterable: &[(String, FilterType)],
-) -> u64 {
+/// the set of text-field names, the open-label default) — **not** column layout
+/// (`sqlite_schema` owns structure). The dangerous drift is same-tables /
+/// reinterpreted-columns, which this catches. (`schema-v3`: rev v0.3 removed the
+/// filterable columns from the model and so from this fingerprint.)
+fn schema_fingerprint(key_name: &str, key_shape: KeyShape, fields: &[String], default_text: bool) -> u64 {
     let mut sorted: Vec<&String> = fields.iter().collect();
     sorted.sort();
-    let mut filt: Vec<&(String, FilterType)> = filterable.iter().collect();
-    filt.sort_by(|a, b| a.0.cmp(&b.0));
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"schema-v2");
+    bytes.extend_from_slice(b"schema-v3");
     bytes.extend_from_slice(&(key_name.len() as u64).to_le_bytes());
     bytes.extend_from_slice(key_name.as_bytes());
     bytes.push(key_shape.code());
@@ -642,12 +309,6 @@ fn schema_fingerprint(
     for name in sorted {
         bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
         bytes.extend_from_slice(name.as_bytes());
-    }
-    bytes.extend_from_slice(&(filt.len() as u64).to_le_bytes());
-    for (name, ty) in filt {
-        bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(name.as_bytes());
-        bytes.push(ty.code());
     }
     crate::tokenize::fnv1a_64(&bytes)
 }
@@ -713,77 +374,5 @@ mod tests {
         // The set of indexed fields is semantic identity.
         let c = Schema::chunked().text("front").build().unwrap();
         assert_ne!(a.fingerprint(), c.fingerprint());
-        // A filterable column is semantic identity too.
-        let d = Schema::chunked()
-            .text("front")
-            .text("back")
-            .filterable("deck", FilterType::Int)
-            .build()
-            .unwrap();
-        assert_ne!(a.fingerprint(), d.fingerprint());
-    }
-
-    #[test]
-    fn filter_grammar_compiles_and_validates_fields() {
-        let s = Schema::chunked()
-            .text("body")
-            .filterable("deck", FilterType::Int)
-            .filterable("created", FilterType::Timestamp)
-            .filterable("lang", FilterType::Text)
-            .build()
-            .unwrap();
-
-        // Comparison, range, null, like, in. Column names are double-quoted (keyword-safe).
-        assert_eq!(
-            Filter::eq("deck", Value::Integer(3)).compile(&s).unwrap().0,
-            "\"deck\" = ?"
-        );
-        let (sql, p) = Filter::between("created", Value::Integer(100), Value::Integer(200))
-            .compile(&s)
-            .unwrap();
-        assert_eq!(sql, "\"created\" BETWEEN ? AND ?");
-        assert_eq!(p.len(), 2);
-        assert_eq!(
-            Filter::is_null("lang").compile(&s).unwrap().0,
-            "\"lang\" IS NULL"
-        );
-        assert_eq!(
-            Filter::like("lang", "en%").compile(&s).unwrap().0,
-            "\"lang\" LIKE ?"
-        );
-        assert_eq!(
-            Filter::in_("deck", [Value::Integer(1), Value::Integer(2)])
-                .compile(&s)
-                .unwrap()
-                .0,
-            "\"deck\" IN (?, ?)"
-        );
-
-        // AND / OR nest with parentheses.
-        let nested = Filter::eq("deck", Value::Integer(1)).and(Filter::like("lang", "en%"));
-        assert_eq!(
-            nested.compile(&s).unwrap().0,
-            "(\"deck\" = ? AND \"lang\" LIKE ?)"
-        );
-
-        // The raw SQL hatch is spliced verbatim (parenthesized), values bound.
-        let (sql, p) = Filter::sql(
-            "deck > ? OR lang = ?",
-            [Value::Integer(5), Value::Text("fr".into())],
-        )
-        .compile(&s)
-        .unwrap();
-        assert_eq!(sql, "(deck > ? OR lang = ?)");
-        assert_eq!(p.len(), 2);
-
-        // An undeclared field is rejected (the injection guard).
-        assert!(
-            Filter::eq("not_a_field", Value::Integer(1))
-                .compile(&s)
-                .is_err()
-        );
-
-        // A Timestamp field is an INTEGER column (epoch).
-        assert_eq!(FilterType::Timestamp.sql_type(), "INTEGER");
     }
 }

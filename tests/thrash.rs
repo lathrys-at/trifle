@@ -30,7 +30,6 @@ use std::path::Path;
 
 use proptest::prelude::*;
 use trifle::rusqlite::Connection;
-use trifle::store::Sidecar;
 use trifle::tokenize::DefaultTokenizer;
 use trifle::{Document, SearchOpts};
 
@@ -41,9 +40,9 @@ const WORDS: &[&str] = &[
 ];
 const LABELS: &[&str] = &["a", "b", "c"];
 
-/// `key -> {label -> text}`, mirroring trifle's v0.2 segment model (labels unique per doc).
+/// `key -> {label -> text}`, mirroring trifle's segment model (labels unique per doc).
 type Oracle = BTreeMap<i64, BTreeMap<String, String>>;
-type Idx = trifle::Index<DefaultTokenizer, Sidecar>;
+type Idx = trifle::Index<DefaultTokenizer>;
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -214,7 +213,7 @@ fn check(idx: &Idx, oracle: &Oracle, path: &Path) {
         let Some((_, txt)) = labels.iter().next() else {
             continue;
         };
-        let hits = reader.search(txt, SearchOpts::new(100)).unwrap();
+        let hits = reader.matches(txt, &SearchOpts::new(), 100).unwrap();
         assert!(
             hit(&hits, *doc),
             "a segment's own text must re-find its doc"

@@ -72,8 +72,9 @@ are decision- or benchmark-gated (below).
    trifle exposes independent **work units** the caller schedules (closures, dep-free); any
    `Future`-returning sugar is feature-gated so non-async users pull in nothing. The
    shared-snapshot serial `matches_batch` stays the dep-free convenience.
-2. **Move to croaring: DONE/decided.** croaring is the engine backend (SIMD + zero-copy Portable
-   views over the existing roaring-format blobs, no migration). MSRV 1.85, permissive `^2.6`.
+2. **Move to croaring: DONE/decided.** croaring is the bitmap library **everywhere — storage and
+   engine** (the `roaring` crate is dropped); SIMD + zero-copy Portable views, byte-identical to the
+   old roaring-format blobs ⇒ no migration. MSRV 1.85, permissive `^2.6`.
 3. **Fused half-adder** — open: worth a croaring/SIMD prototype to confirm ~1.5× build before any
    upstream roaring PR. (Re-evaluate with the next agent round on the clean croaring board.)
 4. **Selection Σdf cap** — open: the biggest build lever, but a recall/speed tradeoff in the

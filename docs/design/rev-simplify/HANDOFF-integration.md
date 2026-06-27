@@ -2,8 +2,44 @@
 
 **Read this first.** This is the entry point for the *integration* session that turns the
 proven spike on `feat/lean-trifle-v0.3` into real `trifle`. Written 2026-06-27 at HEAD
-`7023503`. The spike is complete, green, and pushed; **nothing is wired into the root `trifle`
-crate yet** — that is your job.
+`7023503`.
+
+---
+
+## ✅ Integration landed (update, 2026-06-27)
+
+The root `trifle` crate **has been transformed to rev-v0.3** in this worktree (not yet committed).
+What's done and green:
+
+- **croaring everywhere** — `postings.rs` and the engine both use `croaring::Bitmap`; the
+  `roaring` crate is dropped. Byte-identical portable blobs ⇒ no migration. `effective_postings`
+  feeds `Counter::build` directly (no serialize-bridge).
+- **Flattened `doc`→`seg`** (key on `seg`, no `doc` table); `schema.rs` `SCHEMA_VERSION = 4`.
+- **Store trimmed**: `Backend` trait + `Shared` deleted; `Index<T>` holds a concrete `Sidecar`;
+  pool gains the check-in `ROLLBACK` guard.
+- **Engine wired**: `trifle-overlap` is a real dep; `rank.rs` deleted (its math is the engine).
+- **New read surface**: `Reader::matches`/`matches_batch` (eager) + `Reader::candidates` →
+  `CandidateStream` (lazy spine, provenance-only `Candidate`, batched `hydrate`, fuse-on-Err,
+  `present_terms`/`matched_terms`/`n_segments`/`avgdl`/`collect_matches`).
+- **`SqlFilter`** (fragment-first `?{N+1}` binding) replaces the whole `Filter`/`CmpOp`/`FilterType`
+  grammar + `scope`.
+- **3-method write API** (`upsert`/`remove`/`remove_segment`); payload + ghost-row machinery gone.
+- **KEPT (ren overruled the deletion):** `welford.rs` + per-class multi-script rarity, and the
+  band-spread telemetry + `WeightStepHint`.
+- **Tests rewritten** (`basic`/`typo`/`unicode`/`drift`/`lifecycle`/`filter`/`stream`/`thrash`);
+  obsolete files deleted. **All green:** lib 92 + integration 77 (incl. the 400-case proptest) +
+  5 doctests; `clippy --workspace --all-targets -D warnings` and rustdoc `-D warnings` clean.
+- **LOC:** public `trifle` `src/` 8,052 → **6,383** (~1.26×; ~1.34× had the two kept features been
+  cut as the PROPOSAL planned). Tests 3,045 → 1,524 (~2× collapse).
+
+**Deferred (tracked):** (1) **`benchmarks/` is excluded** from the workspace — its `Effort`
+rerank-pool sweep / `Shared` / `Ranker` harness needs a rework against the streaming API (§3, §6.8).
+(2) **`CLAUDE.md`** still describes the old architecture — update it. (3) Post-integration perf
+levers (Σdf cap + `dfsweep`, zero-copy base load), §6.8.
+
+The rest of this document is the original pre-integration plan, kept for the rationale trail.
+
+---
 
 ---
 
@@ -71,9 +107,12 @@ The crown jewel, essentially integration-ready. Design:
   `count_eq_into` scratch reuse, reachable-bucket skip, weight clamp ≥1, `read_many` bucket fill.
 - API: `build`, `build_weighted`, `build_from_blobs`, `build_weighted_from_blobs`, `walk`,
   `advance(&self, &mut Walk)`, `stream`, `tier_weights`. `Scored { id, score, overlap }`.
-- **Integration action:** make the root crate depend on this. Decide whether the real postings
-  store stays `roaring`-crate blobs (engine views them zero-copy — recommended, no migration) or
-  moves to croaring everywhere.
+- **Integration action:** make the root crate depend on this. **DECIDED (ren): croaring
+  everywhere** — the storage posting layer (`postings.rs`) moves to croaring `Bitmap` too and the
+  `roaring` crate is **dropped from trifle's deps**. The croaring portable format is byte-identical
+  to the old roaring blobs, so this is still **no-migration**; and `effective_postings` then yields
+  croaring `Bitmap`s fed straight into `Counter::build` with **no serialize-bridge**. (The earlier
+  "keep roaring storage, view it zero-copy in the engine" recommendation is superseded.)
 
 ### `crates/trifle-lean` — the storage+stream+filter slice (a SPIKE, not production)
 Proves the shape end-to-end; **rewrite against the real store on integration.** Proven:
@@ -86,7 +125,7 @@ Proves the shape end-to-end; **rewrite against the real store on integration.** 
   numbered `?1..?N` and anonymous `?` bind with no collision (the audit-F2 fix; 3 tests cover it).
 - Stream **fuses on first `Err`** (no silent truncation).
 - **Deviations from real trifle (must change on integration):** postings kept **in memory** as
-  croaring `Bitmap`s (real: base+delta roaring blobs in SQLite, fed via `build_from_blobs`); a
+  croaring `Bitmap`s (real: base+delta **croaring** blobs in SQLite, fed via `build`/`build_from_blobs`); a
   single `Mutex<Connection>` (real: the read pool); **append-only** writes (real: replace-on-write
   + delta/compact); a **minimal trigram tokenizer** (real: `NgramTokenizer`); no dict-gen guard,
   no drift/rebuild, no span.
@@ -100,14 +139,22 @@ empirical justification for the croaring move. Useful when prototyping the fused
   (ren's shrike/Anki) is on rustc **1.92**, below croaring 2.7's **1.95** cliff — so croaring is
   pinned at **`^2.6`** (permissive caret; 2.6 has no MSRV floor; 2.7 gives trifle nothing — same
   bundled CRoaring 4.7.1). Test both ends in CI.
-- **croaring is the engine backend** (SIMD ~1.2× + zero-copy views). Accepts a C build dep.
-  Optional pure-Rust-`roaring` fallback feature is *available if wanted* for no-C reach (wasm,
-  cross-compile) — not built; decide at integration.
+- **croaring is the bitmap library everywhere — storage AND engine** (SIMD ~1.2× + zero-copy
+  views). The `roaring` crate is **dropped from trifle's deps**; `postings.rs` stores/reads
+  croaring portable blobs (byte-identical to the old roaring blobs → no migration). Accepts a C
+  build dep. Optional pure-Rust-`roaring` fallback feature is *available if wanted* for no-C reach
+  (wasm, cross-compile) — not built; decide later.
 - **No library-owned threads / no presumed runtime.** Parallelism is **runtime-agnostic**: hand
   the caller dep-free work units; feature-gate any async/futures. rayon REJECTED. See memory
   `no-library-owned-threads`.
 - **No trifle-stored filter columns.** Filter the caller's live data (churn/staleness). Raw-SQL
   fragment over `key IN rarray(?)` / co-located `ATTACH` join.
+- **Keep `welford.rs` + per-class multi-script rarity** (ren): `ClassStats`/`ClassSnap` and the
+  class-aware rarest-first selection are a **key feature**, NOT deleted. This overrules PROPOSAL
+  deletion #4 / §11 risk #2. The only v0.3 module deletion is `rank.rs` (engine → `trifle-overlap`).
+- **Keep the band-spread telemetry + `WeightStepHint`** (ren): the per-query `log2(df_max/df_min)`
+  histogram + `Stats::weight_step_hint` tune the weighted-overlap `weight_step` and stay. This
+  overrules PROPOSAL deletion #6 / §5's "drop weight_step_hint".
 - **Flatten `doc`→`seg`** (no-ghost dissolves). **No sleeps** — surface retryable `Error::Busy`.
 - **Engine is build-bound and ~optimal in pure Rust.** Honest LOC ceiling **~1.5×** whole-crate
   (NOT 2–3×). Don't re-promise 2–3× without the (capability-cutting) tokenizer trim.
@@ -115,12 +162,12 @@ empirical justification for the croaring move. Useful when prototyping the fused
 ## 6. The integration plan (suggested phasing)
 Each phase ships green under the load-bearing lint bar (`-D warnings`, clippy, rustdoc).
 1. **Land `trifle-overlap` as a real workspace member** the root crate depends on. Add `croaring`
-   to the root deps (permissive `^2.6`). Decide roaring-blob-store + zero-copy-view (recommended)
-   vs croaring everywhere.
+   to the root deps (permissive `^2.6`) and **drop `roaring`** — croaring everywhere (DECIDED).
 2. **Rewrite the storage core** to the rev-v0.3 design: flatten `doc`→`seg`; postings as base+delta
-   roaring blobs; feed the engine via `build_from_blobs` (zero-copy for **base-only** terms; a
-   delta'd posting `(base∪added)\removed` is an owned merge — see §7). Keep the existing
-   `postings.rs`/`schema.rs`/`store` machinery where it already satisfies the invariants.
+   **croaring** blobs; `effective_postings` yields croaring `Bitmap`s fed straight into
+   `Counter::build` (no serialize-bridge). Keep the existing `postings.rs`/`schema.rs`/`store`
+   machinery's *shape* (the three-way write split, fold, shadow swap) — only the bitmap type
+   changes from `roaring::RoaringBitmap` to `croaring::Bitmap`.
 3. **Wire the read path:** selection (rarest-first by `term.df`) → engine → per-bucket
    provenance+filter on the snapshot → dedup-by-key → batched hydrate. Preserve the **dict-gen
    guard** (`search_read_on`) and **batch==serial**.
@@ -163,9 +210,9 @@ data_version → drop cache, never migrate). 6. **no sleeps / `Error::Busy`** (b
 NOT literally "independent of posting size"). 8. **single tokenizer** on index+query.
 
 ## 9. Open questions for the integration session
-- **Storage blobs: roaring vs croaring?** The engine views roaring-crate portable blobs zero-copy
-  (byte-identical), so keeping the `roaring`-crate blob store and only adding croaring for the
-  engine is the no-migration path. Or move postings to croaring entirely. Decide.
+- ~~**Storage blobs: roaring vs croaring?**~~ **RESOLVED (ren): croaring everywhere.** `postings.rs`
+  stores/reads croaring portable blobs and the `roaring` crate is dropped. Byte-identical portable
+  format ⇒ no migration; `effective_postings` feeds the engine with no serialize-bridge.
 - **Pure-Rust fallback feature?** A `roaring`-backed engine behind a feature flag for no-C reach
   (wasm/cross-compile) — worth it for "usable by many," or YAGNI? (Roaring impl is in git history.)
 - **`ATTACH` for co-located filter joins** — verify rusqlite 0.37 + the read pool wiring (apply

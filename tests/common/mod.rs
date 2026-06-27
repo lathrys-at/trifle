@@ -1,17 +1,14 @@
-//! Shared integration-test harness: tiny fixtures, opened against a real temp
-//! sidecar file. Kept minimal on purpose — a handful of rows is enough to assert
-//! an invariant; nothing here needs a large corpus.
+//! Shared integration-test harness: tiny fixtures, opened against a real temp sidecar file.
+//! Kept minimal on purpose — a handful of rows is enough to assert an invariant.
 #![allow(dead_code)]
 
 use tempfile::TempDir;
-use trifle::store::Sidecar;
 use trifle::tokenize::DefaultTokenizer;
 use trifle::{Config, Index, Match, Result, Schema, SearchOpts};
 
-/// A temp sidecar index plus the directory that backs it (kept alive alongside the
-/// index — dropping it deletes the files).
+/// A temp sidecar index plus the directory that backs it (dropping it deletes the files).
 pub struct Harness {
-    pub index: Index<DefaultTokenizer, Sidecar>,
+    pub index: Index<DefaultTokenizer>,
     pub dir: TempDir,
 }
 
@@ -37,31 +34,36 @@ impl Harness {
         self.dir.path().join("trifle.db")
     }
 
-    /// Search via a fresh reader lease (convenience for the search-only tests).
-    pub fn search(&self, query: &str, opts: SearchOpts) -> Result<Vec<Match>> {
-        self.index.reader()?.search(query, opts)
+    /// Top-`limit` matches via a fresh reader lease, default options.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Match>> {
+        self.index
+            .reader()?
+            .matches(query, &SearchOpts::new(), limit)
     }
 
-    /// Batch-search via a fresh reader lease.
-    pub fn search_batch(&self, queries: &[&str], opts: SearchOpts) -> Result<Vec<Vec<Match>>> {
-        self.index.reader()?.search_batch(queries, opts)
+    /// Top-`limit` matches with explicit options.
+    pub fn search_opts(&self, query: &str, opts: &SearchOpts<'_>, limit: usize) -> Result<Vec<Match>> {
+        self.index.reader()?.matches(query, opts, limit)
     }
 
-    /// Insert a single segment, keyed by `doc_id` under label `ref_`. The v0.1 `source`
-    /// (the per-(doc,source) replace group) has no v0.2 analogue, so it is ignored;
-    /// callers keep their 4-argument call sites. Uses `upsert`, so a repeated
-    /// `(doc, label)` replaces rather than erroring.
-    pub fn put(&self, doc_id: i64, _source: &str, ref_: &str, text: &str) {
+    /// Batch matches via a fresh reader lease (one shared snapshot).
+    pub fn search_batch(&self, queries: &[&str], limit: usize) -> Result<Vec<Vec<Match>>> {
+        self.index
+            .reader()?
+            .matches_batch(queries, &SearchOpts::new(), limit)
+    }
+
+    /// Upsert one segment, keyed by `doc_id` under `label`, in one committed write.
+    pub fn put(&self, doc_id: i64, label: &str, text: &str) {
         let mut w = self.index.writer().unwrap();
-        w.upsert(doc_id, &[(ref_, text)]).unwrap();
+        w.upsert(doc_id, &[(label, text)]).unwrap();
         w.commit().unwrap();
     }
 
-    /// Insert one doc with multiple `(label, text)` segments in one committed batch
-    /// (errors if any `(doc, label)` already exists).
-    pub fn insert(&self, doc_id: i64, segments: &[(&str, &str)]) {
+    /// Upsert one doc with multiple `(label, text)` segments in one committed batch.
+    pub fn upsert(&self, doc_id: i64, segments: &[(&str, &str)]) {
         let mut w = self.index.writer().unwrap();
-        w.insert(doc_id, segments).unwrap();
+        w.upsert(doc_id, segments).unwrap();
         w.commit().unwrap();
     }
 
@@ -87,20 +89,14 @@ impl Default for Harness {
 }
 
 /// Caller-side retry for the library's no-sleeps contract: a search racing a concurrent
-/// `rebuild` can surface a retryable [`trifle::Error::Busy`] (a dictionary-generation skew)
-/// instead of the library blocking the caller's thread to retry. The application owns the
-/// backoff — so the test backs off briefly and retries on a **fresh** reader. A sleep in a
-/// *test* is fine; only library code must never sleep. Panics on any non-retryable error or if
-/// `Busy` never clears.
-pub fn search_retrying(
-    index: &Index<DefaultTokenizer, Sidecar>,
-    query: &str,
-    limit: usize,
-) -> Vec<Match> {
+/// `rebuild` can surface a retryable [`trifle::Error::Busy`]. The application owns the backoff —
+/// the test backs off briefly and retries on a **fresh** reader. (A sleep in a *test* is fine;
+/// only library code must never sleep.)
+pub fn search_retrying(index: &Index<DefaultTokenizer>, query: &str, limit: usize) -> Vec<Match> {
     for _ in 0..2000 {
         match index
             .reader()
-            .and_then(|r| r.search(query, SearchOpts::new(limit)))
+            .and_then(|r| r.matches(query, &SearchOpts::new(), limit))
         {
             Ok(hits) => return hits,
             Err(trifle::Error::Busy(_)) => {
@@ -122,8 +118,7 @@ pub fn hit(matches: &[Match], doc_id: i64) -> bool {
     matches.iter().any(|m| m.key.as_i64() == Some(doc_id))
 }
 
-/// A short, real-English fixture corpus (small docs — trifle's regime). Indexed
-/// under label `"body"`.
+/// A short, real-English fixture corpus (small docs — trifle's regime). Indexed under `"body"`.
 pub const FIXTURE: &[(i64, &str)] = &[
     (1, "the quick brown fox jumps over the lazy dog"),
     (2, "a quick brown hare leaps across the meadow"),

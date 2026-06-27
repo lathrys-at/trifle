@@ -126,8 +126,11 @@ A search flows through four stages, each its own module — this is the spine of
   - `src/store/pool.rs` holds the machinery both share (writer `Mutex` + on-demand read pool).
 - **Concurrency / threading** — the API is fully **synchronous and `&self`**-thread-safe; no
   async runtime is imposed. One writer is serialized; reads run on the pool under WAL.
-  An async caller dispatches to a blocking pool. Transient `SQLITE_BUSY`/`LOCKED`/`SCHEMA`
-  faults are retried internally (`read_retry`) before surfacing as `Error::Sqlite`.
+  An async caller dispatches to a blocking pool. The library **never blocks the calling thread
+  to retry** (`busy_timeout` is 0): a transient `SQLITE_BUSY`/`LOCKED`/`SCHEMA` fault — and a
+  read racing a concurrent `rebuild`'s id-reassignment — surfaces immediately as the **retryable
+  `Error::Busy`** (mapped at the `From<rusqlite::Error>` boundary), and the caller owns the
+  backoff: retry on a fresh reader, or re-submit a write batch.
 
 ### Maintenance & lifecycle
 

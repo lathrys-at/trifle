@@ -1019,6 +1019,22 @@ impl<T: Tokenizer, B: Backend> Index<T, B> {
                     }
                     continue;
                 }
+                // The key variant must match the schema's declared shape (the same caller
+                // contract `doc_id_for` debug-asserts on the incremental path — audit C4-1):
+                // otherwise SQLite affinity coercion can make two Rust-distinct keys collide in
+                // the typed `doc.key` column, slipping past the dedup below into the opaque late
+                // UNIQUE error. Debug-only, like the incremental path — release behavior unchanged.
+                debug_assert!(
+                    matches!(
+                        (&doc.key, self.schema.key_shape()),
+                        (Key::Integer(_), KeyShape::Integer)
+                            | (Key::Text(_), KeyShape::Text)
+                            | (Key::Blob(_), KeyShape::Blob)
+                    ),
+                    "rebuild key variant {:?} does not match the declared key shape {:?}",
+                    doc.key,
+                    self.schema.key_shape()
+                );
                 // rebuild reassigns a dense id per document, so a duplicate key is a caller error;
                 // fail fast with a clear message naming the key, rather than the opaque, late
                 // `UNIQUE constraint failed: doc.key` the shadow swap would otherwise raise after

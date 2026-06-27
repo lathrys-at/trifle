@@ -1389,16 +1389,25 @@ impl<'a, T: Tokenizer, B: Backend> Writer<'a, T, B> {
                 .iter()
                 .map(|(l, t)| (l.as_str(), t.as_str()))
                 .collect();
-            // A document with filterable payload but no segments has no searchable content and
-            // would only create a payload-only ghost doc row — reject it, mirroring the T3
-            // `set_fields` contract (audit F1). An empty document with no payload is a harmless
-            // no-op (handled by `write_doc` below).
-            if segs.is_empty() && !doc.payload.is_empty() {
-                return Err(Error::InvalidInput(
-                    "a document with filterable payload but no segments has no searchable \
-                     content; insert at least one segment before setting filterable fields"
-                        .to_string(),
-                ));
+            // A segment-less document writes no segments, so it is a pure payload operation:
+            // mirror `set_fields` exactly (audit F1 / C2-WP1). Update the payload of an
+            // *existing* document, but never create a payload-only "ghost" row for an unknown
+            // key — and an empty document with no payload at all is a harmless no-op.
+            if segs.is_empty() {
+                if doc.payload.is_empty() {
+                    return Ok(()); // §8 fold-of-empty: nothing to do
+                }
+                let ns = w.index.backend.namespace();
+                let conn: &Connection = &w.guard;
+                let Some(did) = w.index.doc_id_for(conn, ns, &doc.key, false)? else {
+                    return Err(Error::InvalidInput(
+                        "a document with filterable payload but no segments names no existing \
+                         document; insert at least one segment before setting filterable fields"
+                            .to_string(),
+                    ));
+                };
+                w.index.set_doc_fields(conn, ns.doc(), did, &doc.payload)?;
+                return Ok(());
             }
             w.write_doc(doc.key.clone(), &segs, replace)?;
             if !doc.payload.is_empty() {

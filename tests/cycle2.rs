@@ -380,6 +380,59 @@ fn empty_segment_writes_create_no_ghost_doc_row() {
     ));
 }
 
+// C2-WP1: a payload-only document (no segments) updates an EXISTING doc's payload — mirroring
+// set_fields — rather than being over-rejected by the F1 guard; on an unknown key it still
+// errors (no ghost row).
+#[test]
+fn payload_only_document_updates_an_existing_doc() {
+    let h = Harness::with_schema(schema_with_deck(), Config::default());
+    let path = h.db_path();
+    {
+        let mut w = h.index.writer().unwrap();
+        w.insert(1, &[("body", "alpha bravo charlie")]).unwrap();
+        w.commit().unwrap();
+    }
+    // Payload-only upsert_document on the existing doc succeeds, sets the payload, keeps the segment.
+    {
+        let mut w = h.index.writer().unwrap();
+        w.upsert_document(
+            Document::new(1, vec![]).with_payload(vec![("deck".into(), Value::Integer(5))]),
+        )
+        .unwrap();
+        w.commit().unwrap();
+    }
+    assert_eq!(
+        doc_rows_with_deck(&path, 5),
+        1,
+        "payload updated on the existing doc"
+    );
+    assert!(hit(
+        &h.search(
+            "alpha bravo",
+            SearchOpts::new(10).filter(&Filter::eq("deck", 5i64))
+        )
+        .unwrap(),
+        1
+    ));
+
+    // On an UNKNOWN key, a payload-only document still errors (no ghost row created).
+    {
+        let mut w = h.index.writer().unwrap();
+        let err = w
+            .upsert_document(
+                Document::new(99, vec![]).with_payload(vec![("deck".into(), Value::Integer(7))]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, trifle::Error::InvalidInput(_)), "got {err:?}");
+        w.commit().unwrap();
+    }
+    assert_eq!(
+        doc_rows_with_deck(&path, 7),
+        0,
+        "no ghost row for the unknown key"
+    );
+}
+
 // ----- IDF-weighted overlap ranking -----
 
 #[test]

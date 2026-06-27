@@ -95,6 +95,39 @@ fn shared_index() -> (Arc<Index<DefaultTokenizer, Sidecar>>, tempfile::TempDir) 
     (Arc::new(idx), dir)
 }
 
+// FINDING-A / OD1: with busy_timeout=0 the library must NOT block the caller's thread on lock
+// contention — it surfaces a retryable Error::Busy promptly, leaving backoff to the caller.
+#[test]
+fn contended_write_surfaces_busy_promptly_without_blocking() {
+    let h = Harness::new();
+    let path = h.db_path();
+    // An external connection grabs the write lock and holds it.
+    let blocker = trifle::rusqlite::Connection::open(&path).unwrap();
+    blocker
+        .busy_timeout(std::time::Duration::from_secs(0))
+        .unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let start = std::time::Instant::now();
+    let res = (|| -> trifle::Result<()> {
+        let mut w = h.index.writer()?;
+        w.upsert(1, &[("body", "hello world")])?;
+        w.commit()?;
+        Ok(())
+    })();
+    let elapsed = start.elapsed();
+    blocker.execute_batch("ROLLBACK").unwrap();
+
+    assert!(
+        matches!(res, Err(trifle::Error::Busy(_))),
+        "a contended write must surface the retryable Error::Busy, got {res:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the library must not block the caller on contention (busy_timeout=0); took {elapsed:?}"
+    );
+}
+
 #[test]
 fn concurrent_reads_run_alongside_writes() {
     let (idx, _dir) = shared_index();

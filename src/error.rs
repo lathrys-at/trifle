@@ -18,11 +18,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// The backing SQLite store returned an error. After the internal busy-retry
-    /// budget is exhausted, a persistent `SQLITE_BUSY`/`SQLITE_LOCKED` surfaces
-    /// here too — it is environmental (another writer holds the file), not a bug.
+    /// The backing SQLite store returned a **non-transient** error (a real fault, not lock
+    /// contention) — e.g. I/O, `SQLITE_CANTOPEN`, or a logic error. Transient faults
+    /// (`SQLITE_BUSY`/`SQLITE_LOCKED`, and the `SQLITE_SCHEMA` re-prepare) are mapped to the
+    /// retryable [`Error::Busy`] instead (see the [`From`] impl below), because the library
+    /// never blocks the caller's thread to retry — it surfaces a retryable signal and the caller
+    /// owns the backoff (audit OD1).
     #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[source] rusqlite::Error),
 
     /// A roaring posting failed to serialize or deserialize. This is an internal
     /// invariant violation (trifle wrote the bytes it is reading back), surfaced
@@ -52,10 +55,13 @@ pub enum Error {
     #[error("index inconsistent: {0}")]
     Corrupt(String),
 
-    /// A **transient** condition that did not settle within the internal retry budget —
-    /// for example a read racing a concurrent [`rebuild`](crate::Index::rebuild)'s
-    /// id-reassignment. Unlike [`Corrupt`](Error::Corrupt) the store is fine; **retry the
-    /// operation on a fresh [`reader`](crate::Index::reader)** and it will succeed.
+    /// A **transient** condition: SQLite lock contention (`SQLITE_BUSY`/`SQLITE_LOCKED`), a
+    /// statement needing a re-prepare after a concurrent schema change (`SQLITE_SCHEMA`), or a
+    /// read racing a concurrent [`rebuild`](crate::Index::rebuild)'s id-reassignment. The
+    /// library does **not** block the caller's thread to retry internally (`busy_timeout` is 0);
+    /// unlike [`Corrupt`](Error::Corrupt) the store is fine — **retry the operation on a fresh
+    /// [`reader`](crate::Index::reader)** (and, for a write, re-submit the batch) and it will
+    /// succeed.
     #[error("transient (retry): {0}")]
     Busy(String),
 
@@ -95,4 +101,40 @@ impl Error {
     pub(crate) fn schema(msg: impl Into<String>) -> Self {
         Error::Schema(msg.into())
     }
+}
+
+impl From<rusqlite::Error> for Error {
+    /// Classify a SQLite error at the `?` boundary: a **transient** fault — lock contention
+    /// (`SQLITE_BUSY`/`SQLITE_LOCKED`) or a schema-change re-prepare (`SQLITE_SCHEMA`) — becomes
+    /// the retryable [`Error::Busy`], so every store path (read checkout, the search body, and
+    /// writes) surfaces one uniform "retry me" signal and the caller owns the backoff. The
+    /// library never sleeps/blocks to retry internally (`busy_timeout` is 0 — audit OD1). Any
+    /// other SQLite error is a real [`Error::Sqlite`] fault.
+    fn from(e: rusqlite::Error) -> Self {
+        if is_retryable(&e) {
+            Error::Busy(format!(
+                "transient store fault (retry on a fresh reader): {e}"
+            ))
+        } else {
+            Error::Sqlite(e)
+        }
+    }
+}
+
+/// Whether a SQLite error is a transient, retryable fault — lock contention
+/// (`SQLITE_BUSY`/`SQLITE_LOCKED`) or a statement that needs re-preparing after a concurrent
+/// schema change (`SQLITE_SCHEMA`) — as opposed to a real store fault.
+fn is_retryable(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::SchemaChanged,
+                ..
+            },
+            _,
+        )
+    )
 }

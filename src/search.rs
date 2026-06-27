@@ -31,22 +31,8 @@ use crate::tokenize::Tokenizer;
 use crate::welford::ClassSnap;
 use crate::{
     DEFAULT_MIN_SHARED, DEFAULT_T_MAX, Error, Index, IntoTerm, Match, Result, SearchOpts,
-    TYPO_DAMAGE, Term, is_retryable, postings, schema,
+    TYPO_DAMAGE, Term, postings, schema,
 };
-
-/// Map a transient store fault to a retryable [`Error::Busy`] (the single "retry me" signal the
-/// caller backs off on); pass every other error through unchanged. The library **never** sleeps
-/// or spins to retry internally — that would block the caller's thread and bake in a backoff
-/// policy the caller can't override — so it surfaces `Busy` and the application owns the retry
-/// (on a fresh reader), per the no-sleeps contract (audit OD1 / T6).
-fn retryable_to_busy(e: Error) -> Error {
-    match e {
-        Error::Sqlite(se) if is_retryable(&se) => Error::busy(format!(
-            "transient store fault (retry on a fresh reader): {se}"
-        )),
-        other => other,
-    }
-}
 
 /// The distinct tokens per query and the batch-wide distinct **term** set (the resolution
 /// input). Factored so the [`Reader`](crate::Reader) and the warm
@@ -330,14 +316,15 @@ pub(crate) fn search_read_on<T: Tokenizer, B: Backend, R>(
     f: impl FnOnce(&Connection, &Namespace, &FxHashMap<u128, TermId>, &ClassSnap) -> Result<R>,
 ) -> Result<R> {
     let ns = index.backend.namespace();
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| retryable_to_busy(Error::from(e)))?;
+    // A transient SQLite fault from any of these `?` (the BEGIN, the generation read, or the
+    // body) is mapped to a retryable `Error::Busy` at the `From<rusqlite::Error>` boundary — no
+    // internal sleep/retry; the caller backs off on a fresh reader (audit OD1).
+    let tx = conn.unchecked_transaction()?;
     // Resolve the terms in memory + capture the generation and per-class stats snapshot
     // atomically, then read the snapshot's generation (the tx's first statement, which pins the
     // WAL snapshot) to compare.
     let (resolved, gen_mem, class_snap) = index.dict.resolve_terms(all_terms);
-    let gen_snap = schema::dict_generation(&tx, ns).map_err(retryable_to_busy)?;
+    let gen_snap = schema::dict_generation(&tx, ns)?;
     if gen_snap != gen_mem {
         // A concurrent rebuild/reset reassigned term-ids vs this snapshot — surface as
         // retryable (NOT Corrupt: the store is the consistent new generation); the caller
@@ -347,5 +334,5 @@ pub(crate) fn search_read_on<T: Tokenizer, B: Backend, R>(
              fresh reader",
         ));
     }
-    f(&tx, ns, &resolved, &class_snap).map_err(retryable_to_busy)
+    f(&tx, ns, &resolved, &class_snap)
 }

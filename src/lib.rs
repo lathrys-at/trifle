@@ -1752,22 +1752,6 @@ impl TokenChanges {
     }
 }
 
-/// Whether a SQLite error is a transient fault worth retrying on the read path.
-fn is_retryable(e: &rusqlite::Error) -> bool {
-    matches!(
-        e,
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::DatabaseBusy
-                    | rusqlite::ErrorCode::DatabaseLocked
-                    | rusqlite::ErrorCode::SchemaChanged,
-                ..
-            },
-            _,
-        )
-    )
-}
-
 #[cfg(test)]
 mod effort_tests {
     use super::Effort;

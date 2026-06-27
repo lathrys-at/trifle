@@ -15,9 +15,11 @@ use super::{Backend, Namespace, configure_sqlite_perf, register_carray};
 /// from the mapped file and bypass the page cache.
 const MMAP_SIZE_BYTES: i64 = 1024 * 1024 * 1024;
 
-/// A read or write that overlaps another connection's commit waits the lock out
-/// rather than taking an instant `SQLITE_BUSY`.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// `busy_timeout = 0`: lock contention returns `SQLITE_BUSY` **immediately** rather than
+/// blocking the calling thread to wait the lock out. Library code must never sleep/block the
+/// caller (audit OD1); the fault is mapped to the retryable [`Error::Busy`](crate::Error::Busy)
+/// at the error boundary and the application owns the backoff/retry.
+const BUSY_TIMEOUT: Duration = Duration::ZERO;
 
 /// A backend that owns its own SQLite file: one write connection (WAL,
 /// `synchronous=NORMAL`) plus a pool of read-only connections that, under WAL, run
@@ -90,7 +92,7 @@ impl Backend for Sidecar {
 }
 
 /// Per-connection setup shared by read connections (and the non-WAL part of the
-/// writer): wait budget, memory-map, and the `carray` vtab.
+/// writer): the no-wait busy policy, memory-map, and the `carray` vtab.
 fn setup_read_conn(conn: &Connection) -> Result<()> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES)?;

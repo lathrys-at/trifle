@@ -535,6 +535,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "trifle-lean"
+version = "0.0.0"
+dependencies = [
+ "roaring",
+ "rusqlite",
+ "trifle-overlap",
+]
+
+[[package]]
 name = "trifle-overlap"
 version = "0.0.0"
 dependencies = [

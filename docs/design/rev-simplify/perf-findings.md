@@ -119,9 +119,17 @@ After moving to croaring, two fresh lanes (`perf-research-croaring-depth.md`,
 - **Searcher snapshot model** — see below. **Scratch/arena reuse**, **batch df-read sharing** —
   as-you-type / serial-batch only.
 
+### Deferred to upstream / future work
+- **Fused half-adder** (in-place `xor_and`: XOR posting into the plane, return `old_plane & posting`):
+  confirmed ~1.3–1.64× build, but needs a bitmap lib to expose the fused op — no `and_xor` in
+  CRoaring 4.7.1, croaring-sys binds containers opaquely. **Planned future work (ren): fork
+  CRoaring + croaring-rs to add it and upstream a PR.** Scope: per-container-type-pair routines
+  mirroring the existing AND/XOR with a dual output + result-type repair; `bitmap×bitmap` and
+  `array×bitmap` (sparse posting into a growing plane) are the BSI-relevant pairs; run-container
+  pairs can fall back to separate ops. Measure the per-pair win on trifle's real container mix
+  before the full matrix.
+
 ### Not actionable / dead-ends
-- **Fused half-adder**: confirmed ~1.3–1.64× build, but **blocked** — no `and_xor` in CRoaring
-  4.7.1, croaring-sys binds containers opaquely. Only unblock = an **upstream CRoaring FR**.
 - **CSA/Wallace tree**: not worth it at k≤12 (crossover ~16; *2× worse* in high-overlap).
 - **frozen_view**: not byte-identical to portable → would force a storage migration; stick with
   portable views.

@@ -1,8 +1,9 @@
 # BSI overlap engine — performance findings & roadmap
 
-Consolidates the foreground optimization work + two background research lanes
-(`perf-research-bsi-algo.md`, `perf-research-bsi-systems.md`) + the croaring A/B
-(`crates/croaring-bsi-bench`). Branch `feat/lean-trifle-v0.3`.
+Consolidates the foreground optimization work + four background research lanes
+(`perf-research-bsi-algo.md`, `perf-research-bsi-systems.md`, `perf-research-croaring-depth.md`,
+`perf-research-pipeline.md`) + the croaring A/B (`crates/croaring-bsi-bench`). Branch
+`feat/lean-trifle-v0.3`. **Round 2 (croaring board) synthesis is at the bottom.**
 
 ## Bottom line
 
@@ -83,3 +84,69 @@ The BSI engine's low-hanging fruit is captured. It is build-bound and near the p
 in the real regime it's already sub-ms. The meaningful further gains are (a) cross-layer
 (selection Σdf cap, recall-gated), (b) the croaring opt-in (decided, ~1.2×), and (c) batch rayon
 (dep-policy-gated). Everything else in the counting/representation math is measured dead-ends.
+
+---
+
+# Round 2 (croaring board) — synthesis
+
+After moving to croaring, two fresh lanes (`perf-research-croaring-depth.md`,
+`perf-research-pipeline.md`) re-evaluated. Outcomes:
+
+### Landed (committed)
+- **Dropped the dual-BSI** (CroaringDepth, measured): the unweighted counter cost +132–156% build
+  for mixed-weight queries; `raw_overlap` via `contains` over retained owned postings is ~free →
+  owned+contains is **~2.2–2.5× faster** than view+dual-BSI. Engine is now single weighted BSI +
+  all-weight-1 fast path (zero-copy view build, retain nothing) / owned-postings+contains for the
+  mixed minority. Faster AND less code. The earlier dual-BSI rec never measured the 2nd build.
+
+### Do-now / cheap
+- **`read_many` for bucket materialization** (CroaringDepth): croaring cursor bulk-read into the
+  walk's bucket `Vec` (1.79×@200, 4.55×@1000 bucket sizes). ~0 for shallow top-k, real for deep
+  pulls. Cheap S — queued as a follow-up.
+- **`term.df` as the single rarity source** (Pipeline): weights from `term.df`, no per-query
+  cardinality pass — enabler for the Σdf cap and zero-copy load.
+
+### Worth-effort, gated
+- **Σdf selection cap** (Pipeline, the biggest cross-layer lever): adaptive budget B, add
+  rarest-first until cumulative Σdf would exceed B (keep ≥ floor). **p99 build 2.6×, mean 1.8×,
+  for ~−1.5% recall@10** at B≈0.1·N. Tail-tamer (Σdf right-skewed even in a rarest-first set).
+  Lives in `select.rs`; **recall-gated** → needs a `dfsweep` eval (mirror tmaxsweep). Budget
+  scales with N → `df_budget` knob.
+- **Zero-copy base load** (Pipeline): `PRAGMA mmap_size` + `row.get_ref().as_blob()` → engine
+  `build_from_blobs`, but only for **base-only** terms (a delta'd posting `(base∪added)\removed`
+  isn't a lazy view). Needs a **mixed-operand build** (fold `&Bitmap` + `&BitmapView` together;
+  the `Operand` trait already abstracts this). Integration-time.
+- **Searcher snapshot model** — see below. **Scratch/arena reuse**, **batch df-read sharing** —
+  as-you-type / serial-batch only.
+
+### Not actionable / dead-ends
+- **Fused half-adder**: confirmed ~1.3–1.64× build, but **blocked** — no `and_xor` in CRoaring
+  4.7.1, croaring-sys binds containers opaquely. Only unblock = an **upstream CRoaring FR**.
+- **CSA/Wallace tree**: not worth it at k≤12 (crossover ~16; *2× worse* in high-overlap).
+- **frozen_view**: not byte-identical to portable → would force a storage migration; stick with
+  portable views.
+
+# Searcher snapshot model (tantivy-style, replaces independent-snapshot work-units)
+
+`Index → Reader → Searcher`. The **`Searcher` owns one snapshot** (a pooled connection with an
+open read tx + the dict-generation captured at creation) until drop — so *all* its queries (serial
+or parallel) are mutually consistent on that one snapshot.
+
+The key enabler: **the dominant cost (BSI build+walk) is pure CPU on loaded postings — zero SQL.**
+So parallelism needs no parallel DB connections (which SQLite fights); it needs one snapshot for
+the cheap I/O and parallelism only on the CPU stage:
+
+1. On the Searcher's single snapshot (serial, cheap): resolve → select → **load** the selected
+   posting blobs per query.
+2. `match_units` returns **pure-CPU work units** (`FnOnce() -> Result<Vec<Scored>> + Send`, each
+   owning its loaded postings/blobs) — build+walk, no connection, no per-unit snapshot. The caller
+   schedules them on *their* threads/executor (runtime-agnostic; no library-owned threads).
+3. Provenance/filter/text hydration: back on the Searcher's snapshot (serial, batched).
+
+Result: tantivy-style "Searcher owns a snapshot until drop" consistency **and** runtime-agnostic
+parallelism on the part that actually costs — **without** needing `sqlite3_snapshot` (unavailable/
+compile-gated anyway). Caveats: a live Searcher pins its WAL snapshot (keep short-lived); a
+concurrent id-reassigning `rebuild` makes its generation stale → searches surface retryable
+`Error::Busy` (drop + re-acquire). The `CandidateStream` becomes "a cursor on the Searcher's
+snapshot," unifying serial/stream/parallel under one consistency model. Prototype-able in
+`trifle-lean` (the parallel stage is CPU-only, so the spike's single connection suffices).

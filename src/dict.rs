@@ -138,7 +138,7 @@ impl Dictionary {
     ///
     /// Keyed by the term's packed `u128` so the read path resolves straight from a tokenizer
     /// token's [`term()`](crate::IntoTerm::term) — no `Token → String → re-encode` round-trip,
-    /// matching what the write path already does (audit T2 / I10).
+    /// matching what the write path already does.
     pub(crate) fn resolve_terms(
         &self,
         terms: &[Term],
@@ -161,14 +161,11 @@ impl Dictionary {
     /// [`InternStage::commit`]. Only ever called on a write path (which holds the
     /// single-writer lease), so the snapshotted `next_id` cannot move under the stage.
     ///
-    /// **Audit I17 (reader/writer fault split):** §4 of the design wanted interning to be
-    /// `&mut self` so a shared reader ref *cannot* intern at the type level. Here `stage`
-    /// takes `&self` (the dictionary lives behind a shared `&Index`), so exclusivity is
-    /// enforced by reachability rather than the type: `stage`/`InternStage` are
-    /// `pub(crate)`, only [`Writer::begin`](crate::Writer) calls `stage` (under the
-    /// single-writer lease), and the read pool hands out `SQLITE_OPEN_READ_ONLY`
-    /// connections, so an intern's `INSERT` would fail at runtime regardless. No reader path
-    /// can intern; the guarantee holds, just not structurally.
+    /// The reader/writer fault split is enforced by reachability rather than the type: `stage`
+    /// takes `&self` (the dictionary lives behind a shared `&Index`), but `stage`/`InternStage`
+    /// are `pub(crate)`, only [`Writer::begin`](crate::Writer) calls `stage` (under the
+    /// single-writer lease), and the read pool hands out `SQLITE_OPEN_READ_ONLY` connections, so
+    /// an intern's `INSERT` would fail at runtime regardless. No reader path can intern.
     pub(crate) fn stage(&self) -> InternStage<'_> {
         let guard = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         InternStage {
@@ -195,7 +192,7 @@ impl Dictionary {
     }
 }
 
-/// The mutation-bearing handle — the §4 writer side of the fault split. Reachable only
+/// The mutation-bearing handle — the writer side of the fault split. Reachable only
 /// via [`Dictionary::stage`] (a write path), so a shared `&Dictionary` reader cannot
 /// allocate ids.
 pub(crate) struct InternStage<'a> {

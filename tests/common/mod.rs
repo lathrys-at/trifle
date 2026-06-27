@@ -42,7 +42,12 @@ impl Harness {
     }
 
     /// Top-`limit` matches with explicit options.
-    pub fn search_opts(&self, query: &str, opts: &SearchOpts<'_>, limit: usize) -> Result<Vec<Match>> {
+    pub fn search_opts(
+        &self,
+        query: &str,
+        opts: &SearchOpts<'_>,
+        limit: usize,
+    ) -> Result<Vec<Match>> {
         self.index.reader()?.matches(query, opts, limit)
     }
 

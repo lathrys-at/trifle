@@ -36,9 +36,9 @@ pub(crate) fn pack(c0: u32, c1: u32, c2: u32, script: u8) -> u128 {
     ((script as u128) << 120) | ((c0 as u128) << 88) | ((c1 as u128) << 56) | ((c2 as u128) << 24) // low 24 bits reserved = 0
 }
 
-/// Reverse [`pack`] (debug / lossless decode). Explicit masks document that the script
-/// bits are dropped from the codepoint slots.
-#[allow(dead_code)]
+/// Reverse [`pack`] into `(c0, c1, c2, script)`; the explicit masks drop the script bits
+/// from the codepoint slots.
+#[cfg(test)]
 #[inline]
 pub(crate) fn unpack(t: u128) -> (u32, u32, u32, u8) {
     (
@@ -57,9 +57,8 @@ impl Term {
         (self.0 >> 120) as u8
     }
 
-    /// Reverse the encoding back to the gram string. Lossless for fitting grams; for
-    /// debug/tooling only (no `TEXT` column is stored).
-    #[allow(dead_code)]
+    /// Reverse the encoding back to the gram string (lossless for fitting grams).
+    #[cfg(test)]
     pub(crate) fn decode(self) -> String {
         let (a, b, c, _) = unpack(self.0);
         [a, b, c]
@@ -85,7 +84,7 @@ pub(crate) fn encode_term(gram: &str) -> Option<Term> {
             // NUL-padded shorter prefix (`"a"`, `"a\0"`, `"a\0\0"` → the same `Term`),
             // colliding distinct grams onto one posting. Reject it like the codepoint ceiling
             // (callers treat `None` as an absent / unindexable gram), so a present codepoint
-            // is never 0 and `0` always means "no codepoint" (audit F3).
+            // is never 0 and `0` always means "no codepoint".
             return None;
         }
         cps[n] = ch as u32;
@@ -160,7 +159,7 @@ mod tests {
     #[test]
     fn rejects_grams_containing_u0000_so_padding_cannot_collide() {
         // A gram with U+0000 is unrepresentable: it must not pack to the same Term as its
-        // NUL-padded shorter prefix (the audit-F3 collision). Reject it, like the ceiling.
+        // NUL-padded shorter prefix. Reject it, like the ceiling.
         assert!(encode_term("a").is_some());
         assert!(encode_term("a\u{0}").is_none());
         assert!(encode_term("a\u{0}\u{0}").is_none());

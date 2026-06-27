@@ -5,10 +5,9 @@
 //! has no injection surface. The store is a rebuildable cache: a version mismatch
 //! drops everything rather than migrating.
 //!
-//! **Flattened model (rev v0.3):** there is no `doc` table. The caller key lives
-//! directly on `seg` (one row per `(key, label)` segment; `seg.id` is the posting id),
-//! so the no-ghost invariant dissolves by construction and provenance is a single-table
-//! point read.
+//! There is no `doc` table: the caller key lives directly on `seg` (one row per
+//! `(key, label)` segment; `seg.id` is the posting id), so a key with no segments cannot
+//! materialize a ghost row and provenance is a single-table point read.
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -16,14 +15,8 @@ use crate::error::Result;
 use crate::model::Schema;
 use crate::store::Namespace;
 
-/// trifle's on-disk format version. Bump on any incompatible schema change; an
-/// index stamped with a different value is reset on open.
-///
-/// v2 (rev-v0.2): postings keyed by an interned `u32` term-id (the `dict` table).
-/// v3 (rev-v0.2): per-field storage modes dropped; `seg` gains a `len` column.
-/// v4 (rev-v0.3): the `doc` table is folded into `seg` (the caller key lives on `seg`);
-/// filterable payload columns are removed; postings move to the CRoaring portable blob
-/// (byte-identical, so the bitmap change alone needs no bump — the table flatten does).
+/// trifle's on-disk format version. Bump on any incompatible schema change; an index stamped
+/// with a different value is reset on open (the cache is rebuilt, never migrated).
 pub(crate) const SCHEMA_VERSION: u32 = 4;
 
 pub(crate) const KEY_SCHEMA_VERSION: &str = "schema_version";

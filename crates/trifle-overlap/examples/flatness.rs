@@ -109,7 +109,10 @@ fn main() {
 
     // ---- Experiment 1: sparse regime (fixed k) -------------------------------------------
     println!("== 1. sparse regime: build + top-{TOPN} vs cardinality (k = 8 postings) ==");
-    println!("{:>10} | {:>12} | {:>12} | {:>10}", "card", "BSI (µs)", "naive (µs)", "speedup");
+    println!(
+        "{:>10} | {:>12} | {:>12} | {:>10}",
+        "card", "BSI (µs)", "naive (µs)", "speedup"
+    );
     println!("{:->10}-+-{:->12}-+-{:->12}-+-{:->10}", "", "", "", "");
     for &card in &[2_000u32, 8_000, 32_000, 128_000, 512_000] {
         let postings = make_postings(8, card, UNIVERSE, PLANTED, 0xC0FFEE ^ card as u64);
@@ -132,7 +135,10 @@ fn main() {
 
     // ---- Experiment 1b: dense regime (one container) -------------------------------------
     println!("== 1b. dense regime: one croaring container, vary density (k = 8) ==");
-    println!("{:>10} | {:>12} | {:>12} | {:>10}", "card", "BSI (µs)", "naive (µs)", "speedup");
+    println!(
+        "{:>10} | {:>12} | {:>12} | {:>10}",
+        "card", "BSI (µs)", "naive (µs)", "speedup"
+    );
     println!("{:->10}-+-{:->12}-+-{:->12}-+-{:->10}", "", "", "", "");
     const DENSE_U: u32 = 65_536;
     for &card in &[4_000u32, 12_000, 24_000, 48_000] {

@@ -14,13 +14,12 @@
 
 Trifle is an embedded, typo-tolerant fuzzy search engine for Rust, backed by SQLite
 and tuned for large corpora of mostly small document segments with read-often and
-write-infrequent characteristics. Trifle uses roaring bitmaps internally for fast and
+write-infrequent characteristics. Trifle uses CRoaring bitmaps internally for fast and
 space-efficient storage of n-gram token posting lists.
 
-Trifle indexes text segments and returns ranked matches for quries. The backing store is
-a rebuildable cache over a caller-owned full-text source. Trifle's storage can be built
-as a separate sidecar or inlined within your existing SQLite database as a set of
-namespaced tables.
+Trifle indexes text segments and returns ranked matches for queries. The backing store is
+a rebuildable cache over a caller-owned full-text source: an owned SQLite sidecar file that
+trifle manages itself.
 
 Trifle performs lexical matching only, and is tuned for mostly small-document retrieval
 by default but longer documents may be indexed and search-ranked using whatever custom
@@ -43,13 +42,13 @@ fn main() -> trifle::Result<()> {
 
     // Writes go through a single-writer lease; commit() makes them durable.
     let mut w = index.writer()?;
-    w.insert(1, &[("title", "the quick brown fox")])?;
-    w.insert(2, &[("title", "the quack brown ox")])?;
+    w.upsert(1, &[("title", "the quick brown fox")])?;
+    w.upsert(2, &[("title", "the quack brown ox")])?;
     w.commit()?;
 
     // Reads go through a reader lease; each search runs under a consistent snapshot
-    // (a single search_batch shares one). A misspelled query still matches.
-    let hits = index.reader()?.search("quikc brown", SearchOpts::new(10))?;
+    // (a single matches_batch shares one). A misspelled query still matches.
+    let hits = index.reader()?.matches("quikc brown", &SearchOpts::new(), 10)?;
     assert_eq!(hits[0].key.as_i64(), Some(1));
     Ok(())
 }
@@ -66,12 +65,11 @@ has a **key** and one or more named **segments**:
   locatable) a byte `span`.
 - **segment** — a `(label, text)` pair under a key. `label` is a free-form name returned on
   a match so you know which segment matched; a document holds each label at most once. Every
-  indexed text field is **stored** and returned on a match (and surfaced to a custom ranker).
-  The segment is the ranking unit (IDF-weighted overlap over its grams); fuse across a key's
-  segments above trifle (aggregate across your keys).
+  indexed text field is **stored** and returned on a match. The segment is the ranking unit
+  (IDF-weighted overlap over its grams); fuse across a key's segments above trifle (aggregate
+  across your keys).
 - `Schema::flat()` is the simplest shape: an integer key and one default text field that
-  accepts any label. `Schema::chunked()` / the builder declare named text fields and
-  **filterable** columns (stored, indexed, used only for filtering — never reranked).
+  accepts any label. `Schema::chunked()` / the builder declare named text fields.
 
 This covers two common patterns:
 
@@ -95,13 +93,16 @@ This covers two common patterns:
   (`NfdStripMarks`), or none. Unicode casefolding is on by default.
 - **Ranking** — **IDF-weighted bit-sliced overlap**, computed in the counter itself: each
   selected gram is weighted by rarity (a per-query, df-anchored 4-tier scheme, weights
-  `{1,2,3,4}`; knob `D` via `SearchOpts::weight_step`), so a rare shared gram outweighs a
-  common one. This is a fuzzy lexical overlap engine, **not** a relevance engine — there is no
-  BM25 tier. For a domain-specific reorder, supply a custom `Ranker` and over-fetch a pool with
-  `SearchOpts::rerank(Effort)` (`None` through `Max`; default `None`).
-- **Filtering** — declare `filterable` columns and pass a structured `Filter` (comparisons,
-  `In`/`Between`/`IsNull`/`Like`, `And`/`Or`) to cut the candidate set; plus a `scope`
-  predicate evaluated over candidates only.
+  `{1,2,3,4}`; knob `D` via `SearchOpts::weight_step`), and rarity is **class-normalized across
+  scripts** so a rare shared gram outweighs a common one even across different script regimes.
+  This is a fuzzy lexical overlap engine, **not** a relevance engine — there is no BM25 tier.
+  For a domain-specific reorder, pull a candidate pool from `reader.candidates(...)`, reorder it
+  yourself (the stream exposes each candidate's score, overlap, and matched terms with their df),
+  and hydrate the winners.
+- **Filtering** — pass a `SqlFilter` (a trusted-constant SQL predicate fragment plus bound
+  params) to cut the candidate set against your **live** data — `key IN rarray(?)` with your own
+  allowed-key set, or a co-located join via `ATTACH`. trifle stores no filter columns of its own
+  (they would go stale), so filtering is staleness-free by construction.
 
 ## Usage
 
@@ -122,25 +123,9 @@ it; nothing else is required:
 let index = Index::open_at(Path::new("search.db"), Schema::flat(), Config::default())?;
 ```
 
-### Shared mode
-
-Trifle's tables live namespaced inside a database you own and supply connections to. Use it
-only for a hard co-location requirement. You give it the write connection and a factory for
-read-only connections, and you take on three guarantees Trifle cannot enforce across a file
-it does not own:
-
-- single-writer serialization across the **whole** database, not just Trifle's tables;
-- a WAL and pragma setup compatible with concurrent reads;
-- never holding an open transaction across a `rebuild()` — its shadow-table swap must commit.
-
-```rust
-let backend = Shared::new(
-    Namespace::prefixed("trifle_")?,   // tables become trifle_seg, trifle_post, …
-    write_conn,                        // the one connection writes serialize through
-    || open_readonly_connection(),     // read-only factory: || -> rusqlite::Result<Connection>
-)?;
-let index = Index::open(backend, DefaultTokenizer::new(), Schema::flat(), Config::default())?;
-```
+A custom tokenizer or table namespace goes through `Index::open(Sidecar::open(path)?, tokenizer,
+schema, config)`. To co-locate trifle's tables inside a database you own, `ATTACH` it to the
+sidecar's read connections and reference it from a `SqlFilter` fragment.
 
 ### Maintenance
 
@@ -182,8 +167,8 @@ more) — a fuzzy lexical engine, not a relevance engine.
 ## Non-goals
 
 Embeddings and semantic search; fusion (e.g. RRF) with other signals; an exact precision
-tier beyond a custom `Ranker`; sub-trigram (< 3-char) queries; and deciding when the cache
-is stale relative to your source of truth.
+tier beyond what you compose over the candidate stream; sub-trigram (< 3-char) queries; and
+deciding when the cache is stale relative to your source of truth.
 
 ## License
 

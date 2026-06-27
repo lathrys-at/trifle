@@ -4,13 +4,11 @@
 //! **IDF-weighted overlap order** (highest weighted score first). It knows nothing of SQL,
 //! segments, keys, text, or provenance — its surface is `postings → impl Iterator<Item=Scored>`.
 //!
-//! # Backend: CRoaring + zero-copy views
+//! # CRoaring backend + zero-copy views
 //!
 //! The engine uses the `croaring` crate (SIMD CRoaring). Postings can be folded in **zero-copy**
 //! from their stored bytes via [`Counter::build_from_blobs`]: croaring constructs a transient
-//! `BitmapView` over the bytes (no allocation, no container copy) — and the `roaring`-crate's
-//! portable serialization is **byte-identical** to croaring's, so trifle's existing stored blobs
-//! are viewed directly with no format migration.
+//! `BitmapView` over the standard portable bytes (no allocation, no container copy).
 //!
 //! # Owns-postings + all-weight-1 fast path (one counter, no second build)
 //!
@@ -18,8 +16,8 @@
 //! **directly as the score** when all tier weights are 1 — the common rarest-first case: the
 //! weighted counter then *is* the count, the floor is met by every walked bucket, and a zero-copy
 //! view build retains nothing. For the mixed-weight minority it retains the **owned postings** and
-//! reads overlap via `contains` — measured **~2.5× cheaper** than building a second (unweighted)
-//! bit-sliced counter for the overlap. Either way the retained state is owned (`Vec<Bitmap>`), so
+//! reads overlap via `contains` — cheaper than building a second (unweighted) bit-sliced counter
+//! for the overlap. Either way the retained state is owned (`Vec<Bitmap>`), so
 //! [`Counter`] is `'static` — no self-referential lifetime when embedded in a stream.
 //!
 //! # Flatness
@@ -130,19 +128,35 @@ impl Counter {
     /// Panics if `weights.len() != bitmaps.len()`.
     pub fn build_weighted(bitmaps: &[Bitmap], weights: Vec<u32>, min_shared: u32) -> Self {
         assert_eq!(bitmaps.len(), weights.len(), "weights parallel to bitmaps");
-        let Plan { weighted, all_weight_one, max_score, reachable, floor } = {
+        let Plan {
+            weighted,
+            all_weight_one,
+            max_score,
+            reachable,
+            floor,
+        } = {
             let refs: Vec<&Bitmap> = bitmaps.iter().collect();
             plan(&refs, weights, min_shared)
         };
         // Retain owned postings only for mixed-weight queries (raw overlap via `contains`); the
         // all-weight-1 case takes overlap = score and keeps nothing.
-        let postings = if all_weight_one { Vec::new() } else { bitmaps.to_vec() };
-        Counter { weighted, postings, floor, max_score, reachable, all_weight_one }
+        let postings = if all_weight_one {
+            Vec::new()
+        } else {
+            bitmaps.to_vec()
+        };
+        Counter {
+            weighted,
+            postings,
+            floor,
+            max_score,
+            reachable,
+            all_weight_one,
+        }
     }
 
     /// Build **zero-copy** from stored portable posting bytes: each blob is viewed in place
-    /// (`BitmapView`, no allocation/copy) and folded transiently. The roaring-crate and croaring
-    /// portable formats are byte-identical, so trifle's existing blobs work unchanged.
+    /// (`BitmapView`, no allocation/copy) and folded transiently.
     pub fn build_from_blobs(blobs: &[&[u8]], weight_step: f64, min_shared: u32) -> Self {
         // Cardinalities (= df) come from a cheap view pass (O(containers), no copy); the weighted
         // build (and any owned retention for mixed weights) happens in `build_weighted_from_blobs`.
@@ -161,7 +175,13 @@ impl Counter {
     /// Panics if `weights.len() != blobs.len()`.
     pub fn build_weighted_from_blobs(blobs: &[&[u8]], weights: Vec<u32>, min_shared: u32) -> Self {
         assert_eq!(blobs.len(), weights.len(), "weights parallel to blobs");
-        let Plan { weighted, all_weight_one, max_score, reachable, floor } = {
+        let Plan {
+            weighted,
+            all_weight_one,
+            max_score,
+            reachable,
+            floor,
+        } = {
             // SAFETY: each `blob` outlives its `view` (both live only within this block);
             // portable layout needs no alignment.
             let views: Vec<BitmapView<'_>> = blobs
@@ -172,9 +192,8 @@ impl Counter {
             plan(&refs, weights, min_shared)
         };
         // all-weight-1: the build was zero-copy (views only) and needs no postings. Mixed-weight:
-        // materialize owned postings for `contains` — owned+contains is ~2.5x cheaper than a
-        // second (unweighted) bit-sliced build (measured), at the cost of zero-copy for this
-        // minority case.
+        // materialize owned postings for `contains` — cheaper than a second (unweighted)
+        // bit-sliced build, at the cost of zero-copy for this minority case.
         let postings = if all_weight_one {
             Vec::new()
         } else {
@@ -183,7 +202,14 @@ impl Counter {
                 .map(|b| Bitmap::try_deserialize::<Portable>(b).expect("portable posting blob"))
                 .collect()
         };
-        Counter { weighted, postings, floor, max_score, reachable, all_weight_one }
+        Counter {
+            weighted,
+            postings,
+            floor,
+            max_score,
+            reachable,
+            all_weight_one,
+        }
     }
 
     /// A fresh best-first walk cursor over this counter (the only way to construct a [`Walk`]).
@@ -257,8 +283,8 @@ impl Counter {
 
     /// Raw overlap of `id`: how many retained postings contain it (`O(k)` SIMD `contains`,
     /// k small by selection, paid only per *yielded* id). Only called for mixed-weight counters;
-    /// the all-weight-1 path takes `overlap = score` and retains no postings. Measured ~2.5x
-    /// cheaper than building a second (unweighted) bit-sliced counter for the overlap.
+    /// the all-weight-1 path takes `overlap = score` and retains no postings. Cheaper than
+    /// building a second (unweighted) bit-sliced counter for the overlap.
     fn raw_overlap(&self, id: u32) -> u32 {
         self.postings.iter().filter(|p| p.contains(id)).count() as u32
     }
@@ -311,8 +337,8 @@ pub fn tier_weights(cardinalities: &[u64], weight_step: f64) -> Vec<u32> {
 
 /// Materialize `src`'s ids (ascending) into `bucket`, reusing its allocation. Uses croaring's
 /// bulk cursor `read_many` — for a large bucket this fills the `Vec` far faster than per-id
-/// iteration (measured ~1.8× at 200 ids, ~4.5× at 1000); neutral for small buckets. Walk cost is
-/// a small fraction of a shallow top-k query, so this is a deep-pull / large-result win.
+/// iteration; neutral for small buckets. Walk cost is a small fraction of a shallow top-k query,
+/// so this is a deep-pull / large-result win.
 fn fill_bucket(bucket: &mut Vec<u32>, src: &Bitmap) {
     let card = src.cardinality() as usize;
     bucket.clear();
@@ -472,7 +498,11 @@ mod tests {
     #[test]
     fn streams_best_first_with_raw_overlap() {
         let counter = Counter::build(
-            &[Bitmap::of(&[1, 2, 3]), Bitmap::of(&[2, 3]), Bitmap::of(&[3])],
+            &[
+                Bitmap::of(&[1, 2, 3]),
+                Bitmap::of(&[2, 3]),
+                Bitmap::of(&[3]),
+            ],
             1.0,
             1,
         );
@@ -493,10 +523,17 @@ mod tests {
         // common df 16 -> weight 1; rare df 1 -> weight 4. Mixed weights -> owned postings retained.
         let common = Bitmap::of(&(0..16).collect::<Vec<_>>());
         let rare = Bitmap::of(&[5]);
-        assert_eq!(tier_weights(&[common.cardinality(), rare.cardinality()], 1.0), vec![1, 4]);
+        assert_eq!(
+            tier_weights(&[common.cardinality(), rare.cardinality()], 1.0),
+            vec![1, 4]
+        );
         let counter = Counter::build(&[common, rare], 1.0, 1);
         assert!(!counter.all_weight_one);
-        assert_eq!(counter.postings.len(), 2, "mixed weights retain owned postings");
+        assert_eq!(
+            counter.postings.len(),
+            2,
+            "mixed weights retain owned postings"
+        );
         let got = all(&counter);
         assert_eq!(got[0].id, 5);
         assert_eq!(got[0].score, 5); // 1 + 4
@@ -549,7 +586,9 @@ mod tests {
 
     #[test]
     fn lazy_walk_matches_full_drain_prefix() {
-        let posts: Vec<Bitmap> = (0..6).map(|i| Bitmap::of(&(0..=(i * 2)).collect::<Vec<_>>())).collect();
+        let posts: Vec<Bitmap> = (0..6)
+            .map(|i| Bitmap::of(&(0..=(i * 2)).collect::<Vec<_>>()))
+            .collect();
         let counter = Counter::build(&posts, 1.0, 1);
         let full = all(&counter);
         let mut w = counter.walk();

@@ -1,4 +1,4 @@
-//! Per-script-class document-frequency statistics for class-normalized rarity (§6).
+//! Per-script-class document-frequency statistics for class-normalized rarity.
 //!
 //! The pruner ranks query tokens rarest-first, but raw DF is not comparable across
 //! `(script, gram-size)` classes — shorter grams and denser scripts (CJK's thousands of

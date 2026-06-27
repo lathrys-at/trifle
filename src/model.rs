@@ -11,8 +11,8 @@
 //! A document is a `key` plus a set of named segments (`label → text`). `flat()` and
 //! `chunked()` are ergonomic front-ends that both lower to the same engine.
 //!
-//! (rev v0.3 removed the filterable-payload columns and the `Filter` grammar — filtering is
-//! now an opt-in raw-SQL fragment over the caller's *live* data; see [`SqlFilter`](crate::SqlFilter).)
+//! Filtering is an opt-in raw-SQL fragment over the caller's *live* data — see
+//! [`SqlFilter`](crate::SqlFilter) — not a stored attribute on the index.
 
 use crate::hash::FxHashSet;
 
@@ -193,7 +193,7 @@ impl Schema {
     }
 
     /// A flat schema: one integer key named `key` and a single default text field (any
-    /// label accepted). The closest analogue to the v0.1 fixed model.
+    /// label accepted) — the simplest shape.
     pub fn flat() -> Schema {
         Schema::builder()
             .key("key", KeyShape::Integer)
@@ -294,9 +294,13 @@ impl SchemaBuilder {
 /// A stable FNV-1a over a canonical *semantic* encoding of the schema (key name + shape,
 /// the set of text-field names, the open-label default) — **not** column layout
 /// (`sqlite_schema` owns structure). The dangerous drift is same-tables /
-/// reinterpreted-columns, which this catches. (`schema-v3`: rev v0.3 removed the
-/// filterable columns from the model and so from this fingerprint.)
-fn schema_fingerprint(key_name: &str, key_shape: KeyShape, fields: &[String], default_text: bool) -> u64 {
+/// reinterpreted-columns, which this catches.
+fn schema_fingerprint(
+    key_name: &str,
+    key_shape: KeyShape,
+    fields: &[String],
+    default_text: bool,
+) -> u64 {
     let mut sorted: Vec<&String> = fields.iter().collect();
     sorted.sort();
     let mut bytes = Vec::new();

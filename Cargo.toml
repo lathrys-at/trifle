@@ -1,12 +1,7 @@
 [workspace]
-members = ["crates/trifle-overlap", "crates/trifle-lean"]
-# `benchmarks/` is temporarily excluded: its harness is built around the removed `Effort`
-# rerank-pool sweep, the `Shared` backend, and the `Ranker` trait, so it does not compile against
-# the rev-v0.3 streaming API. Reworking it (rerank becomes a caller-side `take(pool)` over
-# `candidates`; bench `trifle-overlap` directly; the `dfsweep` eval) is a tracked follow-up — see
-# docs/design/rev-simplify/HANDOFF-integration.md. `croaring-bsi-bench` is the quarantined A/B
-# (its own [workspace]); run both via their own manifest paths.
-exclude = ["crates/croaring-bsi-bench", "benchmarks"]
+members = ["crates/trifle-overlap"]
+# `benchmarks/` is excluded until its harness is reworked against the streaming candidate API.
+exclude = ["benchmarks"]
 
 # Shared lint bar, inherited by every workspace member (incl. the benchmark crate).
 [workspace.lints.rust]

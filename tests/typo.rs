@@ -10,7 +10,11 @@ fn finds(target: &str, query: &str) -> bool {
     let h = Harness::new();
     h.put(1, "f", target);
     h.put(2, "f", "completely unrelated content about sailing ships");
-    h.put(3, "f", "another different sentence regarding mountain trails");
+    h.put(
+        3,
+        "f",
+        "another different sentence regarding mountain trails",
+    );
     let hits = h.search(query, 5).unwrap();
     hit(&hits, 1)
 }

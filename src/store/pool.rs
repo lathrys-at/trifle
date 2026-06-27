@@ -82,7 +82,7 @@ impl ReadPool {
         // leaked its read transaction — `mem::forget`, `panic = "abort"`, or a double-panic that
         // bypasses `Drop` — would otherwise hand the next checkout a connection still pinning an
         // open WAL snapshot. Returning it to the pool clean keeps the snapshot lifetime bounded by
-        // the checkout, not by some past leak (PROPOSAL §6 pool check-in rollback).
+        // the checkout, not by some past leak.
         if !conn.is_autocommit() {
             let _ = conn.execute_batch("ROLLBACK");
         }

@@ -25,7 +25,6 @@ const BUSY_TIMEOUT: Duration = Duration::ZERO;
 /// read-only connections that, under WAL, run concurrently with the writer. The caller passes a
 /// path; trifle owns everything else.
 ///
-/// This is the only store (rev v0.3 dropped the `Backend` trait and the `Shared` backend). An
 /// [`Index`](crate::Index) holds one `Sidecar` and reads/writes through it.
 pub struct Sidecar {
     store: Store,

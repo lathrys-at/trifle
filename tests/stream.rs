@@ -31,7 +31,9 @@ fn candidates_are_provenance_only_then_hydrated() {
     assert!(hits.iter().all(|m| !m.text.is_empty()));
     assert_eq!(
         ids(&hits),
-        keep.iter().map(|c| c.key().as_i64().unwrap()).collect::<Vec<_>>(),
+        keep.iter()
+            .map(|c| c.key().as_i64().unwrap())
+            .collect::<Vec<_>>(),
         "hydrate preserves the chosen order"
     );
 }
@@ -91,7 +93,10 @@ fn batch_equals_serial() {
     let batch = reader.matches_batch(&queries, &opts, 10).unwrap();
     for (i, q) in queries.iter().enumerate() {
         let serial = reader.matches(q, &opts, 10).unwrap();
-        assert_eq!(batch[i], serial, "query {q:?} ranks identically batch vs serial");
+        assert_eq!(
+            batch[i], serial,
+            "query {q:?} ranks identically batch vs serial"
+        );
     }
 }
 
@@ -107,7 +112,11 @@ fn a_stream_can_pull_then_filter_in_caller_code() {
 
     let kept: Vec<_> = stream
         .by_ref()
-        .filter(|c| c.as_ref().map(|c| c.key().as_i64() == Some(7)).unwrap_or(true))
+        .filter(|c| {
+            c.as_ref()
+                .map(|c| c.key().as_i64() == Some(7))
+                .unwrap_or(true)
+        })
         .take(5)
         .collect::<Result<Vec<_>>>()
         .unwrap();

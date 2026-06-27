@@ -5,10 +5,9 @@
 //! concurrently with the writer. The whole surface is plain tables and BLOBs (no virtual
 //! tables beyond the `carray`/`rarray` helper), so it is genuinely portable.
 //!
-//! (rev v0.3 dropped the `Backend` trait and the `Shared` backend: the only store is the
-//! concrete [`Sidecar`], so no generic `B` threads through the public types. Co-locating
-//! trifle's tables inside a caller-owned database is recovered, if needed, by an `ATTACH`
-//! on the read-connection factory rather than a second backend.)
+//! The only store is the concrete [`Sidecar`]. Co-locating trifle's tables inside a
+//! caller-owned database is available, if needed, via an `ATTACH` on the read-connection
+//! factory.
 
 use std::sync::Once;
 
@@ -62,7 +61,7 @@ pub struct TableMap {
     /// Key/value metadata: schema/data/tokenizer version stamps, rolling counters.
     pub meta: String,
     /// One row per indexed segment (id, caller key, label, snapshot text, gram length).
-    /// `seg.id` is the roaring posting id. (rev v0.3 folded the former `doc` table here.)
+    /// `seg.id` is the roaring posting id.
     pub seg: String,
     /// Per-segment forward index: the interned `u32` term-id set of each segment, as a
     /// roaring posting. Read by delete, so delete needs neither the text nor the tokenizer.

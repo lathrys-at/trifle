@@ -323,7 +323,11 @@ fn hydrate_matches<T: Tokenizer>(
     if kept.is_empty() {
         return Ok(Vec::new());
     }
-    let arr: Rc<Vec<Value>> = Rc::new(kept.iter().map(|c| Value::Integer(c.seg_id as i64)).collect());
+    let arr: Rc<Vec<Value>> = Rc::new(
+        kept.iter()
+            .map(|c| Value::Integer(c.seg_id as i64))
+            .collect(),
+    );
     let sql = format!("SELECT id, txt FROM {} WHERE id IN rarray(?1)", ns.seg());
     let mut txt: FxHashMap<u32, String> =
         FxHashMap::with_capacity_and_hasher(kept.len(), Default::default());

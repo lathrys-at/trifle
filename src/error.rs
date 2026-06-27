@@ -23,7 +23,7 @@ pub enum Error {
     /// (`SQLITE_BUSY`/`SQLITE_LOCKED`, and the `SQLITE_SCHEMA` re-prepare) are mapped to the
     /// retryable [`Error::Busy`] instead (see the [`From`] impl below), because the library
     /// never blocks the caller's thread to retry — it surfaces a retryable signal and the caller
-    /// owns the backoff (audit OD1).
+    /// owns the backoff.
     #[error("sqlite: {0}")]
     Sqlite(#[source] rusqlite::Error),
 
@@ -108,8 +108,8 @@ impl From<rusqlite::Error> for Error {
     /// (`SQLITE_BUSY`/`SQLITE_LOCKED`) or a schema-change re-prepare (`SQLITE_SCHEMA`) — becomes
     /// the retryable [`Error::Busy`], so every store path (read checkout, the search body, and
     /// writes) surfaces one uniform "retry me" signal and the caller owns the backoff. The
-    /// library never sleeps/blocks to retry internally (`busy_timeout` is 0 — audit OD1). Any
-    /// other SQLite error is a real [`Error::Sqlite`] fault.
+    /// library never sleeps/blocks to retry internally (`busy_timeout` is 0). Any other SQLite
+    /// error is a real [`Error::Sqlite`] fault.
     fn from(e: rusqlite::Error) -> Self {
         if is_retryable(&e) {
             Error::Busy(format!(

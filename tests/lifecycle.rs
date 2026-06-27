@@ -77,10 +77,16 @@ fn compact_preserves_results_and_clears_the_backlog() {
     h.index.compact().unwrap();
     h.remove(3);
     let before = h.index.stats().unwrap();
-    assert!(before.delta_backlog > 0, "the remove leaves a delta backlog");
+    assert!(
+        before.delta_backlog > 0,
+        "the remove leaves a delta backlog"
+    );
     let stats = h.index.compact().unwrap();
     assert!(stats.tokens_folded > 0);
-    assert!(stats.ids_purged > 0, "the deleted doc's base ids are purged");
+    assert!(
+        stats.ids_purged > 0,
+        "the deleted doc's base ids are purged"
+    );
     let after = h.index.stats().unwrap();
     assert_eq!(after.delta_backlog, 0, "fold clears the backlog");
     assert!(finds(&h, "quick brown fox", 1));
@@ -94,7 +100,10 @@ fn search_works_across_base_and_delta_after_compact() {
     h.index.compact().unwrap(); // doc 1 now lives in the base
     h.put(2, "f", "established baseline content"); // doc 2 lives in the delta
     let hits = h.search("established baseline", 10).unwrap();
-    assert!(hit(&hits, 1) && hit(&hits, 2), "base and delta both contribute");
+    assert!(
+        hit(&hits, 1) && hit(&hits, 2),
+        "base and delta both contribute"
+    );
 }
 
 #[test]
@@ -102,8 +111,14 @@ fn rebuild_replaces_the_corpus_and_is_searchable() {
     let h = Harness::new();
     h.put(99, "f", "stale preexisting data to be discarded");
     h.index.rebuild(fixture_docs()).unwrap();
-    assert!(!finds(&h, "stale preexisting", 99), "pre-rebuild data discarded");
-    assert!(finds(&h, "quick brown fox", 1), "rebuilt corpus is searchable");
+    assert!(
+        !finds(&h, "stale preexisting", 99),
+        "pre-rebuild data discarded"
+    );
+    assert!(
+        finds(&h, "quick brown fox", 1),
+        "rebuilt corpus is searchable"
+    );
     assert_eq!(h.index.stats().unwrap().segments, FIXTURE.len() as u64);
 }
 
@@ -217,7 +232,10 @@ fn remove_segment_wipes_one_label_and_leaves_the_others() {
 
     assert!(!finds(&h, "alpha ocr", 1), "doc 1 scan label wiped");
     assert!(finds(&h, "beta caption", 1), "doc 1 alt label survives");
-    assert!(finds(&h, "gamma other", 2), "another doc's same label untouched");
+    assert!(
+        finds(&h, "gamma other", 2),
+        "another doc's same label untouched"
+    );
     assert_eq!(h.index.stats().unwrap().segments, 2);
 
     // Removing a (doc, label) pair with no segment is a no-op.
@@ -259,7 +277,10 @@ fn rebuild_skips_empty_documents() {
         "only the non-empty document built"
     );
     assert!(finds(&h, "alpha bravo", 1));
-    assert!(!finds(&h, "alpha bravo", 2), "the skipped empty doc is absent");
+    assert!(
+        !finds(&h, "alpha bravo", 2),
+        "the skipped empty doc is absent"
+    );
 }
 
 #[test]
@@ -373,6 +394,10 @@ fn results_are_byte_identical_across_reopen_and_rebuild() {
         .unwrap()
         .matches(q, &trifle::SearchOpts::new(), 10)
         .unwrap();
-    assert_eq!(ids(&after), ids(&baseline), "ranking is stable across reindex");
+    assert_eq!(
+        ids(&after),
+        ids(&baseline),
+        "ranking is stable across reindex"
+    );
     drop(h.dir);
 }

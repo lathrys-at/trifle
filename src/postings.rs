@@ -7,10 +7,9 @@
 //! touches only the small `term.df` and `delta` rows; the big `post.base` is
 //! rewritten only by [`fold`] or a rebuild.
 //!
-//! Bitmaps are [`croaring::Bitmap`] (CRoaring/SIMD) throughout. Blobs are the
-//! **portable** serialization — byte-identical to the old `roaring`-crate format, so an
-//! existing store reads back unchanged — and an effective posting is handed straight to
-//! the [`trifle_overlap`] engine with no re-serialization.
+//! Bitmaps are [`croaring::Bitmap`] (CRoaring/SIMD) throughout. Blobs are the standard
+//! **portable** CRoaring serialization, and an effective posting is handed straight to the
+//! [`trifle_overlap`] engine with no re-serialization.
 
 use crate::hash::FxHashMap;
 use std::io;
@@ -24,8 +23,8 @@ use crate::dict::TermId;
 use crate::error::{Error, Result};
 use crate::store::Namespace;
 
-/// Serialize a bitmap to its on-disk blob form (CRoaring **portable** format —
-/// byte-identical to the legacy `roaring`-crate blobs). Infallible (allocates).
+/// Serialize a bitmap to its on-disk blob form (the standard CRoaring **portable** format).
+/// Infallible (allocates).
 pub(crate) fn serialize(bm: &Bitmap) -> Vec<u8> {
     bm.serialize::<Portable>()
 }

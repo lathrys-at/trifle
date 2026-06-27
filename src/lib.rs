@@ -93,8 +93,8 @@ use dict::{Dictionary, TermId};
 pub use error::{Error, Result};
 pub use filter::SqlFilter;
 pub use model::{Document, Key, KeyShape, Match, Schema, SchemaBuilder};
-pub use search::{Candidate, CandidateStream};
 use schema::SCHEMA_VERSION;
+pub use search::{Candidate, CandidateStream};
 use store::{Namespace, Sidecar};
 pub use term::{IntoTerm, Term};
 use tokenize::{DefaultTokenizer, Tokenizer};
@@ -394,7 +394,9 @@ impl<T: Tokenizer> Index<T> {
     /// A cheap consistency probe: the monotonic-id invariant `max(seg.id) < next_id`.
     fn desync(&self, conn: &Connection, ns: &Namespace) -> Result<bool> {
         let max_id: Option<i64> =
-            conn.query_row(&format!("SELECT max(id) FROM {}", ns.seg()), [], |r| r.get(0))?;
+            conn.query_row(&format!("SELECT max(id) FROM {}", ns.seg()), [], |r| {
+                r.get(0)
+            })?;
         let next: i64 = schema::meta_get(conn, ns, schema::KEY_NEXT_ID)?
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);

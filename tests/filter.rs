@@ -90,7 +90,11 @@ fn filter_does_not_reduce_the_floor_for_unfiltered_queries() {
     let allowed: Rc<Vec<Value>> = Rc::new(vec![Value::Integer(1)]);
     let params: Vec<&dyn ToSql> = vec![&allowed];
     let filtered = ids(&h
-        .search_opts("quick", &SearchOpts::new().filter(SqlFilter::new("key IN rarray(?1)", &params)), 10)
+        .search_opts(
+            "quick",
+            &SearchOpts::new().filter(SqlFilter::new("key IN rarray(?1)", &params)),
+            10,
+        )
         .unwrap());
     for k in &filtered {
         assert!(unfiltered.contains(k), "filter only removes, never adds");

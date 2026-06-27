@@ -1,0 +1,22 @@
+[package]
+name = "trifle-overlap"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Pure IDF-weighted bit-sliced overlap engine for trifle. Roaring-only: no SQL, no provenance, no String."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# The ONLY dependency. The engine cannot name `rusqlite`, `Connection`, `Key`, or any
+# provenance/`String` type — the isolation the design wants is enforced by the dependency
+# graph, not by discipline. (no_std is a future aspiration, contingent on `roaring`.)
+roaring = "0.11"
+
+[lints]
+workspace = true
+
+# A dependency-free flatness benchmark (run with --release): demonstrates that candidate
+# generation is O(k·log k) bitmap ops, independent of posting cardinality, vs a naive counter.
+[[example]]
+name = "flatness"

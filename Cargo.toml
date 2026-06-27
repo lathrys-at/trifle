@@ -1,5 +1,5 @@
 [workspace]
-members = ["benchmarks"]
+members = ["benchmarks", "crates/trifle-overlap"]
 
 # Shared lint bar, inherited by every workspace member (incl. the benchmark crate).
 [workspace.lints.rust]

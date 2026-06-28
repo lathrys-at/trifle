@@ -314,28 +314,6 @@ impl Flags {
     }
 }
 
-/// Print a `#`-prefixed comment, hard-wrapped at 72 columns on word boundaries (each line,
-/// including continuations, re-prefixed with `# `). All of the harness's `#` notes go through
-/// this so the output stays within a narrow terminal. A single word longer than the budget
-/// overflows its own line rather than being split.
-fn comment(text: &str) {
-    const WIDTH: usize = 72;
-    const PREFIX: &str = "# ";
-    let budget = WIDTH - PREFIX.len();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > budget {
-            println!("{PREFIX}{line}");
-            line.clear();
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    println!("{PREFIX}{line}");
-}
-
 /// Parse a `u64` in decimal or `0x`-hex, ignoring `_` separators.
 fn parse_u64(s: &str) -> Option<u64> {
     let t = s.replace('_', "");
@@ -413,7 +391,7 @@ fn print_filter(skip: &HashSet<String>) {
     if !skip.is_empty() {
         let mut s: Vec<&str> = skip.iter().map(String::as_str).collect();
         s.sort_unstable();
-        comment(&format!("filter: skipping {}", s.join(", ")));
+        println!("# filter: skipping {}", s.join(", "));
     }
 }
 
@@ -529,9 +507,7 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
             return Err("concurrent mode runs trifle only, but it is filtered out".into());
         }
         print_run_header(&meta, &skip);
-        comment(&format!(
-            "mode=concurrent threads={concurrent} (trifle only — the read-pool fanout axis)"
-        ));
+        println!("# mode=concurrent threads={concurrent} (trifle read-pool fanout)");
         let trifle = Trifle::build(corpus, tuning);
         let recall = set_recall_at_k(&trifle.search_batch(&qtexts, k), &relevant, k);
         bench_concurrent(&trifle, &bench, concurrent, recall);
@@ -545,14 +521,9 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
         render_run_json(&meta, &records);
     } else {
         print_run_header(&meta, &skip);
-        comment(&format!(
-            "mode={}",
-            if batched { "batched" } else { "serial" }
-        ));
+        println!("# mode={}", if batched { "batched" } else { "serial" });
         render_run_text(&bench, &records);
-        comment(
-            "(latency is one axis; durability, footprint, update cost, and semantics differ per engine — see the comparison table in the project README)",
-        );
+        println!("# latency is one axis; see the README comparison for the rest");
     }
     Ok(())
 }
@@ -759,11 +730,11 @@ fn bench_concurrent(trifle: &Trifle, bench: &Bench, threads: usize, recall: f64)
 
 /// The `# …`-prefixed header for the human (text) output of the latency profile.
 fn print_run_header(meta: &RunMeta, skip: &HashSet<String>) {
-    comment(&format!("latency — {}", meta.provenance));
-    comment(&format!(
-        "docs={} queries={} k={} warmup={} repeat={}",
+    println!("# latency — {}", meta.provenance);
+    println!(
+        "# docs={} queries={} k={} warmup={} repeat={}",
         meta.docs, meta.queries, meta.k, meta.warmup, meta.repeat
-    ));
+    );
     print_filter(skip);
 }
 
@@ -1190,17 +1161,15 @@ fn cmd_relevance(args: &[String]) -> Result<(), String> {
             serde_json::to_string(&obj).expect("serialize relevance json")
         );
     } else {
-        comment(&format!(
-            "relevance (recall/MRR/nDCG @ {REPORT_KS:?}) — {}",
+        println!(
+            "# relevance (recall/MRR/nDCG @ {REPORT_KS:?}) — {}",
             corpus.provenance
-        ));
-        comment(&format!(
-            "docs={} scored-queries={scored} depth={KMAX} (single pull, sliced) — sparse qrels (~1 relevant/query): recall@k UNDERSTATES true recall",
-            corpus.docs.len()
-        ));
-        comment(
-            "real paraphrased queries (no guaranteed substring). baseline = word BM25 (canonical) + trigram-bm25 cousin + LIKE floor.",
         );
+        println!(
+            "# docs={} scored={scored} depth={KMAX}; sparse qrels => recall@k understates",
+            corpus.docs.len()
+        );
+        println!("# baselines: word-BM25 + trigram-BM25 + LIKE");
         print_filter(&skip);
         for r in &records {
             render_quality_record(r);
@@ -1369,24 +1338,18 @@ fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
             .map(|e| format!("{}×{}", e.edits, e.count))
             .collect::<Vec<_>>()
             .join(" ");
-        comment(&format!(
-            "fuzzy (recall/MRR/nDCG @ {REPORT_KS:?}) — {}",
+        println!(
+            "# fuzzy (recall/MRR/nDCG @ {REPORT_KS:?}) — {}",
             corpus.provenance
-        ));
-        comment(&format!(
-            "edits {edits_lo}..={edits_hi} random per query (mix {mix}); queries={} scored-queries={} depth={KMAX} (single pull, sliced)",
+        );
+        println!(
+            "# edits {edits_lo}..={edits_hi} random/query (mix {mix}); queries={} scored={} depth={KMAX}",
             qtexts.len(),
             scored_queries(&relevant),
-        ));
-        comment(&format!(
-            "trigram-survival={survival:.3}; near-distractor-density={density:.3} (fraction of targets whose clean name surfaces another indexed entity; low => easy run, recall inflated)"
-        ));
-        comment(
-            "baseline = FTS5 trigram-MATCH (OR-bag, bm25) + LIKE floor, NOT bm25-phrase (~0 on typos by construction)",
         );
-        comment(
-            "CAVEAT: entity-name fuzzy is a FAVORABLE regime (short, structured, low-paraphrase); strong recall here validates the fuzzy MACHINERY, not prose fuzzy",
-        );
+        println!("# trigram-survival={survival:.3} near-distractor-density={density:.3}");
+        println!("# baselines: FTS5 trigram-MATCH (OR-bag) + LIKE (not bm25-phrase)");
+        println!("# CAVEAT: entity-name fuzzy is favorable; validates machinery, not prose");
         print_filter(&skip);
         for r in &records {
             render_quality_record(r);
@@ -1735,11 +1698,11 @@ fn cmd_profile(args: &[String]) -> Result<(), String> {
     let ndocs = corpus.docs.len();
     let nq = qtexts.len();
     let ns = dist.count();
-    comment(&format!(
-        "profile — Σ(kept-posting cardinality) per query — {}",
+    println!(
+        "# profile — Σ(kept-posting cardinality) per query — {}",
         corpus.provenance
-    ));
-    comment(&format!("docs={ndocs} queries={nq} (samples={ns})"));
+    );
+    println!("# docs={ndocs} queries={nq} (samples={ns})");
     println!(
         "Σ-cardinality  p50 {} · p90 {} · p99 {} · max {} · mean {:.0}",
         dist.pct(50.0),
@@ -1748,9 +1711,7 @@ fn cmd_profile(args: &[String]) -> Result<(), String> {
         dist.max(),
         dist.mean(),
     );
-    comment(
-        "Correlate with the p99 of `latency`: if the tail tracks this curve, the residual is big-bitset AND/XOR cost (expected). If not, look at hydration.",
-    );
+    println!("# correlate with latency p99; residual = big-bitset AND/XOR cost");
     Ok(())
 }
 
@@ -1830,10 +1791,10 @@ fn cmd_dsweep(args: &[String]) -> Result<(), String> {
     let relevant: Vec<Vec<i64>> = queries.iter().map(|(_, r)| r.clone()).collect();
     let trifle = Trifle::build(&corpus, fixed);
 
-    comment(&format!(
-        "dsweep[{which}] — recall vs weight_step D — N={ndocs} queries={} depth={KMAX}",
+    println!(
+        "# dsweep[{which}] — recall vs weight_step D — N={ndocs} queries={} depth={KMAX}",
         qtexts.len()
-    ));
+    );
     println!("D       recall@1  @5      @10     @50     mrr@10  ndcg@10");
     let mut best = (f64::NAN, f64::NEG_INFINITY); // (D, recall@10)
     for &d in &steps {
@@ -1855,13 +1816,13 @@ fn cmd_dsweep(args: &[String]) -> Result<(), String> {
             best = (d, r10);
         }
     }
-    comment(&format!("scored-queries={}", scored_queries(&relevant)));
+    println!("# scored-queries={}", scored_queries(&relevant));
     match trifle.weight_step_hint() {
-        Some(h) => comment(&format!(
-            "WeightStepHint suggests D≈{h:.2}; recall@10-optimal in grid is D={:.2} (recall@10 {:.4})",
+        Some(h) => println!(
+            "# WeightStepHint D≈{h:.2}; recall@10-best in grid D={:.2} ({:.4})",
             best.0, best.1
-        )),
-        None => comment("WeightStepHint: none (no informative band-spread sample)"),
+        ),
+        None => println!("# WeightStepHint: none"),
     }
     Ok(())
 }
@@ -1901,10 +1862,8 @@ fn cmd_overlap(args: &[String]) -> Result<(), String> {
     }
     let p = |samples: Vec<u64>, q: f64| fmt_dur(Duration::from_nanos(Dist::new(samples).pct(q)));
 
-    comment("overlap — trifle-overlap build/walk on synthetic bitmaps (no SQLite)");
-    comment(&format!(
-        "postings(k)={k} trials={trials} universe={universe}"
-    ));
+    println!("# overlap — trifle-overlap build/walk on synthetic bitmaps (no SQLite)");
+    println!("# postings(k)={k} trials={trials} universe={universe}");
 
     // Build cost vs posting cardinality — the op-count flatness curve (all-weight-1).
     println!("\n## build cost vs posting cardinality (all-weight-1)");
@@ -2023,10 +1982,10 @@ fn cmd_ingest(args: &[String]) -> Result<(), String> {
     };
     let rate = |docs: usize, d: Duration| docs as f64 / d.as_secs_f64().max(1e-9);
 
-    comment(&format!(
-        "ingest — {} — docs={ndocs} batch={batch}",
+    println!(
+        "# ingest — {} — docs={ndocs} batch={batch}",
         corpus.provenance
-    ));
+    );
 
     // (a) incremental upsert + commit, batched.
     let dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;

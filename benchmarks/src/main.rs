@@ -136,7 +136,7 @@ LATENCY (speed only):
                                   geonames-* = exact entity-name queries (no typos), the
                                   short-structured-segment scaling regime.
     --k <N>                       Top-k limit per search [default: 10]
-    --warmup <N>                  Untimed warmup queries [default: 200]
+    --warmup <N>                  Untimed warmup queries [default: 3]
     --repeat <N>                  Measured passes (samples accumulate) [default: 1]
     --batched                     One matches_batch call (shares posting/frequency reads)
     --concurrent <T>              Run trifle across T reader threads, each on its own
@@ -151,13 +151,13 @@ LATENCY (speed only):
 
 RELEVANCE (recall + latency; single depth-50 pull):
     Engines: trifle, fts5-word-bm25 (BM25), fts5-trigram-bm25 (OR-bag), like-scan.
-    --warmup <N>                  Untimed warmup queries [default: 100]
+    --warmup <N>                  Untimed warmup queries [default: 3]
     --format <text|json>          Output format [default: text]
 
 FUZZY (recall + latency; single depth-50 pull):
     --corpus <geonames-cities|geonames-all>   Entity corpus [default: geonames-cities]
     --edits <N>                   Typos per query. Omit to run {1, 2} separately.
-    --warmup <N>                  Untimed warmup queries [default: 100]
+    --warmup <N>                  Untimed warmup queries [default: 3]
     --format <text|json>          Output format [default: text]
 
 SELSWEEP (selection-cost frontier; trifle only):
@@ -450,7 +450,7 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
 
     let corpus_name = flags.str("corpus", "synthetic");
     let k = flags.usize("k", 10)?;
-    let warmup = flags.usize("warmup", 200)?;
+    let warmup = flags.usize("warmup", 3)?;
     let repeat = flags.usize("repeat", 1)?.max(1);
     let batched = flags.flag("batched");
     let concurrent = flags.usize("concurrent", 0)?;
@@ -1214,7 +1214,7 @@ fn cmd_relevance(args: &[String]) -> Result<(), String> {
     }
     let n = flags.usize("queries", 1000)?;
     let seed = flags.u64("seed", DEFAULT_SEED)?;
-    let warmup = flags.usize("warmup", 100)?;
+    let warmup = flags.usize("warmup", 3)?;
     let tuning = tuning(&flags)?;
     let json_mode = match flags.str("format", "text").as_str() {
         "text" => false,
@@ -1361,7 +1361,7 @@ fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
     }
     let n_targets = flags.usize("queries", 2000)?;
     let seed = flags.u64("seed", DEFAULT_SEED)?;
-    let warmup = flags.usize("warmup", 100)?;
+    let warmup = flags.usize("warmup", 3)?;
     let tuning = tuning(&flags)?;
     let edit_counts: Vec<usize> = if flags.has("edits") {
         vec![flags.usize("edits", 1)?]

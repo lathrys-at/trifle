@@ -150,15 +150,17 @@ much*.
 
 ### Scaling / frontier sweeps
 
-`selsweep` measures one `N` per run (`--docs`); sweep `N` externally. The canonical scaling
-ladder is the **geometric ×5**: `{1000, 5000, 25000, 125000, 625000}`.
+`selsweep` takes `--docs` as a single `N` **or a comma-separated ladder** swept in one run (each
+`N` rebuilds the corpus; all rows land in one CSV, pivoted apart by the `N` column). The canonical
+scaling ladder is the **geometric ×5**: `{1000, 5000, 25000, 125000, 625000}`.
 
 ```bash
-for n in 1000 5000 25000 125000 625000; do
-  cargo run --manifest-path benchmarks/Cargo.toml --release -- selsweep \
-    --corpus geonames-all --docs "$n" --seed 42 >> frontier.csv
-done
+cargo run --manifest-path benchmarks/Cargo.toml --release -- selsweep \
+  --corpus geonames-all --docs 1000,5000,25000,125000,625000 --seed 42 > frontier.csv
 ```
+
+(The old external `for n in …; do … >> frontier.csv; done` loop still works — the plotter skips the
+repeated per-run header lines either way.)
 
 `selsweep` CSV (and `--format json`) columns are
 `arm,knob,N,k,recall,sigma_df_p50,sigma_df_p99,lat_p50_us,lat_p99_us`, with one row per
@@ -169,14 +171,22 @@ the work-done collector, constant across the four `k` rows; `recall` varies by `
 selection-cost frontier. The same ladder applies to `latency`/`profile` if you want the
 flat-latency-as-N-grows confirmation.
 
-`scripts/plot_selsweep.py` draws that frontier straight from the appended CSV (it skips the
-repeated per-run header lines): one panel row per `N`, `recall@k` on the y-axis against Σdf and
-p99 latency, the `t_max` and `df_budget` arms overlaid — the better knob is the curve up-and-left.
-Needs matplotlib.
+`scripts/plot_selsweep.py` draws the frontier straight from that CSV (needs matplotlib). Three
+`--mode`s, all keyed off the `N` column so a ladder file plots in one shot:
+
+- **`facet`** (default) — one panel row per `N`, `recall@k` against Σdf and p99 latency, the
+  `t_max` and `df_budget` arms overlaid. The better knob is the curve up-and-left.
+- **`overlay`** — every `N` on shared axes (color = `N`, linestyle = arm); shows how the frontier
+  shifts as the corpus grows.
+- **`knee`** — the scaling analysis: per `N`, the cheapest `df_budget` reaching `--knee-frac` (0.98)
+  of its own max recall (the knee), then **optimal df_budget vs `N`** with the `budget*/N` fraction
+  and a log-log fit. A slope ≈ 1 means the optimal budget is a constant slice of `N`. The per-`N`
+  knee table prints to stderr.
 
 ```bash
-python3 benchmarks/scripts/plot_selsweep.py frontier.csv            # -> selsweep.png
-python3 benchmarks/scripts/plot_selsweep.py frontier.csv --k 10 --x both
+python3 benchmarks/scripts/plot_selsweep.py frontier.csv                  # facet -> selsweep.png
+python3 benchmarks/scripts/plot_selsweep.py frontier.csv --mode overlay
+python3 benchmarks/scripts/plot_selsweep.py frontier.csv --mode knee      # optimal df_budget vs N
 ```
 
 ## Caveats

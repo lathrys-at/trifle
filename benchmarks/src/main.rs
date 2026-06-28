@@ -166,12 +166,14 @@ FUZZY (recall + latency; single depth-50 pull):
 SELSWEEP (selection-cost frontier; trifle only):
     --corpus <geonames-all|geonames-cities|msmarco-relevance>  Labeled corpus [default:
                                   msmarco-relevance]
+    --docs <N | n1,n2,..>         Index size, or a comma-separated N ladder swept in one run
+                                  (e.g. 1000,5000,25000,125000,625000) [default: 100000]
     --edits <N>                   Typos per query for geonames [default: 2]
     --max-tmax <T>                Top of the t_max grid (2,4,..,T) [default: 20]
     --format <csv|json>           Output format [default: csv]
     Columns: arm,knob,N,k,recall,sigma_df_p50,sigma_df_p99,lat_p50_us,lat_p99_us.
-    N is per-run (--docs); sweep N externally over the geometric x5 ladder
-    {1000,5000,25000,125000,625000} for the scaling frontier.
+    Each N rebuilds the corpus; all rows land in one CSV (the N column pivots them apart).
+    plot_selsweep.py --mode knee fits the optimal df_budget vs N relationship.
 
 DSWEEP (recall vs the weight_step D; trifle only, single depth-50 pull):
     --corpus <msmarco-relevance|geonames-cities|geonames-all>  Labeled corpus [default:
@@ -205,7 +207,7 @@ EXAMPLES:
     trifle-bench latency --corpus msmarco --docs 25000 --concurrent 8
     trifle-bench relevance --docs 100000 --queries 2000 --format json
     trifle-bench fuzzy --corpus geonames-cities --edits 1
-    trifle-bench selsweep --corpus geonames-all --docs 125000
+    trifle-bench selsweep --corpus geonames-all --docs 1000,5000,25000,125000,625000
     trifle-bench profile --docs 1000000
 ";
 
@@ -1488,15 +1490,22 @@ struct SelRow {
     lat_p99_us: f64,
 }
 
+/// One rung of the `--docs` ladder: the realized doc/query counts and provenance at that `N`
+/// (per-`N` because each `N` rebuilds the corpus, so the counts and provenance differ).
+#[derive(Serialize)]
+struct SelLadderEntry {
+    n: usize,
+    queries: usize,
+    provenance: String,
+}
+
 #[derive(Serialize)]
 struct SelRunJson<'a> {
     command: &'a str,
     corpus: &'a str,
-    provenance: &'a str,
-    docs: usize,
-    queries: usize,
     seed: u64,
     conditions: Conditions,
+    ladder: Vec<SelLadderEntry>,
     rows: Vec<SelRow>,
 }
 
@@ -1513,9 +1522,11 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
         "max-tmax",
         "format",
     ])?;
-    let n = flags.usize("docs", 100_000)?;
-    if n == 0 {
-        return Err("--docs must be >= 1".into());
+    // `--docs` is a ladder: one or more `N` (comma-separated), each rebuilt and swept in turn,
+    // all rows emitted to one CSV (the per-row `N` column pivots them apart downstream).
+    let ns = parse_usize_list(&flags.str("docs", "100000"))?;
+    if ns.contains(&0) {
+        return Err("--docs values must be >= 1".into());
     }
     let q = flags.usize("queries", 500)?;
     let edits = flags.usize("edits", 2)?;
@@ -1540,56 +1551,65 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
         weight_step: flags.opt_f64("weight-step")?,
     };
 
-    let (corpus, queries) = labeled_corpus(&which, n, q, edits, seed)?;
-    let ndocs = corpus.docs.len();
-    if queries.is_empty() {
-        return Err("no queries generated".into());
-    }
-    let qtexts: Vec<&str> = queries.iter().map(|(t, _)| t.as_str()).collect();
-    let relevant: Vec<Vec<i64>> = queries.iter().map(|(_, r)| r.clone()).collect();
-    let provenance = corpus.provenance.clone();
-    let trifle = Trifle::build(&corpus, fixed);
-
     let tmaxes = tmax_grid(max_tmax);
-    eprintln!(
-        "selsweep[{which}]: N={ndocs} queries={} depth={KMAX} — t_max {tmaxes:?} + df_budget {SEL_FRACS:?}",
-        qtexts.len()
-    );
-
     let mut rows: Vec<SelRow> = Vec::new();
-    // Arm 1 — t_max: the selection-count cap.
-    for &t in &tmaxes {
-        let (results, lats, sigma) = sweep_run(&qtexts, |query| trifle.search_tmax(query, KMAX, t));
-        rows.extend(sel_rows(
-            "t_max", t as u64, ndocs, &results, &relevant, &lats, sigma,
-        ));
-    }
-    // Arm 2 — df_budget: the Σdf work cap, as fractions of N.
-    for &frac in SEL_FRACS {
-        let budget = ((frac * ndocs as f64).round() as u64).max(1);
-        let (results, lats, sigma) = sweep_run(&qtexts, |query| {
-            trifle.search_df_budget(query, KMAX, budget)
+    let mut ladder: Vec<SelLadderEntry> = Vec::new();
+
+    for &n in &ns {
+        let (corpus, queries) = labeled_corpus(&which, n, q, edits, seed)?;
+        let ndocs = corpus.docs.len();
+        if queries.is_empty() {
+            return Err(format!("no queries generated at N={n}"));
+        }
+        let qtexts: Vec<&str> = queries.iter().map(|(t, _)| t.as_str()).collect();
+        let relevant: Vec<Vec<i64>> = queries.iter().map(|(_, r)| r.clone()).collect();
+        let provenance = corpus.provenance.clone();
+        let trifle = Trifle::build(&corpus, fixed);
+
+        eprintln!(
+            "selsweep[{which}]: N={ndocs} queries={} depth={KMAX} — t_max {tmaxes:?} + df_budget {SEL_FRACS:?}",
+            qtexts.len()
+        );
+
+        // Arm 1 — t_max: the selection-count cap.
+        for &t in &tmaxes {
+            let (results, lats, sigma) =
+                sweep_run(&qtexts, |query| trifle.search_tmax(query, KMAX, t));
+            rows.extend(sel_rows(
+                "t_max", t as u64, ndocs, &results, &relevant, &lats, sigma,
+            ));
+        }
+        // Arm 2 — df_budget: the Σdf work cap, as fractions of N.
+        for &frac in SEL_FRACS {
+            let budget = ((frac * ndocs as f64).round() as u64).max(1);
+            let (results, lats, sigma) = sweep_run(&qtexts, |query| {
+                trifle.search_df_budget(query, KMAX, budget)
+            });
+            rows.extend(sel_rows(
+                "df_budget",
+                budget,
+                ndocs,
+                &results,
+                &relevant,
+                &lats,
+                sigma,
+            ));
+        }
+
+        ladder.push(SelLadderEntry {
+            n: ndocs,
+            queries: qtexts.len(),
+            provenance,
         });
-        rows.extend(sel_rows(
-            "df_budget",
-            budget,
-            ndocs,
-            &results,
-            &relevant,
-            &lats,
-            sigma,
-        ));
     }
 
     if json_mode {
         let obj = SelRunJson {
             command: "selsweep",
             corpus: &which,
-            provenance: &provenance,
-            docs: ndocs,
-            queries: qtexts.len(),
             seed,
             conditions: conditions(),
+            ladder,
             rows,
         };
         println!(
@@ -1737,6 +1757,28 @@ fn parse_edits_range(s: &str) -> Result<(usize, usize), String> {
     let lo = *vals.iter().min().ok_or("--edits is empty")?;
     let hi = *vals.iter().max().expect("non-empty (min succeeded)");
     Ok((lo, hi))
+}
+
+/// Parse a comma-separated `usize` list (the `--docs` ladder for selsweep), honoring `_`/hex
+/// via [`parse_u64`]. Sorted ascending and deduped, so a repeated or out-of-order ladder is
+/// normalized to one ascending sweep.
+fn parse_usize_list(s: &str) -> Result<Vec<usize>, String> {
+    let mut v: Vec<usize> = s
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            parse_u64(t)
+                .map(|u| u as usize)
+                .ok_or_else(|| format!("--docs: not an integer: {t}"))
+        })
+        .collect::<Result<_, _>>()?;
+    v.sort_unstable();
+    v.dedup();
+    if v.is_empty() {
+        return Err("--docs is empty".into());
+    }
+    Ok(v)
 }
 
 /// Parse a comma-separated `f64` list (the `--steps` grid).

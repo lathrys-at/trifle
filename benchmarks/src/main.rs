@@ -170,7 +170,8 @@ SELSWEEP (selection-cost frontier; trifle only):
                                   (e.g. 1000,5000,25000,125000,625000) [default: 100000]
     --queries <N>                 Labeled queries evaluated per N [default: 500]
     --edits <N>                   Typos per query for geonames [default: 2]
-    --max-tmax <T>                Top of the t_max grid (2,4,..,T) [default: 20]
+    --max-tmax <T>                Top of the generated t_max grid (2,4,..,T) [default: 20]
+    --t-maxes <a,b,c>             t_max grid (token counts), overrides --max-tmax, e.g. 4,8,12,16
     --df-fracs <a,b,c>            df_budget grid as fractions of N (each = frac*N), e.g.
                                   0.03,0.05,0.08 [default: 0.005,0.01,0.02,0.05,0.1,0.2,0.5,1.0]
     --format <csv|json>           Output format [default: csv]
@@ -1524,12 +1525,13 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
         "min-shared",
         "weight-step",
         "max-tmax",
+        "t-maxes",
         "df-fracs",
         "format",
     ])?;
     // `--docs` is a ladder: one or more `N` (comma-separated), each rebuilt and swept in turn,
     // all rows emitted to one CSV (the per-row `N` column pivots them apart downstream).
-    let ns = parse_usize_list(&flags.str("docs", "100000"))?;
+    let ns = parse_usize_list("docs", &flags.str("docs", "100000"))?;
     if ns.contains(&0) {
         return Err("--docs values must be >= 1".into());
     }
@@ -1562,7 +1564,18 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
         weight_step: flags.opt_f64("weight-step")?,
     };
 
-    let tmaxes = tmax_grid(max_tmax);
+    // The t_max arm sweeps these token counts; a manual `--t-maxes` grid overrides the generated
+    // `2,4,..,max-tmax` (so `--max-tmax` is ignored when `--t-maxes` is given).
+    let tmaxes = match flags.last("t-maxes") {
+        Some(s) => {
+            let v = parse_usize_list("t-maxes", s)?;
+            if v.contains(&0) {
+                return Err("--t-maxes values must be >= 1".into());
+            }
+            v
+        }
+        None => tmax_grid(max_tmax),
+    };
     let mut rows: Vec<SelRow> = Vec::new();
     let mut ladder: Vec<SelLadderEntry> = Vec::new();
 
@@ -1770,10 +1783,11 @@ fn parse_edits_range(s: &str) -> Result<(usize, usize), String> {
     Ok((lo, hi))
 }
 
-/// Parse a comma-separated `usize` list (the `--docs` ladder for selsweep), honoring `_`/hex
-/// via [`parse_u64`]. Sorted ascending and deduped, so a repeated or out-of-order ladder is
-/// normalized to one ascending sweep.
-fn parse_usize_list(s: &str) -> Result<Vec<usize>, String> {
+/// Parse a comma-separated `usize` list (the `--docs` ladder and the `--t-maxes` grid for
+/// selsweep), honoring `_`/hex via [`parse_u64`]. `flag` names the flag in error messages.
+/// Sorted ascending and deduped, so a repeated or out-of-order list is normalized to one
+/// ascending sweep.
+fn parse_usize_list(flag: &str, s: &str) -> Result<Vec<usize>, String> {
     let mut v: Vec<usize> = s
         .split(',')
         .map(str::trim)
@@ -1781,13 +1795,13 @@ fn parse_usize_list(s: &str) -> Result<Vec<usize>, String> {
         .map(|t| {
             parse_u64(t)
                 .map(|u| u as usize)
-                .ok_or_else(|| format!("--docs: not an integer: {t}"))
+                .ok_or_else(|| format!("--{flag}: not an integer: {t}"))
         })
         .collect::<Result<_, _>>()?;
     v.sort_unstable();
     v.dedup();
     if v.is_empty() {
-        return Err("--docs is empty".into());
+        return Err(format!("--{flag} is empty"));
     }
     Ok(v)
 }

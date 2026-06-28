@@ -165,7 +165,9 @@ repeated per-run header lines either way.)
 `--df-fracs a,b,c` overrides the df_budget grid (fractions of `N`, each becomes a `Σdf` cap =
 `frac·N`); the fractions scale per `N` across the ladder, so a refined grid around a knee works at
 every rung. E.g. once `knee` mode locates the elbow near `0.05·N`, densify there with
-`--df-fracs 0.02,0.03,0.04,0.05,0.06,0.08,0.1`.
+`--df-fracs 0.02,0.03,0.04,0.05,0.06,0.08,0.1`. Symmetrically, `--t-maxes a,b,c` sets the t_max
+arm's token-count grid explicitly (overriding the generated `2,4,..,--max-tmax`), e.g.
+`--t-maxes 4,8,12,16`.
 
 `selsweep` CSV (and `--format json`) columns are
 `arm,knob,N,k,recall,sigma_df_p50,sigma_df_p99,lat_p50_us,lat_p99_us`, with one row per

@@ -146,8 +146,10 @@ LATENCY (speed only):
                                   measured code). xctrace = Instruments (macOS); samply = X-plat.
     --instrument-out <dir>        Where to write the trace [.cache/bench/instruments]
 
-    A trifle-only in-corpus self-recall figure (the snippet/name's own doc is the answer)
-    rides along so the speed numbers carry a quality sanity check.
+    An in-corpus self-recall figure (the snippet/name's own doc is the answer) rides along so
+    the speed numbers carry a quality sanity check. trifle is always scored; the FTS5-phrase
+    and LIKE baselines are scored too on the exact geonames corpora (no typos), and left
+    unscored on the typo'd synthetic/msmarco snippets (phrase-MATCH scores ~0 there).
 
 RELEVANCE (recall + latency; single depth-50 pull):
     Engines: trifle, fts5-word-bm25 (BM25), fts5-trigram-bm25 (OR-bag), like-scan.
@@ -479,6 +481,11 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
     let qtexts: Vec<&str> = inputs.qtexts.iter().map(String::as_str).collect();
     let relevant: Vec<Vec<i64>> = inputs.targets.iter().map(|&t| vec![t]).collect();
     let corpus = &inputs.corpus;
+    // When the regime injects no typos (the geonames exact-name corpora), the SQLite baselines
+    // have well-defined recall too — an exact name is an exact substring, so FTS5 phrase + LIKE
+    // find it — so score every engine. On the typo regime (synthetic/msmarco) phrase-MATCH scores
+    // ~0 by construction, so the baselines stay unscored and only trifle reports self-recall.
+    let exact = inputs.mix[1] == 0 && inputs.mix[2] == 0;
 
     let meta = RunMeta {
         corpus: &corpus_name,
@@ -518,7 +525,7 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
     }
 
     // Serial / batched: measure every engine into records, then render.
-    let records = measure_engines(corpus, &bench, &skip, tuning);
+    let records = measure_engines(corpus, &bench, &skip, tuning, exact);
 
     if json_mode {
         render_run_json(&meta, &records);
@@ -611,9 +618,10 @@ struct Bench<'a> {
 }
 
 /// One measured engine row. `samples_ns` is the raw per-query latency in call order (serial
-/// mode); it is empty in batched mode, which times the whole set as one call. `recall` is
-/// `Some` only for trifle (its in-corpus self-recall sanity figure — the snippet/name queries
-/// make the FTS5 phrase baseline's recall a lie, so it is left unscored).
+/// mode); it is empty in batched mode, which times the whole set as one call. `recall` is `Some`
+/// for trifle always (its in-corpus self-recall) and for the baselines on the exact (no-typo)
+/// regime; it is `None` for the baselines on the typo regime, where phrase-MATCH scores ~0 and a
+/// recall number would mislead.
 struct Record {
     engine: String,
     samples_ns: Vec<u64>,
@@ -621,14 +629,17 @@ struct Record {
     recall: Option<f64>,
 }
 
-/// Build, then measure, each non-filtered engine for `latency`: trifle (with its self-recall)
-/// plus the FTS5-phrase and LIKE speed baselines (no recall — phrase-MATCH on the typo'd
-/// snippet queries scores ~0 by construction, so a recall number there would misrepresent FTS5).
+/// Build, then measure, each non-filtered engine for `latency`. trifle always reports its
+/// in-corpus self-recall. The FTS5-phrase and LIKE baselines are scored only when `exact` (the
+/// queries carry no typos, e.g. the geonames exact-name corpora), where phrase + substring recall
+/// is well-defined; on the typo regime phrase-MATCH scores ~0 by construction, so they are left
+/// unscored to avoid a misleading number.
 fn measure_engines(
     corpus: &Corpus,
     bench: &Bench,
     skip: &HashSet<String>,
     tuning: Tuning,
+    exact: bool,
 ) -> Vec<Record> {
     let mut records = Vec::new();
     if !skip.contains(ENGINE_TRIFLE) {
@@ -636,15 +647,15 @@ fn measure_engines(
         records.push(measure_one(bench, true, &trifle));
     }
     if !skip.contains(ENGINE_FTS5) {
-        // Phrase mode: the latency *speed* baseline. No recall (see the doc above).
+        // Phrase mode: the latency *speed* baseline. Scored only on the exact regime.
         match Fts5::build(corpus, MatchMode::Phrase) {
-            Some(fts5) => records.push(measure_one(bench, false, &fts5)),
+            Some(fts5) => records.push(measure_one(bench, exact, &fts5)),
             None => eprintln!("note: FTS5 trigram unavailable in the linked SQLite — skipping"),
         }
     }
     if !skip.contains(ENGINE_LIKE) {
         let like = Like::build(corpus);
-        records.push(measure_one(bench, false, &like));
+        records.push(measure_one(bench, exact, &like));
     }
     records
 }

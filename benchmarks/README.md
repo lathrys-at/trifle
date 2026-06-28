@@ -8,9 +8,11 @@ knob.
 
 There are seven benchmarks plus two utilities:
 
-- **`latency`** — search latency + throughput only. No recall table (a trifle-only in-corpus
-  self-recall figure rides along as a sanity check). Corpus `synthetic`/`msmarco` (snippet
-  queries) or `geonames-*` (exact entity names, the short-structured-segment scaling regime).
+- **`latency`** — search latency + throughput. Corpus `synthetic`/`msmarco` (snippet queries
+  with a 0/1/2 typo mix) or `geonames-*` (exact entity names, the short-structured-segment
+  scaling regime). An in-corpus self-recall figure rides along as a sanity check: trifle is
+  always scored, and on the exact geonames corpora the FTS5-phrase and LIKE baselines are scored
+  too (on the typo'd snippets they stay unscored — phrase-MATCH scores ~0 there).
 - **`relevance`** — recall + latency on MS MARCO real dev queries + qrels, vs BM25.
 - **`fuzzy`** — recall + latency on GeoNames entity names with injected edits (typo tolerance).
 - **`selsweep`** — the selection-cost frontier: recall@k vs Σdf (and vs p99 latency) for both

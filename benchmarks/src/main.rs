@@ -171,6 +171,8 @@ SELSWEEP (selection-cost frontier; trifle only):
     --queries <N>                 Labeled queries evaluated per N [default: 500]
     --edits <N>                   Typos per query for geonames [default: 2]
     --max-tmax <T>                Top of the t_max grid (2,4,..,T) [default: 20]
+    --df-fracs <a,b,c>            df_budget grid as fractions of N (each = frac*N), e.g.
+                                  0.03,0.05,0.08 [default: 0.005,0.01,0.02,0.05,0.1,0.2,0.5,1.0]
     --format <csv|json>           Output format [default: csv]
     Columns: arm,knob,N,k,recall,sigma_df_p50,sigma_df_p99,lat_p50_us,lat_p99_us.
     Each N rebuilds the corpus; all rows land in one CSV (the N column pivots them apart).
@@ -1472,8 +1474,9 @@ fn tmax_grid(max: usize) -> Vec<usize> {
     v
 }
 
-/// The `df_budget` grid for the work-cap arm, as fractions of `N` (each becomes a `Σdf` cap).
-/// Dense at the low end where the recall curve bends; `1.0` is effectively uncapped.
+/// The default `df_budget` grid for the work-cap arm, as fractions of `N` (each becomes a `Σdf`
+/// cap); `--df-fracs` overrides it. Dense at the low end where the recall curve bends; `1.0` is
+/// effectively uncapped.
 const SEL_FRACS: &[f64] = &[0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0];
 
 /// One CSV/JSON row of the frontier: a fixed `(arm, knob)` measured at one recall cutoff `k`.
@@ -1521,6 +1524,7 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
         "min-shared",
         "weight-step",
         "max-tmax",
+        "df-fracs",
         "format",
     ])?;
     // `--docs` is a ladder: one or more `N` (comma-separated), each rebuilt and swept in turn,
@@ -1529,6 +1533,12 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
     if ns.contains(&0) {
         return Err("--docs values must be >= 1".into());
     }
+    // The df_budget arm sweeps these fractions of N (each becomes a `Σdf` cap = frac·N); a manual
+    // `--df-fracs` grid overrides the default, keeping the per-N scaling across a `--docs` ladder.
+    let sel_fracs = match flags.last("df-fracs") {
+        Some(s) => parse_df_fracs(s)?,
+        None => SEL_FRACS.to_vec(),
+    };
     let q = flags.usize("queries", 500)?;
     let edits = flags.usize("edits", 2)?;
     let seed = flags.u64("seed", DEFAULT_SEED)?;
@@ -1568,7 +1578,7 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
         let trifle = Trifle::build(&corpus, fixed);
 
         eprintln!(
-            "selsweep[{which}]: N={ndocs} queries={} depth={KMAX} — t_max {tmaxes:?} + df_budget {SEL_FRACS:?}",
+            "selsweep[{which}]: N={ndocs} queries={} depth={KMAX} — t_max {tmaxes:?} + df_budget {sel_fracs:?}",
             qtexts.len()
         );
 
@@ -1581,7 +1591,7 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
             ));
         }
         // Arm 2 — df_budget: the Σdf work cap, as fractions of N.
-        for &frac in SEL_FRACS {
+        for &frac in &sel_fracs {
             let budget = ((frac * ndocs as f64).round() as u64).max(1);
             let (results, lats, sigma) = sweep_run(&qtexts, |query| {
                 trifle.search_df_budget(query, KMAX, budget)
@@ -1778,6 +1788,29 @@ fn parse_usize_list(s: &str) -> Result<Vec<usize>, String> {
     v.dedup();
     if v.is_empty() {
         return Err("--docs is empty".into());
+    }
+    Ok(v)
+}
+
+/// Parse the `--df-fracs` grid: comma-separated fractions of N for the df_budget arm (each
+/// becomes a `Σdf` cap = frac·N). Values must be finite and positive; sorted ascending and
+/// deduped so the swept frontier reads left-to-right.
+fn parse_df_fracs(s: &str) -> Result<Vec<f64>, String> {
+    let mut v: Vec<f64> = s
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            t.parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite() && *f > 0.0)
+                .ok_or_else(|| format!("--df-fracs: expected a positive fraction of N: {t}"))
+        })
+        .collect::<Result<_, _>>()?;
+    v.sort_by(|a, b| a.partial_cmp(b).expect("finite (validated)"));
+    v.dedup();
+    if v.is_empty() {
+        return Err("--df-fracs is empty".into());
     }
     Ok(v)
 }

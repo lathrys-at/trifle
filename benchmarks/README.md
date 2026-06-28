@@ -162,6 +162,11 @@ cargo run --manifest-path benchmarks/Cargo.toml --release -- selsweep \
 (The old external `for n in …; do … >> frontier.csv; done` loop still works — the plotter skips the
 repeated per-run header lines either way.)
 
+`--df-fracs a,b,c` overrides the df_budget grid (fractions of `N`, each becomes a `Σdf` cap =
+`frac·N`); the fractions scale per `N` across the ladder, so a refined grid around a knee works at
+every rung. E.g. once `knee` mode locates the elbow near `0.05·N`, densify there with
+`--df-fracs 0.02,0.03,0.04,0.05,0.06,0.08,0.1`.
+
 `selsweep` CSV (and `--format json`) columns are
 `arm,knob,N,k,recall,sigma_df_p50,sigma_df_p99,lat_p50_us,lat_p99_us`, with one row per
 `(arm, knob, k)`. `arm` is `t_max` or `df_budget`; `knob` is the swept value (a `t_max` count,

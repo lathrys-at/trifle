@@ -169,6 +169,16 @@ the work-done collector, constant across the four `k` rows; `recall` varies by `
 selection-cost frontier. The same ladder applies to `latency`/`profile` if you want the
 flat-latency-as-N-grows confirmation.
 
+`scripts/plot_selsweep.py` draws that frontier straight from the appended CSV (it skips the
+repeated per-run header lines): one panel row per `N`, `recall@k` on the y-axis against Σdf and
+p99 latency, the `t_max` and `df_budget` arms overlaid — the better knob is the curve up-and-left.
+Needs matplotlib.
+
+```bash
+python3 benchmarks/scripts/plot_selsweep.py frontier.csv            # -> selsweep.png
+python3 benchmarks/scripts/plot_selsweep.py frontier.csv --k 10 --x both
+```
+
 ## Caveats
 
 These are not your users' queries. Prefer relative signal (trifle vs BM25; typo vs no-typo;

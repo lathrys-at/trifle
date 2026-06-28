@@ -59,6 +59,9 @@ impl Latency {
     pub fn p90(&self) -> Duration {
         Duration::from_nanos(self.dist.pct(90.0))
     }
+    pub fn p95(&self) -> Duration {
+        Duration::from_nanos(self.dist.pct(95.0))
+    }
     pub fn p99(&self) -> Duration {
         Duration::from_nanos(self.dist.pct(99.0))
     }
@@ -109,6 +112,63 @@ pub fn set_recall_at_k(results: &[Vec<i64>], relevant: &[Vec<i64>], k: usize) ->
 /// relevant id) — report this so a silently-shrunk query set is visible.
 pub fn scored_queries(relevant: &[Vec<i64>]) -> usize {
     relevant.iter().filter(|r| !r.is_empty()).count()
+}
+
+/// **MRR@k**: mean over scored queries of `1 / rank` where `rank` (1-based) is the position of
+/// the first relevant id within the top-`k` of `got`, or `0` if none appears. Same
+/// empty-relevant exclusion contract as [`set_recall_at_k`].
+pub fn mrr_at_k(results: &[Vec<i64>], relevant: &[Vec<i64>], k: usize) -> f64 {
+    let mut scored = 0usize;
+    let mut acc = 0.0f64;
+    for (got, rel) in results.iter().zip(relevant.iter()) {
+        if rel.is_empty() {
+            continue;
+        }
+        scored += 1;
+        let rels: HashSet<i64> = rel.iter().copied().collect();
+        if let Some(pos) = got.iter().take(k).position(|id| rels.contains(id)) {
+            acc += 1.0 / (pos as f64 + 1.0);
+        }
+    }
+    if scored == 0 {
+        0.0
+    } else {
+        acc / scored as f64
+    }
+}
+
+/// **nDCG@k** with binary relevance: `DCG@k / IDCG@k` averaged over scored queries, where
+/// `DCG = Σ_i rel(got[i]) / log2(i + 2)` over the top-`k` (0-based `i`) and `IDCG` is the DCG of
+/// the ideal ranking (all relevant first). Same empty-relevant exclusion as [`set_recall_at_k`].
+pub fn ndcg_at_k(results: &[Vec<i64>], relevant: &[Vec<i64>], k: usize) -> f64 {
+    let mut scored = 0usize;
+    let mut acc = 0.0f64;
+    for (got, rel) in results.iter().zip(relevant.iter()) {
+        if rel.is_empty() {
+            continue;
+        }
+        scored += 1;
+        let rels: HashSet<i64> = rel.iter().copied().collect();
+        let dcg: f64 = got
+            .iter()
+            .take(k)
+            .enumerate()
+            .filter(|(_, id)| rels.contains(id))
+            .map(|(i, _)| 1.0 / ((i as f64 + 2.0).log2()))
+            .sum();
+        let ideal_hits = rel.len().min(k);
+        let idcg: f64 = (0..ideal_hits)
+            .map(|i| 1.0 / ((i as f64 + 2.0).log2()))
+            .sum();
+        if idcg > 0.0 {
+            acc += dcg / idcg;
+        }
+    }
+    if scored == 0 {
+        0.0
+    } else {
+        acc / scored as f64
+    }
 }
 
 /// Render a `Duration` compactly in the largest unit that keeps it readable.
@@ -174,5 +234,24 @@ mod tests {
     #[test]
     fn throughput_zero_elapsed_is_zero() {
         assert_eq!(throughput(10, Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn mrr_uses_first_relevant_rank_and_respects_k() {
+        // first relevant (id 1) sits at rank 3 → 1/3; empty-relevant query excluded.
+        let results = vec![vec![9, 8, 1], vec![1]];
+        let relevant = vec![vec![1], vec![]];
+        assert!((mrr_at_k(&results, &relevant, 10) - 1.0 / 3.0).abs() < 1e-9);
+        // at k=2 the relevant id is past the cutoff → 0.
+        assert_eq!(mrr_at_k(&results, &relevant, 2), 0.0);
+    }
+
+    #[test]
+    fn ndcg_is_one_at_rank_one_and_discounts_below() {
+        // relevant at rank 1 → perfect nDCG.
+        assert!((ndcg_at_k(&[vec![1, 2, 3]], &[vec![1]], 10) - 1.0).abs() < 1e-9);
+        // relevant at rank 2 → 1/log2(3) discounted against an ideal IDCG of 1.
+        let want = (1.0 / 3.0_f64.log2()) / 1.0;
+        assert!((ndcg_at_k(&[vec![9, 1]], &[vec![1]], 10) - want).abs() < 1e-9);
     }
 }

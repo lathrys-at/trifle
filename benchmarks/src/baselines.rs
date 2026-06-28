@@ -17,7 +17,7 @@ use std::path::Path;
 use rusqlite::Connection;
 use trifle::store::Sidecar;
 use trifle::tokenize::TrigramTokenizer;
-use trifle::{Config, Document, Effort, Index, Schema, SearchOpts};
+use trifle::{Config, Document, Index, Schema, SearchOpts};
 
 use crate::corpus::Corpus;
 
@@ -37,19 +37,18 @@ pub trait Engine {
     }
 }
 
-/// Search-strictness knobs for trifle (`m`, `t_max`) plus the rerank [`Effort`].
-/// `None` leaves the engine default (Effort defaults to Medium). Baselines have no
-/// analogue and ignore these.
+/// Search-strictness knobs for trifle (`m`, `t_max`, `weight_step`). `None` leaves the engine
+/// default. Baselines have no analogue and ignore these.
 #[derive(Clone, Copy, Default)]
 pub struct Tuning {
     pub min_shared: Option<u32>,
     pub t_max: Option<usize>,
-    pub effort: Option<Effort>,
+    pub weight_step: Option<f64>,
 }
 
 /// trifle itself.
 pub struct Trifle {
-    index: Index<TrigramTokenizer, Sidecar>,
+    index: Index<TrigramTokenizer>,
     tuning: Tuning,
     // Held so the temp file outlives the index.
     _dir: tempfile::TempDir,
@@ -60,9 +59,9 @@ impl Trifle {
         let dir = tempfile::tempdir().unwrap();
         // The bench corpora are single-script (Latin), so the plain trigram tokenizer is the
         // right baseline; open with it explicitly rather than the script-segmenting default.
-        let backend = Sidecar::open(dir.path().join("trifle.db")).unwrap();
+        let store = Sidecar::open(dir.path().join("trifle.db")).unwrap();
         let index = Index::open(
-            backend,
+            store,
             TrigramTokenizer::new(),
             Schema::flat(),
             Config::default(),
@@ -72,8 +71,8 @@ impl Trifle {
             .docs
             .iter()
             .map(|d| Document::new(d.id, vec![("body".to_string(), d.text.clone())]));
-        // Bulk-load via rebuild (roaring accumulation, folded bases): the steady-state
-        // read shape, and far more memory-efficient than per-doc writes at million-doc N.
+        // Bulk-load via rebuild (accumulate then fold the bases): the steady-state read shape,
+        // and far more memory-efficient than per-doc writes at million-doc N.
         index.rebuild(docs).unwrap();
         Trifle {
             index,
@@ -82,98 +81,88 @@ impl Trifle {
         }
     }
 
-    fn opts(&self, k: usize) -> SearchOpts<'static> {
-        let mut o = SearchOpts::new(k);
+    /// The search options for this run's tuning (the result limit is a terminal argument).
+    fn opts(&self) -> SearchOpts<'static> {
+        let mut o = SearchOpts::new();
         if let Some(m) = self.tuning.min_shared {
             o = o.min_shared(m);
         }
         if let Some(t) = self.tuning.t_max {
             o = o.t_max(t);
         }
-        if let Some(e) = self.tuning.effort {
-            o = o.rerank(e);
+        if let Some(d) = self.tuning.weight_step {
+            o = o.weight_step(d);
         }
         o
     }
 
-    /// Options at an explicit [`Effort`], keeping the run's `min_shared`/`t_max` tuning
-    /// but overriding the rerank effort. Backs the latency command's effort sweep: one
-    /// built index measured at Low/Medium/High without rebuilding (effort is a per-search
-    /// pool-depth knob, not an index property).
-    fn opts_effort(&self, k: usize, effort: Effort) -> SearchOpts<'static> {
-        let mut o = SearchOpts::new(k).rerank(effort);
+    /// Top-`k` doc ids best-first under the given options (the weighted-overlap order *is* the
+    /// ranking — there is no rerank pool).
+    fn run(&self, query: &str, opts: &SearchOpts<'_>, k: usize) -> Vec<i64> {
+        self.index
+            .reader()
+            .unwrap()
+            .matches(query, opts, k)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key.as_i64().unwrap())
+            .collect()
+    }
+
+    /// Top-`k` doc ids with an explicit selection cap `t_max` (the rest of the tuning
+    /// unchanged) — selection is the swept variable for the selection-frontier sweep's
+    /// `t_max` arm.
+    pub fn search_tmax(&self, query: &str, k: usize, t_max: usize) -> Vec<i64> {
+        let mut o = SearchOpts::new().t_max(t_max);
+        if let Some(m) = self.tuning.min_shared {
+            o = o.min_shared(m);
+        }
+        if let Some(d) = self.tuning.weight_step {
+            o = o.weight_step(d);
+        }
+        self.run(query, &o, k)
+    }
+
+    /// Top-`k` doc ids with an explicit `Σdf` budget `B` (the rest of the tuning unchanged) —
+    /// the work-cap arm of the selection-frontier sweep. `B` caps the cumulative document
+    /// frequency of the selected tokens (what candidate generation scans), so it bounds the
+    /// scanned-rows axis directly; mirror of [`search_tmax`](Trifle::search_tmax).
+    pub fn search_df_budget(&self, query: &str, k: usize, budget: u64) -> Vec<i64> {
+        let mut o = SearchOpts::new().df_budget(budget);
         if let Some(m) = self.tuning.min_shared {
             o = o.min_shared(m);
         }
         if let Some(t) = self.tuning.t_max {
             o = o.t_max(t);
         }
-        o
+        if let Some(d) = self.tuning.weight_step {
+            o = o.weight_step(d);
+        }
+        self.run(query, &o, k)
     }
 
-    /// Search at an explicit [`Effort`] (rest of the tuning unchanged), best-first doc ids.
-    pub fn search_effort(&self, query: &str, k: usize, effort: Effort) -> Vec<i64> {
-        self.index
-            .reader()
-            .unwrap()
-            .search(query, self.opts_effort(k, effort))
-            .unwrap()
-            .into_iter()
-            .map(|m| m.key.as_i64().unwrap())
-            .collect()
-    }
-
-    /// Batch counterpart of [`search_effort`](Self::search_effort) (shares posting/freq
-    /// reads across the set — the `search_batch` path). `batch == serial` holds, so recall
-    /// is identical either way; this is the form the latency command times and scores.
-    pub fn search_batch_effort(&self, queries: &[&str], k: usize, effort: Effort) -> Vec<Vec<i64>> {
-        self.index
-            .reader()
-            .unwrap()
-            .search_batch(queries, self.opts_effort(k, effort))
-            .unwrap()
-            .into_iter()
-            .map(|ms| ms.into_iter().map(|m| m.key.as_i64().unwrap()).collect())
-            .collect()
-    }
-
-    /// Search the top-`pool` candidates by IDF-weighted overlap, returning doc ids best-first.
-    /// Exact pool control for the `ranksweep` calibration: `Effort::None` disables the √(kN)
-    /// auto-pool (so pool == `limit`). recall@k for any `k <= pool` is `id in result[..k]`.
-    pub fn search_pool(&self, query: &str, pool: usize) -> Vec<i64> {
-        let mut o = SearchOpts::new(pool).rerank(Effort::None);
+    /// Top-`k` doc ids at an explicit IDF weight step `d` (the rest of the tuning unchanged) —
+    /// the swept variable for the `dsweep` recall-vs-`weight_step` eval.
+    pub fn search_weight_step(&self, query: &str, k: usize, d: f64) -> Vec<i64> {
+        let mut o = SearchOpts::new().weight_step(d);
         if let Some(m) = self.tuning.min_shared {
             o = o.min_shared(m);
         }
         if let Some(t) = self.tuning.t_max {
             o = o.t_max(t);
         }
-        self.index
-            .reader()
-            .unwrap()
-            .search(query, o)
-            .unwrap()
-            .into_iter()
-            .map(|m| m.key.as_i64().unwrap())
-            .collect()
+        self.run(query, &o, k)
     }
 
-    /// Like [`search_pool`](Self::search_pool) but with an explicit selection cap `t_max`,
-    /// so the rarest `t_max` query trigrams are kept — selection is the swept variable
-    /// while the pool is held generous. Backs the t_max knee sweep (`tools/tmax_knee.py`).
-    pub fn search_pool_tmax(&self, query: &str, pool: usize, t_max: usize) -> Vec<i64> {
-        let mut o = SearchOpts::new(pool).rerank(Effort::None).t_max(t_max);
-        if let Some(m) = self.tuning.min_shared {
-            o = o.min_shared(m);
-        }
+    /// The corpus-fitted `weight_step` suggestion accumulated from the searches run so far (the
+    /// band-spread telemetry); `None` until a search has produced an informative sample. Used by
+    /// `dsweep` to check the hint against the recall-optimal `weight_step`.
+    pub fn weight_step_hint(&self) -> Option<f64> {
         self.index
-            .reader()
-            .unwrap()
-            .search(query, o)
-            .unwrap()
-            .into_iter()
-            .map(|m| m.key.as_i64().unwrap())
-            .collect()
+            .stats()
+            .ok()
+            .and_then(|s| s.weight_step_hint)
+            .map(|h| h.suggested)
     }
 }
 
@@ -182,20 +171,13 @@ impl Engine for Trifle {
         "trifle"
     }
     fn search(&self, query: &str, k: usize) -> Vec<i64> {
-        self.index
-            .reader()
-            .unwrap()
-            .search(query, self.opts(k))
-            .unwrap()
-            .into_iter()
-            .map(|m| m.key.as_i64().unwrap())
-            .collect()
+        self.run(query, &self.opts(), k)
     }
     fn search_batch(&self, queries: &[&str], k: usize) -> Vec<Vec<i64>> {
         self.index
             .reader()
             .unwrap()
-            .search_batch(queries, self.opts(k))
+            .matches_batch(queries, &self.opts(), k)
             .unwrap()
             .into_iter()
             .map(|ms| ms.into_iter().map(|m| m.key.as_i64().unwrap()).collect())

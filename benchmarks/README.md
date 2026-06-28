@@ -116,7 +116,7 @@ cargo run --manifest-path benchmarks/Cargo.toml --release -- latency --corpus ge
 # 2. relevance: recall/MRR/nDCG@{1,5,10,50} + latency on real dev queries+qrels, vs word/trigram BM25
 cargo run --manifest-path benchmarks/Cargo.toml --release -- relevance --docs 100000 --queries 5000
 
-# 3. fuzzy: name+edit recall/MRR/nDCG (1- and 2-edit), vs FTS5 trigram-MATCH + LIKE floor
+# 3. fuzzy: name+edit recall/MRR/nDCG (random 0-2 typos per query), vs FTS5 trigram + LIKE
 cargo run --manifest-path benchmarks/Cargo.toml --release -- fuzzy --corpus geonames-cities --queries 5000
 
 # 4. selsweep: the selection-cost frontier (both arms), CSV to stdout
@@ -142,8 +142,9 @@ all workers.
 `--format json` (serial mode only) emits one machine-readable object carrying, per engine, the
 p50/p90/**p95**/p99/max + mean latency, throughput, recall, **and the raw per-query ns samples**
 (so a post-processor can recompute any statistic without re-running). `relevance` and `fuzzy`
-also take `--format json` (the full recall/MRR/nDCG + latency record per engine; `fuzzy` groups
-by edit-count). `--instrument xctrace|samply` re-execs a `latency` run under a sampling profiler
+also take `--format json` (the full recall/MRR/nDCG + latency record per engine; `fuzzy` reports
+the realized edit-mix of its single batch). `--instrument xctrace|samply` re-execs a `latency`
+run under a sampling profiler
 and writes a trace artifact — a hook for *where* the time goes, separate from the JSON's *how
 much*.
 

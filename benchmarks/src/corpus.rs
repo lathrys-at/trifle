@@ -174,7 +174,7 @@ fn ensure(m: &Manifest, corpus: &str) -> io::Result<PathBuf> {
     if dest.is_file() {
         if m.sha256.is_empty() {
             eprintln!(
-                "WARNING: {} is unpinned; reusing cached {} without verification.\n  Pin its sha256 in the manifest for a verified, reproducible cache.",
+                "WARNING: {} is unpinned (empty sha256) — reusing cached {} as-is.",
                 m.name,
                 dest.display()
             );
@@ -202,7 +202,7 @@ fn ensure(m: &Manifest, corpus: &str) -> io::Result<PathBuf> {
     let got = sha256_file(&tmp)?;
     if m.sha256.is_empty() {
         eprintln!(
-            "WARNING: {} is unpinned. Computed sha256 = {got}\n  Pin it in the manifest for reproducibility.",
+            "WARNING: {} is unpinned (empty sha256) — using the download as-is (sha256 = {got}).",
             m.name
         );
     } else if got != m.sha256 {

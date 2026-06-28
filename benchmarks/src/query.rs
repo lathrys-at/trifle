@@ -34,6 +34,9 @@ pub struct FuzzyQuery {
     pub text: String,
     pub target: i64,
     pub clean: String,
+    /// The number of typos actually injected into this query (a random draw from the requested
+    /// `[lo, hi]` range), kept for the run's reported edit-mix.
+    pub edits: usize,
 }
 
 /// Take a contiguous run of `len` words starting at a random offset in `text`.
@@ -154,18 +157,20 @@ pub fn labeled_snippets(corpus: &Corpus, n: usize, edits: usize, seed: u64) -> V
         .collect()
 }
 
-/// Generate one fuzzy query per target entity: the entity name with exactly `edits`
-/// single-character typos, labeled by the entity id. Deterministic per
-/// `(seed, edits)`, so 1-edit and 2-edit runs use distinct corruptions. Names too short
-/// to form a trigram query after corruption are skipped (a 1–2 char name can't).
-pub fn fuzzy_queries(targets: &[Entity], edits: usize, seed: u64) -> Vec<FuzzyQuery> {
-    let mut rng = Rng::new(seed ^ 0x00C0_FFEE_u64 ^ ((edits as u64) << 32));
+/// Generate one fuzzy query per target entity: the entity name with a **random** number of
+/// single-character typos drawn uniformly from the inclusive range `[lo, hi]` (so a single
+/// batch carries a realistic mix of typo counts), labeled by the entity id. Deterministic per
+/// `(seed, lo, hi)`. Names too short to form a trigram query after corruption are skipped (a
+/// 1–2 char name can't). `lo == hi` pins every query to that exact count.
+pub fn fuzzy_queries(targets: &[Entity], lo: usize, hi: usize, seed: u64) -> Vec<FuzzyQuery> {
+    let mut rng = Rng::new(seed ^ 0x00C0_FFEE_u64 ^ ((lo as u64) << 32) ^ ((hi as u64) << 48));
     targets
         .iter()
         .filter_map(|t| {
             if t.name.chars().count() < 4 {
                 return None;
             }
+            let edits = rng.range(lo, hi); // a random typo count per query, uniform in [lo, hi]
             let text = corrupt(t.name.clone(), edits, &mut rng);
             if text.chars().count() < 3 {
                 return None;
@@ -174,6 +179,7 @@ pub fn fuzzy_queries(targets: &[Entity], edits: usize, seed: u64) -> Vec<FuzzyQu
                 text,
                 target: t.id,
                 clean: t.name.clone(),
+                edits,
             })
         })
         .collect()

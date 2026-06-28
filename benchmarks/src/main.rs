@@ -104,7 +104,7 @@ USAGE:
 COMMANDS:
     latency    Search latency + throughput, trifle vs in-process baselines (speed only)
     relevance  MS MARCO real dev queries+qrels: recall/MRR/nDCG@{1,5,10,50} + latency
-    fuzzy      Entity name+edit recall/MRR/nDCG@{1,5,10,50} + latency, per edit-count
+    fuzzy      Entity name+edit recall/MRR/nDCG@{1,5,10,50} + latency (mixed typo range)
     selsweep   Selection-cost frontier: recall@k vs Σdf for both arms (t_max, df_budget)
     dsweep     Recall@{1,5,10,50} vs weight_step D, and the WeightStepHint vs the optimum
     overlap    Engine microbench: trifle-overlap build/walk on synthetic bitmaps (no SQLite)
@@ -157,8 +157,9 @@ RELEVANCE (recall + latency; single depth-50 pull):
 
 FUZZY (recall + latency; single depth-50 pull):
     --corpus <geonames-cities|geonames-all>   Entity corpus [default: geonames-cities]
-    --edits <N | lo,hi>           Typos per query: a single count, or a `lo,hi` inclusive
-                                  range run separately (e.g. 0,2 → 0, 1, 2). Omit to run {1, 2}.
+    --edits <N | lo,hi>           Typo range [default: 0,2]. Each query gets a RANDOM count
+                                  drawn from [lo,hi], evaluated as one mixed batch; `N` pins
+                                  every query to N.
     --warmup <N>                  Untimed warmup queries [default: 3]
     --format <text|json>          Output format [default: text]
 
@@ -313,6 +314,28 @@ impl Flags {
     }
 }
 
+/// Print a `#`-prefixed comment, hard-wrapped at 72 columns on word boundaries (each line,
+/// including continuations, re-prefixed with `# `). All of the harness's `#` notes go through
+/// this so the output stays within a narrow terminal. A single word longer than the budget
+/// overflows its own line rather than being split.
+fn comment(text: &str) {
+    const WIDTH: usize = 72;
+    const PREFIX: &str = "# ";
+    let budget = WIDTH - PREFIX.len();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > budget {
+            println!("{PREFIX}{line}");
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    println!("{PREFIX}{line}");
+}
+
 /// Parse a `u64` in decimal or `0x`-hex, ignoring `_` separators.
 fn parse_u64(s: &str) -> Option<u64> {
     let t = s.replace('_', "");
@@ -390,7 +413,7 @@ fn print_filter(skip: &HashSet<String>) {
     if !skip.is_empty() {
         let mut s: Vec<&str> = skip.iter().map(String::as_str).collect();
         s.sort_unstable();
-        println!("# filter: skipping {}", s.join(", "));
+        comment(&format!("filter: skipping {}", s.join(", ")));
     }
 }
 
@@ -506,9 +529,9 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
             return Err("concurrent mode runs trifle only, but it is filtered out".into());
         }
         print_run_header(&meta, &skip);
-        println!(
-            "# mode=concurrent threads={concurrent} (trifle only — the read-pool fanout axis)"
-        );
+        comment(&format!(
+            "mode=concurrent threads={concurrent} (trifle only — the read-pool fanout axis)"
+        ));
         let trifle = Trifle::build(corpus, tuning);
         let recall = set_recall_at_k(&trifle.search_batch(&qtexts, k), &relevant, k);
         bench_concurrent(&trifle, &bench, concurrent, recall);
@@ -522,11 +545,13 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
         render_run_json(&meta, &records);
     } else {
         print_run_header(&meta, &skip);
-        println!("# mode={}", if batched { "batched" } else { "serial" });
+        comment(&format!(
+            "mode={}",
+            if batched { "batched" } else { "serial" }
+        ));
         render_run_text(&bench, &records);
-        println!(
-            "# (latency is one axis; durability, footprint, update cost, and semantics differ \
-             per engine — see the comparison table in the project README)"
+        comment(
+            "(latency is one axis; durability, footprint, update cost, and semantics differ per engine — see the comparison table in the project README)",
         );
     }
     Ok(())
@@ -571,7 +596,7 @@ fn latency_inputs(flags: &Flags, corpus_name: &str, seed: u64) -> Result<Latency
                 return Err("no entities loaded (corpus empty)".into());
             }
             // Exact entity-name queries: zero edits, the short-structured-segment regime.
-            let qs = query::fuzzy_queries(&ent.targets, 0, seed);
+            let qs = query::fuzzy_queries(&ent.targets, 0, 0, seed);
             let qtexts = qs.iter().map(|q| q.text.clone()).collect();
             let targets = qs.iter().map(|q| q.target).collect();
             Ok(LatencyInputs {
@@ -722,35 +747,46 @@ fn bench_concurrent(trifle: &Trifle, bench: &Bench, threads: usize, recall: f64)
     });
     let lat = Latency::from_durations(samples.iter().map(|&ns| Duration::from_nanos(ns)).collect());
     println!(
-        "{:>18}  conc({:>2})  {} queries in {} ({:.0} q/s aggregate)  per-query p99 {}  recall@{k} {:.3}",
+        "{:>18}  conc({:>2})  {} queries in {} ({:.0} q/s aggregate)  {}/@p99 per-query  {recall:.3}/@recall{k}",
         "trifle",
         threads,
         queries.len(),
         fmt_dur(elapsed),
         throughput(queries.len(), elapsed),
         fmt_dur(lat.p99()),
-        recall,
     );
 }
 
 /// The `# …`-prefixed header for the human (text) output of the latency profile.
 fn print_run_header(meta: &RunMeta, skip: &HashSet<String>) {
-    println!("# latency — {}", meta.provenance);
-    println!(
-        "# docs={} queries={} k={} warmup={} repeat={}",
+    comment(&format!("latency — {}", meta.provenance));
+    comment(&format!(
+        "docs={} queries={} k={} warmup={} repeat={}",
         meta.docs, meta.queries, meta.k, meta.warmup, meta.repeat
-    );
+    ));
     print_filter(skip);
 }
 
-/// Render the measured records as aligned human-readable lines (one per engine). A baseline
-/// with no recall prints a `—` in the recall column.
+/// The latency percentiles as `value/@label` cells (`146.7µs/@p50  …/@p90  …/@p95  …/@p99
+/// …/@max`), the shared format for every per-engine latency line.
+fn lat_cells(lat: &Latency) -> String {
+    format!(
+        "{}/@p50  {}/@p90  {}/@p95  {}/@p99  {}/@max",
+        fmt_dur(lat.p50()),
+        fmt_dur(lat.p90()),
+        fmt_dur(lat.p95()),
+        fmt_dur(lat.p99()),
+        fmt_dur(lat.max()),
+    )
+}
+
+/// Render the measured records as aligned human-readable lines (one per engine).
 fn render_run_text(bench: &Bench, records: &[Record]) {
     let k = bench.k;
     for r in records {
         let recall = match r.recall {
-            Some(v) => format!("recall@{k} {v:.3}"),
-            None => format!("recall@{k}     —"),
+            Some(v) => format!("{v:.3}/@recall{k}"),
+            None => format!("—/@recall{k}"),
         };
         if bench.batched {
             println!(
@@ -767,13 +803,9 @@ fn render_run_text(bench: &Bench, records: &[Record]) {
                     .collect(),
             );
             println!(
-                "{:>18}  serial   p50 {:>8} p90 {:>8} p95 {:>8} p99 {:>8} max {:>8}  {recall}  ({:.0} q/s)",
+                "{:>18}  {}  {recall}  ({:.0} q/s)",
                 r.engine,
-                fmt_dur(lat.p50()),
-                fmt_dur(lat.p90()),
-                fmt_dur(lat.p95()),
-                fmt_dur(lat.p99()),
-                fmt_dur(lat.max()),
+                lat_cells(&lat),
                 r.throughput_qps,
             );
         }
@@ -995,13 +1027,9 @@ fn render_quality_record(r: &QualityRecord) {
             .collect(),
     );
     println!(
-        "{:>18}  p50 {:>8} p90 {:>8} p95 {:>8} p99 {:>8} max {:>8}  ({:.0} q/s)",
+        "{:>18}  {}  ({:.0} q/s)",
         r.engine,
-        fmt_dur(lat.p50()),
-        fmt_dur(lat.p90()),
-        fmt_dur(lat.p95()),
-        fmt_dur(lat.p99()),
-        fmt_dur(lat.max()),
+        lat_cells(&lat),
         r.throughput_qps,
     );
     print_metric_row("recall", &r.recall);
@@ -1009,11 +1037,12 @@ fn render_quality_record(r: &QualityRecord) {
     print_metric_row("nDCG", &r.ndcg);
 }
 
-/// Print one `@k` metric row aligned under the engine line (values indexed by [`REPORT_KS`]).
+/// Print one metric row of `value/@k` cells aligned under the engine line (values indexed by
+/// [`REPORT_KS`]).
 fn print_metric_row(label: &str, values: &[f64]) {
     print!("{:>18}  {label:<6}", "");
     for (k, v) in REPORT_KS.iter().zip(values) {
-        print!("  @{k}:{v:.3}");
+        print!("  {v:.3}/@{k}");
     }
     println!();
 }
@@ -1079,91 +1108,6 @@ fn shared_trigrams(tok: &TrigramTokenizer, a: &str, b: &str) -> usize {
         .count()
 }
 
-/// `id -> text` over a corpus's docs, for resolving a label id to its (target) text.
-fn text_index(corpus: &Corpus) -> HashMap<i64, &str> {
-    corpus
-        .docs
-        .iter()
-        .map(|d| (d.id, d.text.as_str()))
-        .collect()
-}
-
-/// The effective match floor `m` for a run (trifle's default is 2, clamped ≥ 1).
-fn effective_m(tuning: Tuning) -> usize {
-    tuning.min_shared.unwrap_or(2).max(1) as usize
-}
-
-/// Where a recall miss's fix lives, tagged cheaply from the shared-trigram count between each
-/// missed query and its target — no internals, no re-search.
-#[derive(Default)]
-struct MissTally {
-    /// No shared trigrams: overlap could never surface the target. The pruner/tokenizer is the
-    /// ceiling — the most concerning bucket.
-    selection: usize,
-    /// Shares trigrams, but fewer than the match floor `m` — points at `m` (the strictness
-    /// dial), not the ranking.
-    floor: usize,
-    /// Shares ≥ `m` trigrams (cleared the raw overlap floor) but ranked past k — a ranking gap.
-    /// On long multi-word queries trifle selects only the rarest tokens, so a few here may
-    /// instead be selection-pruned; the *definitive* signals are the other two buckets.
-    ranking: usize,
-}
-
-impl MissTally {
-    fn record(&mut self, shared: usize, m: usize) {
-        if shared == 0 {
-            self.selection += 1;
-        } else if shared < m {
-            self.floor += 1;
-        } else {
-            self.ranking += 1;
-        }
-    }
-    fn total(&self) -> usize {
-        self.selection + self.floor + self.ranking
-    }
-    fn line(&self) -> String {
-        format!(
-            "misses={} (selection/no-overlap {}, below-floor/m {}, ranking {})",
-            self.total(),
-            self.selection,
-            self.floor,
-            self.ranking
-        )
-    }
-}
-
-/// Tag trifle's recall misses at depth `k`. `results`/`relevant` are trifle's, in query order;
-/// `text_of` resolves a relevant id to its target text; `m` is the match floor.
-fn tag_misses(
-    qtexts: &[&str],
-    relevant: &[Vec<i64>],
-    results: &[Vec<i64>],
-    k: usize,
-    text_of: &HashMap<i64, &str>,
-    m: usize,
-) -> MissTally {
-    let tok = TrigramTokenizer::new();
-    let mut tally = MissTally::default();
-    for ((got, rel), q) in results.iter().zip(relevant).zip(qtexts) {
-        if rel.is_empty() {
-            continue;
-        }
-        let topk: HashSet<i64> = got.iter().copied().take(k).collect();
-        if rel.iter().any(|r| topk.contains(r)) {
-            continue; // a hit, not a miss
-        }
-        let shared = rel
-            .iter()
-            .filter_map(|r| text_of.get(r))
-            .map(|t| shared_trigrams(&tok, q, t))
-            .max()
-            .unwrap_or(0);
-        tally.record(shared, m);
-    }
-    tally
-}
-
 // ----- relevance (recall + latency) -------------------------------------------
 
 fn cmd_relevance(args: &[String]) -> Result<(), String> {
@@ -1205,22 +1149,10 @@ fn cmd_relevance(args: &[String]) -> Result<(), String> {
     let relevant: Vec<Vec<i64>> = rel.queries.iter().map(|q| q.relevant.clone()).collect();
     let scored = scored_queries(&relevant);
 
-    // trifle (the subject) first, so we can tag its misses; then the baselines.
     let mut records: Vec<QualityRecord> = Vec::new();
-    let mut trifle_misses: Option<MissTally> = None;
     if !skip.contains(ENGINE_TRIFLE) {
         let trifle = Trifle::build(corpus, tuning);
-        let (rec, res) = measure_quality(&trifle, &qtexts, &relevant, warmup);
-        let text_of = text_index(corpus);
-        trifle_misses = Some(tag_misses(
-            &qtexts,
-            &relevant,
-            &res,
-            KMAX,
-            &text_of,
-            effective_m(tuning),
-        ));
-        records.push(rec);
+        records.push(measure_quality(&trifle, &qtexts, &relevant, warmup).0);
     }
     if !skip.contains(ENGINE_FTS5_WORD) {
         match Fts5Word::build(corpus) {
@@ -1258,25 +1190,20 @@ fn cmd_relevance(args: &[String]) -> Result<(), String> {
             serde_json::to_string(&obj).expect("serialize relevance json")
         );
     } else {
-        println!(
-            "# relevance (recall/MRR/nDCG @ {REPORT_KS:?}) — {}",
+        comment(&format!(
+            "relevance (recall/MRR/nDCG @ {REPORT_KS:?}) — {}",
             corpus.provenance
-        );
-        println!(
-            "# docs={} scored-queries={scored} depth={KMAX} (single pull, sliced) — sparse qrels \
-             (~1 relevant/query): recall@k UNDERSTATES true recall",
+        ));
+        comment(&format!(
+            "docs={} scored-queries={scored} depth={KMAX} (single pull, sliced) — sparse qrels (~1 relevant/query): recall@k UNDERSTATES true recall",
             corpus.docs.len()
-        );
-        println!(
-            "# real paraphrased queries (no guaranteed substring). baseline = word BM25 \
-             (canonical) + trigram-bm25 cousin + LIKE floor."
+        ));
+        comment(
+            "real paraphrased queries (no guaranteed substring). baseline = word BM25 (canonical) + trigram-bm25 cousin + LIKE floor.",
         );
         print_filter(&skip);
         for r in &records {
             render_quality_record(r);
-        }
-        if let Some(t) = trifle_misses {
-            println!("# trifle {}", t.line());
         }
     }
     Ok(())
@@ -1336,11 +1263,11 @@ fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
     let seed = flags.u64("seed", DEFAULT_SEED)?;
     let warmup = flags.usize("warmup", 3)?;
     let tuning = tuning(&flags)?;
-    // `--edits N` runs a single edit count; `--edits lo,hi` runs each of the inclusive range
-    // lo..=hi (e.g. `0,2` → 0, 1, 2). Omitted runs {1, 2}.
-    let edit_counts: Vec<usize> = match flags.last("edits") {
+    // `--edits lo,hi` (default `0,2`) sets the typo range; each query gets a RANDOM count drawn
+    // from [lo, hi], evaluated as ONE mixed batch. `--edits N` pins every query to N.
+    let (edits_lo, edits_hi) = match flags.last("edits") {
         Some(s) => parse_edits_range(s)?,
-        None => vec![1, 2],
+        None => (0, 2),
     };
     let json_mode = match flags.str("format", "text").as_str() {
         "text" => false,
@@ -1366,137 +1293,113 @@ fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
         e
     };
     let like = (!skip.contains(ENGINE_LIKE)).then(|| Like::build(corpus));
-    let text_of = text_index(corpus);
-    let m = effective_m(tuning);
     let density = near_distractor_density(&trifle, &ent.targets, KMAX);
 
-    let tok = TrigramTokenizer::new();
-    // Owned groups (their `QualityRecord`s outlive the per-edit loop so the borrowed JSON
-    // view can be built once at the end).
-    let mut groups: Vec<FuzzyGroup> = Vec::new();
-
-    if !json_mode {
-        println!(
-            "# fuzzy (recall/MRR/nDCG @ {REPORT_KS:?}) — {}",
-            corpus.provenance
-        );
-        println!(
-            "# depth={KMAX} (single pull, sliced). baseline = FTS5 trigram-MATCH (OR-bag, bm25) \
-             + LIKE floor — NOT bm25-phrase (~0 on typos by construction)."
-        );
-        println!(
-            "# CAVEAT: entity-name fuzzy is a FAVORABLE regime (short, structured, low-paraphrase). \
-             Strong recall here validates the fuzzy MACHINERY; it does NOT transfer to prose fuzzy."
-        );
-        println!(
-            "# near-distractor density = {density:.3} (fraction of targets whose clean name \
-             surfaces another indexed entity; low => trivially-easy run, recall inflated)."
-        );
-        print_filter(&skip);
+    // ONE mixed-typo batch: each query gets a random typo count in [edits_lo, edits_hi].
+    let qs = query::fuzzy_queries(&ent.targets, edits_lo, edits_hi, seed);
+    if qs.is_empty() {
+        return Err("no queries generated (corpus too small or names too short)".into());
     }
+    let qtexts: Vec<&str> = qs.iter().map(|q| q.text.as_str()).collect();
+    // Singleton relevant sets (MRR is the reciprocal rank of the one relevant entity).
+    let relevant: Vec<Vec<i64>> = qs.iter().map(|q| vec![q.target]).collect();
 
-    for edits in edit_counts {
-        let qs = query::fuzzy_queries(&ent.targets, edits, seed);
-        if qs.is_empty() {
-            if !json_mode {
-                println!("{edits:>6}  (no queries generated)");
-            }
-            continue;
-        }
-        let qtexts: Vec<&str> = qs.iter().map(|q| q.text.as_str()).collect();
-        // Singleton relevant sets — the same path as relevance (MRR is the reciprocal rank of
-        // the one relevant entity).
-        let relevant: Vec<Vec<i64>> = qs.iter().map(|q| vec![q.target]).collect();
-        // Trigram survival: avg fraction of the clean name's trigrams the edits leave.
-        let mut surv = 0.0f64;
-        for q in &qs {
-            let clean = trigram_set(&tok, &q.clean);
-            if !clean.is_empty() {
-                surv += shared_trigrams(&tok, &q.text, &q.clean) as f64 / clean.len() as f64;
-            }
-        }
-        let survival = surv / qs.len() as f64;
+    // The actual edit-count distribution across the batch.
+    let mut counts = vec![0usize; edits_hi - edits_lo + 1];
+    for q in &qs {
+        counts[q.edits - edits_lo] += 1;
+    }
+    let edit_mix: Vec<EditCount> = (edits_lo..=edits_hi)
+        .zip(counts.iter().copied())
+        .map(|(edits, count)| EditCount { edits, count })
+        .collect();
 
-        let mut records: Vec<QualityRecord> = Vec::new();
-        let (tr_rec, tr_res) = measure_quality(&trifle, &qtexts, &relevant, warmup);
-        records.push(tr_rec);
-        if let Some(e) = &fts5 {
-            records.push(measure_quality(e, &qtexts, &relevant, warmup).0);
+    // Trigram survival: the average fraction of each clean name's trigrams the typos leave.
+    let tok = TrigramTokenizer::new();
+    let (mut surv, mut surv_n) = (0.0f64, 0usize);
+    for q in &qs {
+        let clean = trigram_set(&tok, &q.clean);
+        if !clean.is_empty() {
+            surv += shared_trigrams(&tok, &q.text, &q.clean) as f64 / clean.len() as f64;
+            surv_n += 1;
         }
-        if let Some(e) = &like {
-            records.push(measure_quality(e, &qtexts, &relevant, warmup).0);
-        }
+    }
+    let survival = if surv_n > 0 {
+        surv / surv_n as f64
+    } else {
+        0.0
+    };
 
-        if json_mode {
-            groups.push(FuzzyGroup {
-                edits,
-                queries: qtexts.len(),
-                scored_queries: scored_queries(&relevant),
-                trigram_survival: survival,
-                records,
-            });
-        } else {
-            println!(
-                "## edits={edits}  queries={}  trigram-survival={survival:.3}",
-                qtexts.len()
-            );
-            for r in &records {
-                render_quality_record(r);
-            }
-            let tally = tag_misses(&qtexts, &relevant, &tr_res, KMAX, &text_of, m);
-            println!("# trifle edits={edits}: {}", tally.line());
-        }
+    // Measure each engine once over the whole mixed batch.
+    let mut records: Vec<QualityRecord> = Vec::new();
+    records.push(measure_quality(&trifle, &qtexts, &relevant, warmup).0);
+    if let Some(e) = &fts5 {
+        records.push(measure_quality(e, &qtexts, &relevant, warmup).0);
+    }
+    if let Some(e) = &like {
+        records.push(measure_quality(e, &qtexts, &relevant, warmup).0);
     }
 
     if json_mode {
-        let groups_json: Vec<FuzzyGroupJson> = groups
-            .iter()
-            .map(|g| FuzzyGroupJson {
-                edits: g.edits,
-                queries: g.queries,
-                scored_queries: g.scored_queries,
-                trigram_survival: g.trigram_survival,
-                records: g.records.iter().map(quality_record_json).collect(),
-            })
-            .collect();
         let obj = FuzzyRunJson {
             command: "fuzzy",
             corpus: &corpus_key,
             provenance: &corpus.provenance,
             docs: corpus.docs.len(),
+            queries: qtexts.len(),
+            scored_queries: scored_queries(&relevant),
             seed,
+            edits_lo,
+            edits_hi,
+            edit_mix,
+            trigram_survival: survival,
+            near_distractor_density: density,
             k_max: KMAX,
             ks: REPORT_KS.to_vec(),
-            near_distractor_density: density,
             conditions: conditions(),
-            groups: groups_json,
+            records: records.iter().map(quality_record_json).collect(),
         };
         println!(
             "{}",
             serde_json::to_string(&obj).expect("serialize fuzzy json")
         );
+    } else {
+        let mix = edit_mix
+            .iter()
+            .map(|e| format!("{}×{}", e.edits, e.count))
+            .collect::<Vec<_>>()
+            .join(" ");
+        comment(&format!(
+            "fuzzy (recall/MRR/nDCG @ {REPORT_KS:?}) — {}",
+            corpus.provenance
+        ));
+        comment(&format!(
+            "edits {edits_lo}..={edits_hi} random per query (mix {mix}); queries={} scored-queries={} depth={KMAX} (single pull, sliced)",
+            qtexts.len(),
+            scored_queries(&relevant),
+        ));
+        comment(&format!(
+            "trigram-survival={survival:.3}; near-distractor-density={density:.3} (fraction of targets whose clean name surfaces another indexed entity; low => easy run, recall inflated)"
+        ));
+        comment(
+            "baseline = FTS5 trigram-MATCH (OR-bag, bm25) + LIKE floor, NOT bm25-phrase (~0 on typos by construction)",
+        );
+        comment(
+            "CAVEAT: entity-name fuzzy is a FAVORABLE regime (short, structured, low-paraphrase); strong recall here validates the fuzzy MACHINERY, not prose fuzzy",
+        );
+        print_filter(&skip);
+        for r in &records {
+            render_quality_record(r);
+        }
     }
     Ok(())
 }
 
-/// One per-edit-count group of the fuzzy run (owned): the edit count, its diagnostics, and a
-/// quality record per engine.
-struct FuzzyGroup {
-    edits: usize,
-    queries: usize,
-    scored_queries: usize,
-    trigram_survival: f64,
-    records: Vec<QualityRecord>,
-}
-
-/// The borrowed JSON view of a [`FuzzyGroup`].
+/// One bucket of the fuzzy edit-mix: how many batch queries got exactly `edits` typos.
 #[derive(Serialize)]
-struct FuzzyGroupJson<'a> {
+struct EditCount {
     edits: usize,
-    queries: usize,
-    scored_queries: usize,
-    trigram_survival: f64,
-    records: Vec<QualityRecordJson<'a>>,
+    count: usize,
 }
 
 #[derive(Serialize)]
@@ -1505,12 +1408,18 @@ struct FuzzyRunJson<'a> {
     corpus: &'a str,
     provenance: &'a str,
     docs: usize,
+    queries: usize,
+    scored_queries: usize,
     seed: u64,
+    edits_lo: usize,
+    edits_hi: usize,
+    edit_mix: Vec<EditCount>,
+    trigram_survival: f64,
+    near_distractor_density: f64,
     k_max: usize,
     ks: Vec<usize>,
-    near_distractor_density: f64,
     conditions: Conditions,
-    groups: Vec<FuzzyGroupJson<'a>>,
+    records: Vec<QualityRecordJson<'a>>,
 }
 
 /// Fraction of targets whose *clean* name surfaces ≥1 other indexed entity in trifle — i.e.
@@ -1569,7 +1478,9 @@ fn labeled_corpus(
         }
         corpus::CORPUS_GEONAMES_CITIES | corpus::CORPUS_GEONAMES_ALL => {
             let ent = corpus::geonames(which, n, q, seed).map_err(|e| format!("geonames: {e}"))?;
-            let qs = query::fuzzy_queries(&ent.targets, edits.max(1), seed)
+            // selsweep/dsweep hold the typo count fixed at `edits` (they sweep selection / D).
+            let e = edits.max(1);
+            let qs = query::fuzzy_queries(&ent.targets, e, e, seed)
                 .into_iter()
                 .map(|fq| (fq.text, vec![fq.target]))
                 .collect();
@@ -1824,11 +1735,11 @@ fn cmd_profile(args: &[String]) -> Result<(), String> {
     let ndocs = corpus.docs.len();
     let nq = qtexts.len();
     let ns = dist.count();
-    println!(
-        "# profile — Σ(kept-posting cardinality) per query — {}",
+    comment(&format!(
+        "profile — Σ(kept-posting cardinality) per query — {}",
         corpus.provenance
-    );
-    println!("# docs={ndocs} queries={nq} (samples={ns})");
+    ));
+    comment(&format!("docs={ndocs} queries={nq} (samples={ns})"));
     println!(
         "Σ-cardinality  p50 {} · p90 {} · p99 {} · max {} · mean {:.0}",
         dist.pct(50.0),
@@ -1837,8 +1748,9 @@ fn cmd_profile(args: &[String]) -> Result<(), String> {
         dist.max(),
         dist.mean(),
     );
-    println!("# Correlate with the p99 of `latency`: if the tail tracks this curve, the");
-    println!("# residual is big-bitset AND/XOR cost (expected). If not, look at hydration.");
+    comment(
+        "Correlate with the p99 of `latency`: if the tail tracks this curve, the residual is big-bitset AND/XOR cost (expected). If not, look at hydration.",
+    );
     Ok(())
 }
 
@@ -1853,9 +1765,9 @@ fn cmd_fetch(args: &[String]) -> Result<(), String> {
 
 // ----- dsweep (recall vs weight_step D) ---------------------------------------
 
-/// Parse a `--edits` spec: a single `N` (→ `[N]`) or a comma range `lo,hi` (→ the inclusive
-/// range `lo..=hi`, e.g. `0,2` → `[0, 1, 2]`). Order-insensitive (uses min/max of the values).
-fn parse_edits_range(s: &str) -> Result<Vec<usize>, String> {
+/// Parse a `--edits` spec into an inclusive `(lo, hi)` typo range: a single `N` → `(N, N)`, or a
+/// comma range `lo,hi` → `(min, max)` (order-insensitive, e.g. `0,2` and `2,0` both → `(0, 2)`).
+fn parse_edits_range(s: &str) -> Result<(usize, usize), String> {
     let vals: Vec<usize> = s
         .split(',')
         .map(|t| t.trim().parse::<usize>())
@@ -1863,7 +1775,7 @@ fn parse_edits_range(s: &str) -> Result<Vec<usize>, String> {
         .map_err(|_| format!("--edits: expected an integer or a `lo,hi` range: {s}"))?;
     let lo = *vals.iter().min().ok_or("--edits is empty")?;
     let hi = *vals.iter().max().expect("non-empty (min succeeded)");
-    Ok((lo..=hi).collect())
+    Ok((lo, hi))
 }
 
 /// Parse a comma-separated `f64` list (the `--steps` grid).
@@ -1918,10 +1830,10 @@ fn cmd_dsweep(args: &[String]) -> Result<(), String> {
     let relevant: Vec<Vec<i64>> = queries.iter().map(|(_, r)| r.clone()).collect();
     let trifle = Trifle::build(&corpus, fixed);
 
-    println!(
-        "# dsweep[{which}] — recall vs weight_step D — N={ndocs} queries={} depth={KMAX}",
+    comment(&format!(
+        "dsweep[{which}] — recall vs weight_step D — N={ndocs} queries={} depth={KMAX}",
         qtexts.len()
-    );
+    ));
     println!("D       recall@1  @5      @10     @50     mrr@10  ndcg@10");
     let mut best = (f64::NAN, f64::NEG_INFINITY); // (D, recall@10)
     for &d in &steps {
@@ -1943,13 +1855,13 @@ fn cmd_dsweep(args: &[String]) -> Result<(), String> {
             best = (d, r10);
         }
     }
-    println!("# scored-queries={}", scored_queries(&relevant));
+    comment(&format!("scored-queries={}", scored_queries(&relevant)));
     match trifle.weight_step_hint() {
-        Some(h) => println!(
-            "# WeightStepHint suggests D≈{h:.2}; recall@10-optimal in grid is D={:.2} (recall@10 {:.4})",
+        Some(h) => comment(&format!(
+            "WeightStepHint suggests D≈{h:.2}; recall@10-optimal in grid is D={:.2} (recall@10 {:.4})",
             best.0, best.1
-        ),
-        None => println!("# WeightStepHint: none (no informative band-spread sample)"),
+        )),
+        None => comment("WeightStepHint: none (no informative band-spread sample)"),
     }
     Ok(())
 }
@@ -1989,8 +1901,10 @@ fn cmd_overlap(args: &[String]) -> Result<(), String> {
     }
     let p = |samples: Vec<u64>, q: f64| fmt_dur(Duration::from_nanos(Dist::new(samples).pct(q)));
 
-    println!("# bench — trifle-overlap build/walk on synthetic bitmaps (no SQLite)");
-    println!("# postings(k)={k} trials={trials} universe={universe}");
+    comment("overlap — trifle-overlap build/walk on synthetic bitmaps (no SQLite)");
+    comment(&format!(
+        "postings(k)={k} trials={trials} universe={universe}"
+    ));
 
     // Build cost vs posting cardinality — the op-count flatness curve (all-weight-1).
     println!("\n## build cost vs posting cardinality (all-weight-1)");
@@ -2014,7 +1928,7 @@ fn cmd_overlap(args: &[String]) -> Result<(), String> {
     // Weights derive from df, so mixed weights require unequal cardinalities — the geometric set
     // is therefore also lighter total work. This contrasts a realistic skewed-df query against
     // the worst-case uniform-dense set; it is NOT weight-mode isolated at equal work.
-    println!("\n## build: uniform card 4096 (all-weight-1) vs geometric cards (mixed-weight)");
+    println!("\n## build: uniform-card (all-weight-1) vs geometric-card (mixed-weight)");
     let mut rng = Rng::new(seed ^ 0x0A11);
     let (mut uni, mut mix) = (Vec::with_capacity(trials), Vec::with_capacity(trials));
     for _ in 0..trials {
@@ -2109,10 +2023,10 @@ fn cmd_ingest(args: &[String]) -> Result<(), String> {
     };
     let rate = |docs: usize, d: Duration| docs as f64 / d.as_secs_f64().max(1e-9);
 
-    println!(
-        "# write — {} — docs={ndocs} batch={batch}",
+    comment(&format!(
+        "ingest — {} — docs={ndocs} batch={batch}",
         corpus.provenance
-    );
+    ));
 
     // (a) incremental upsert + commit, batched.
     let dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
@@ -2170,11 +2084,11 @@ mod tests {
 
     #[test]
     fn edits_range_single_value_and_inclusive_range() {
-        assert_eq!(parse_edits_range("2").unwrap(), vec![2]);
-        assert_eq!(parse_edits_range("0,2").unwrap(), vec![0, 1, 2]);
-        assert_eq!(parse_edits_range("1,2").unwrap(), vec![1, 2]);
-        // Order-insensitive: lo,hi is min..=max either way.
-        assert_eq!(parse_edits_range("2,0").unwrap(), vec![0, 1, 2]);
+        assert_eq!(parse_edits_range("2").unwrap(), (2, 2));
+        assert_eq!(parse_edits_range("0,2").unwrap(), (0, 2));
+        assert_eq!(parse_edits_range("1,2").unwrap(), (1, 2));
+        // Order-insensitive: lo,hi is (min, max) either way.
+        assert_eq!(parse_edits_range("2,0").unwrap(), (0, 2));
         // Non-integers are rejected.
         assert!(parse_edits_range("x").is_err());
         assert!(parse_edits_range("0,x").is_err());

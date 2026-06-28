@@ -76,11 +76,12 @@ For `latency`, the `geonames-*` corpora are queried with **exact entity names (n
 distinct short-structured-segment scaling regime — while `synthetic`/`msmarco` use in-corpus
 snippets.
 
-Assets download on first use and are hash-verified, into `.cache/bench/<corpus>/`. The GeoNames
-dumps are **pinned to a frozen snapshot** for reproducibility but regenerate ~daily upstream, so
-after a refresh strict verification fails: re-pin the manifest in `benchmarks/sources/` with the
-hash the error prints (the mismatched download is kept in the cache, so there is nothing to
-re-fetch). See [`ASSETS.md`](ASSETS.md) for licenses.
+Assets download on first use and cache into `.cache/bench/<corpus>/`. An immutable source pins a
+`sha256` in `benchmarks/sources/` and is hash-verified; the **GeoNames** dumps are intentionally
+**unpinned** (empty `sha256`) — they regenerate ~daily, so a pinned hash would go stale every day,
+and the dump is used as-is without content verification (the fetch prints the computed hash for
+reference). A pinned source whose hash *does* drift errors but keeps the download, so you re-pin
+with the printed hash without re-fetching. See [`ASSETS.md`](ASSETS.md) for licenses.
 
 ## Reproducibility
 

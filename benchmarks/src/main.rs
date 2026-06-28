@@ -168,6 +168,7 @@ SELSWEEP (selection-cost frontier; trifle only):
                                   msmarco-relevance]
     --docs <N | n1,n2,..>         Index size, or a comma-separated N ladder swept in one run
                                   (e.g. 1000,5000,25000,125000,625000) [default: 100000]
+    --queries <N>                 Labeled queries evaluated per N [default: 500]
     --edits <N>                   Typos per query for geonames [default: 2]
     --max-tmax <T>                Top of the t_max grid (2,4,..,T) [default: 20]
     --format <csv|json>           Output format [default: csv]

@@ -8,21 +8,21 @@ knob.
 
 There are seven benchmarks plus two utilities:
 
-- **`latency`** — search latency + throughput. Corpus `synthetic`/`msmarco` (snippet queries
-  with a 0/1/2 typo mix) or `geonames-*` (exact entity names, the short-structured-segment
-  scaling regime). An in-corpus self-recall figure rides along as a sanity check: trifle is
-  always scored, and on the exact geonames corpora the FTS5-phrase and LIKE baselines are scored
-  too (on the typo'd snippets they stay unscored — phrase-MATCH scores ~0 there).
+- **`latency`** — search latency + throughput on **clean** queries (no typos). Corpus
+  `synthetic`/`msmarco` (in-corpus snippets) or `geonames-*` (exact entity names, the
+  short-structured-segment scaling regime). An in-corpus self-recall figure rides along as a
+  sanity check; since the queries are clean, every engine has well-defined recall and all are
+  scored.
 - **`relevance`** — recall + latency on MS MARCO real dev queries + qrels, vs BM25.
 - **`fuzzy`** — recall + latency on GeoNames entity names with injected edits (typo tolerance).
 - **`selsweep`** — the selection-cost frontier: recall@k vs Σdf (and vs p99 latency) for both
   selection arms, `t_max` and `df_budget` — to pick the better recall-per-unit-work knob.
 - **`dsweep`** — recall/MRR/nDCG@{1,5,10,50} vs the IDF `weight_step` `D`, plus a check of the
   corpus `WeightStepHint` against the recall-optimal `D`.
-- **`bench`** — the engine in isolation: `trifle-overlap` build/walk on synthetic CRoaring
+- **`overlap`** — the engine in isolation: `trifle-overlap` build/walk on synthetic CRoaring
   bitmaps (no SQLite). The build-cost-vs-cardinality flatness curve, the all-weight-1 fast path,
   and shallow top-k vs a full deep-pull walk.
-- **`write`** — write-path throughput: incremental `upsert`/`commit` docs/s, `rebuild` docs/s,
+- **`ingest`** — write-path throughput: incremental `upsert`/`commit` docs/s, `rebuild` docs/s,
   and `compact()` cost.
 - **`profile`** — the work-done curve: the Σ(kept-posting cardinality) distribution.
 - **`fetch`** — warm the pinned-corpus cache before an offline run.
@@ -74,11 +74,13 @@ count (queries with ≥1 in-corpus relevant id) is printed as the denominator.
 
 For `latency`, the `geonames-*` corpora are queried with **exact entity names (no edits)** — a
 distinct short-structured-segment scaling regime — while `synthetic`/`msmarco` use in-corpus
-snippets (0–2 typos).
+snippets.
 
-Assets download on first use and are hash-verified where the source is immutable, into
-`.cache/bench/<corpus>/`. GeoNames dumps regenerate ~daily and are intentionally unpinned. See
-[`ASSETS.md`](ASSETS.md) for licenses.
+Assets download on first use and are hash-verified, into `.cache/bench/<corpus>/`. The GeoNames
+dumps are **pinned to a frozen snapshot** for reproducibility but regenerate ~daily upstream, so
+after a refresh strict verification fails: re-pin the manifest in `benchmarks/sources/` with the
+hash the error prints (the mismatched download is kept in the cache, so there is nothing to
+re-fetch). See [`ASSETS.md`](ASSETS.md) for licenses.
 
 ## Reproducibility
 
@@ -129,7 +131,8 @@ meaningless.
 ### Latency output, `--batched`, `--concurrent`, and JSON
 
 `latency` reports per engine, in serial mode, **p50 / p90 / p95 / p99 / max** latency plus
-throughput, and a trifle-only in-corpus self-recall@k. `--batched` times the whole query set as
+throughput, and an in-corpus self-recall@k (every engine — the queries are clean, so recall is
+well-defined for all). `--batched` times the whole query set as
 one `matches_batch` call (shares posting/frequency reads). `--concurrent T` runs trifle across
 `T` worker threads, each opening its own pooled `index.reader()` behind a start gate (the
 read-pool caller-fanout axis), and reports aggregate throughput plus the per-query p99 across

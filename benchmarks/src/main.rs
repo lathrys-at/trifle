@@ -76,8 +76,8 @@ fn main() -> ExitCode {
         "fuzzy" => cmd_fuzzy(rest),
         "selsweep" => cmd_selsweep(rest),
         "dsweep" => cmd_dsweep(rest),
-        "bench" => cmd_bench(rest),
-        "write" => cmd_write(rest),
+        "overlap" => cmd_overlap(rest),
+        "ingest" => cmd_ingest(rest),
         "profile" => cmd_profile(rest),
         "fetch" => cmd_fetch(rest),
         "help" | "--help" | "-h" => {
@@ -107,8 +107,8 @@ COMMANDS:
     fuzzy      Entity name+edit recall/MRR/nDCG@{1,5,10,50} + latency, per edit-count
     selsweep   Selection-cost frontier: recall@k vs Σdf for both arms (t_max, df_budget)
     dsweep     Recall@{1,5,10,50} vs weight_step D, and the WeightStepHint vs the optimum
-    bench      Engine microbench: trifle-overlap build/walk on synthetic bitmaps (no SQLite)
-    write      Write throughput: incremental upsert/commit, rebuild, and compact cost
+    overlap    Engine microbench: trifle-overlap build/walk on synthetic bitmaps (no SQLite)
+    ingest     Write throughput: incremental upsert/commit, rebuild, and compact cost
     profile    Σ(kept-posting cardinality) distribution — the work-done curve
     fetch      Download + verify the pinned corpus assets into the cache (no bench)
     help       Show this message
@@ -130,10 +130,10 @@ ENGINE SELECTION (latency, relevance, fuzzy):
                                   fts5-trigram-bm25, fts5-word-bm25, like-scan.
                                   (trifle is the subject of `fuzzy` and cannot be filtered.)
 
-LATENCY (speed only):
+LATENCY (speed; clean queries — no typos):
     --corpus <synthetic|msmarco|geonames-cities|geonames-all>  Corpus [default: synthetic]
-                                  synthetic/msmarco = in-corpus snippets (0-2 typos);
-                                  geonames-* = exact entity-name queries (no typos), the
+                                  synthetic/msmarco = clean in-corpus snippets;
+                                  geonames-* = exact entity-name queries, the
                                   short-structured-segment scaling regime.
     --k <N>                       Top-k limit per search [default: 10]
     --warmup <N>                  Untimed warmup queries [default: 3]
@@ -147,9 +147,8 @@ LATENCY (speed only):
     --instrument-out <dir>        Where to write the trace [.cache/bench/instruments]
 
     An in-corpus self-recall figure (the snippet/name's own doc is the answer) rides along so
-    the speed numbers carry a quality sanity check. trifle is always scored; the FTS5-phrase
-    and LIKE baselines are scored too on the exact geonames corpora (no typos), and left
-    unscored on the typo'd synthetic/msmarco snippets (phrase-MATCH scores ~0 there).
+    the speed numbers carry a quality sanity check. Queries are clean (no typos), so every
+    engine has well-defined recall and all are scored.
 
 RELEVANCE (recall + latency; single depth-50 pull):
     Engines: trifle, fts5-word-bm25 (BM25), fts5-trigram-bm25 (OR-bag), like-scan.
@@ -158,7 +157,8 @@ RELEVANCE (recall + latency; single depth-50 pull):
 
 FUZZY (recall + latency; single depth-50 pull):
     --corpus <geonames-cities|geonames-all>   Entity corpus [default: geonames-cities]
-    --edits <N>                   Typos per query. Omit to run {1, 2} separately.
+    --edits <N | lo,hi>           Typos per query: a single count, or a `lo,hi` inclusive
+                                  range run separately (e.g. 0,2 → 0, 1, 2). Omit to run {1, 2}.
     --warmup <N>                  Untimed warmup queries [default: 3]
     --format <text|json>          Output format [default: text]
 
@@ -180,14 +180,14 @@ DSWEEP (recall vs the weight_step D; trifle only, single depth-50 pull):
     Reports recall/MRR/nDCG@{1,5,10,50} per D, then the corpus WeightStepHint's suggested D
     against the recall@10-optimal D in the grid.
 
-BENCH (trifle-overlap engine, synthetic bitmaps — no SQLite, no corpus):
+OVERLAP (trifle-overlap engine microbench, synthetic bitmaps — no SQLite, no corpus):
     --postings <K>                Postings per query (selected tokens) [default: 10]
     --trials <N>                  Counters built per regime (build-time samples) [default: 300]
     --universe <N>                Id space the synthetic postings draw from [default: 1000000]
     Sweeps posting cardinality to expose the build's op-count flatness, contrasts the
     all-weight-1 fast path with mixed weights, and shallow top-k vs a full deep-pull walk.
 
-WRITE (write-path throughput; trifle only):
+INGEST (write-path throughput; trifle only):
     --corpus <synthetic|msmarco|geonames-cities|geonames-all>  Corpus [default: synthetic]
     --docs <N>                    Documents to index [default: 50000]
     --batch <N>                   Commit batch size for the incremental path [default: 1000]
@@ -272,9 +272,6 @@ impl Flags {
         self.last(key)
             .cloned()
             .unwrap_or_else(|| default.to_string())
-    }
-    fn has(&self, key: &str) -> bool {
-        self.valued.contains_key(key)
     }
     fn flag(&self, key: &str) -> bool {
         self.bools.contains(key)
@@ -471,9 +468,9 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
         );
     }
 
-    // The two latency query regimes: snippet corpora (synthetic/msmarco) carry a 0/1/2 typo
-    // mix; the geonames corpora are exact entity-name queries (no typos), a short-structured
-    // scaling regime. Both expose a per-query relevant id for the trifle self-recall sanity.
+    // Latency queries are clean (no typos): in-corpus snippets for synthetic/msmarco, exact
+    // entity names for geonames (a short-structured-segment regime). Both expose a per-query
+    // relevant id, so every engine is scored alongside the timing.
     let inputs = latency_inputs(&flags, &corpus_name, seed)?;
     if inputs.qtexts.is_empty() {
         return Err("no queries generated (corpus too small or documents too short)".into());
@@ -481,11 +478,6 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
     let qtexts: Vec<&str> = inputs.qtexts.iter().map(String::as_str).collect();
     let relevant: Vec<Vec<i64>> = inputs.targets.iter().map(|&t| vec![t]).collect();
     let corpus = &inputs.corpus;
-    // When the regime injects no typos (the geonames exact-name corpora), the SQLite baselines
-    // have well-defined recall too — an exact name is an exact substring, so FTS5 phrase + LIKE
-    // find it — so score every engine. On the typo regime (synthetic/msmarco) phrase-MATCH scores
-    // ~0 by construction, so the baselines stay unscored and only trifle reports self-recall.
-    let exact = inputs.mix[1] == 0 && inputs.mix[2] == 0;
 
     let meta = RunMeta {
         corpus: &corpus_name,
@@ -494,7 +486,6 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
         queries: qtexts.len(),
         k,
         seed,
-        mix: inputs.mix,
         warmup: warmup.min(qtexts.len()),
         repeat,
         min_shared: tuning.min_shared,
@@ -525,7 +516,7 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
     }
 
     // Serial / batched: measure every engine into records, then render.
-    let records = measure_engines(corpus, &bench, &skip, tuning, exact);
+    let records = measure_engines(corpus, &bench, &skip, tuning);
 
     if json_mode {
         render_run_json(&meta, &records);
@@ -541,18 +532,16 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The built corpus + generated latency queries (texts and their relevant ids) plus the typo
-/// mix the regime produced.
+/// The built corpus + generated latency queries (texts and their relevant ids).
 struct LatencyInputs {
     corpus: Corpus,
     qtexts: Vec<String>,
     targets: Vec<i64>,
-    mix: [usize; 3],
 }
 
-/// Build the latency corpus + queries for `corpus_name`. The snippet corpora draw in-corpus
-/// snippets with a 0/1/2 typo mix ([`query::perf_queries`]); the geonames corpora emit exact
-/// entity-name queries (zero edits) over short structured segments.
+/// Build the latency corpus + queries for `corpus_name`. The snippet corpora draw clean
+/// in-corpus snippets ([`query::perf_queries`]); the geonames corpora emit exact entity-name
+/// queries over short structured segments. Latency never injects typos.
 fn latency_inputs(flags: &Flags, corpus_name: &str, seed: u64) -> Result<LatencyInputs, String> {
     let docs = flags.usize("docs", 50_000)?;
     if docs == 0 {
@@ -566,19 +555,12 @@ fn latency_inputs(flags: &Flags, corpus_name: &str, seed: u64) -> Result<Latency
                 _ => corpus::msmarco(docs, seed).map_err(|e| format!("msmarco: {e}"))?,
             };
             let queries = query::perf_queries(&corpus, n, seed);
-            let mut mix = [0usize; 3];
-            for q in &queries {
-                if let Some(slot) = mix.get_mut(q.edits) {
-                    *slot += 1;
-                }
-            }
             let qtexts = queries.iter().map(|q| q.text.clone()).collect();
             let targets = queries.iter().map(|q| q.target).collect();
             Ok(LatencyInputs {
                 corpus,
                 qtexts,
                 targets,
-                mix,
             })
         }
         corpus::CORPUS_GEONAMES_CITIES | corpus::CORPUS_GEONAMES_ALL => {
@@ -590,14 +572,12 @@ fn latency_inputs(flags: &Flags, corpus_name: &str, seed: u64) -> Result<Latency
             }
             // Exact entity-name queries: zero edits, the short-structured-segment regime.
             let qs = query::fuzzy_queries(&ent.targets, 0, seed);
-            let mix = [qs.len(), 0, 0];
             let qtexts = qs.iter().map(|q| q.text.clone()).collect();
             let targets = qs.iter().map(|q| q.target).collect();
             Ok(LatencyInputs {
                 corpus: ent.corpus,
                 qtexts,
                 targets,
-                mix,
             })
         }
         other => Err(format!(
@@ -618,10 +598,9 @@ struct Bench<'a> {
 }
 
 /// One measured engine row. `samples_ns` is the raw per-query latency in call order (serial
-/// mode); it is empty in batched mode, which times the whole set as one call. `recall` is `Some`
-/// for trifle always (its in-corpus self-recall) and for the baselines on the exact (no-typo)
-/// regime; it is `None` for the baselines on the typo regime, where phrase-MATCH scores ~0 and a
-/// recall number would mislead.
+/// mode); it is empty in batched mode, which times the whole set as one call. `recall` is the
+/// in-corpus recall@k — `Some` for every engine, since latency queries are clean (a skipped
+/// engine simply has no record). The `Option` keeps the renderer/JSON defensive.
 struct Record {
     engine: String,
     samples_ns: Vec<u64>,
@@ -629,17 +608,15 @@ struct Record {
     recall: Option<f64>,
 }
 
-/// Build, then measure, each non-filtered engine for `latency`. trifle always reports its
-/// in-corpus self-recall. The FTS5-phrase and LIKE baselines are scored only when `exact` (the
-/// queries carry no typos, e.g. the geonames exact-name corpora), where phrase + substring recall
-/// is well-defined; on the typo regime phrase-MATCH scores ~0 by construction, so they are left
-/// unscored to avoid a misleading number.
+/// Build, then measure, each non-filtered engine for `latency`. Latency queries are clean
+/// in-corpus snippets / exact names (no typos), so every engine has well-defined recall — an
+/// exact query is an exact substring that FTS5-phrase and LIKE genuinely match — and all are
+/// scored alongside the timing.
 fn measure_engines(
     corpus: &Corpus,
     bench: &Bench,
     skip: &HashSet<String>,
     tuning: Tuning,
-    exact: bool,
 ) -> Vec<Record> {
     let mut records = Vec::new();
     if !skip.contains(ENGINE_TRIFLE) {
@@ -647,15 +624,15 @@ fn measure_engines(
         records.push(measure_one(bench, true, &trifle));
     }
     if !skip.contains(ENGINE_FTS5) {
-        // Phrase mode: the latency *speed* baseline. Scored only on the exact regime.
+        // Phrase mode: the latency speed baseline (and exact-query recall).
         match Fts5::build(corpus, MatchMode::Phrase) {
-            Some(fts5) => records.push(measure_one(bench, exact, &fts5)),
+            Some(fts5) => records.push(measure_one(bench, true, &fts5)),
             None => eprintln!("note: FTS5 trigram unavailable in the linked SQLite — skipping"),
         }
     }
     if !skip.contains(ENGINE_LIKE) {
         let like = Like::build(corpus);
-        records.push(measure_one(bench, exact, &like));
+        records.push(measure_one(bench, true, &like));
     }
     records
 }
@@ -759,10 +736,9 @@ fn bench_concurrent(trifle: &Trifle, bench: &Bench, threads: usize, recall: f64)
 /// The `# …`-prefixed header for the human (text) output of the latency profile.
 fn print_run_header(meta: &RunMeta, skip: &HashSet<String>) {
     println!("# latency — {}", meta.provenance);
-    let m = meta.mix;
     println!(
-        "# docs={} queries={} (0-edit={} 1-edit={} 2-edit={}) k={} warmup={} repeat={}",
-        meta.docs, meta.queries, m[0], m[1], m[2], meta.k, meta.warmup, meta.repeat
+        "# docs={} queries={} k={} warmup={} repeat={}",
+        meta.docs, meta.queries, meta.k, meta.warmup, meta.repeat
     );
     print_filter(skip);
 }
@@ -812,7 +788,6 @@ struct RunMeta<'a> {
     queries: usize,
     k: usize,
     seed: u64,
-    mix: [usize; 3],
     warmup: usize,
     repeat: usize,
     min_shared: Option<u32>,
@@ -820,13 +795,6 @@ struct RunMeta<'a> {
 }
 
 // ---- machine-readable (`--format json`) schema ------------------------------------------
-
-#[derive(Serialize)]
-struct TypoMix {
-    e0: usize,
-    e1: usize,
-    e2: usize,
-}
 
 #[derive(Serialize)]
 struct Conditions {
@@ -883,7 +851,6 @@ struct RunJson<'a> {
     queries: usize,
     k: usize,
     seed: u64,
-    typo_mix: TypoMix,
     warmup: usize,
     repeat: usize,
     mode: &'a str,
@@ -915,11 +882,6 @@ fn render_run_json(meta: &RunMeta, records: &[Record]) {
         queries: meta.queries,
         k: meta.k,
         seed: meta.seed,
-        typo_mix: TypoMix {
-            e0: meta.mix[0],
-            e1: meta.mix[1],
-            e2: meta.mix[2],
-        },
         warmup: meta.warmup,
         repeat: meta.repeat,
         mode: "serial",
@@ -1374,10 +1336,11 @@ fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
     let seed = flags.u64("seed", DEFAULT_SEED)?;
     let warmup = flags.usize("warmup", 3)?;
     let tuning = tuning(&flags)?;
-    let edit_counts: Vec<usize> = if flags.has("edits") {
-        vec![flags.usize("edits", 1)?]
-    } else {
-        vec![1, 2]
+    // `--edits N` runs a single edit count; `--edits lo,hi` runs each of the inclusive range
+    // lo..=hi (e.g. `0,2` → 0, 1, 2). Omitted runs {1, 2}.
+    let edit_counts: Vec<usize> = match flags.last("edits") {
+        Some(s) => parse_edits_range(s)?,
+        None => vec![1, 2],
     };
     let json_mode = match flags.str("format", "text").as_str() {
         "text" => false,
@@ -1890,6 +1853,19 @@ fn cmd_fetch(args: &[String]) -> Result<(), String> {
 
 // ----- dsweep (recall vs weight_step D) ---------------------------------------
 
+/// Parse a `--edits` spec: a single `N` (→ `[N]`) or a comma range `lo,hi` (→ the inclusive
+/// range `lo..=hi`, e.g. `0,2` → `[0, 1, 2]`). Order-insensitive (uses min/max of the values).
+fn parse_edits_range(s: &str) -> Result<Vec<usize>, String> {
+    let vals: Vec<usize> = s
+        .split(',')
+        .map(|t| t.trim().parse::<usize>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("--edits: expected an integer or a `lo,hi` range: {s}"))?;
+    let lo = *vals.iter().min().ok_or("--edits is empty")?;
+    let hi = *vals.iter().max().expect("non-empty (min succeeded)");
+    Ok((lo..=hi).collect())
+}
+
 /// Parse a comma-separated `f64` list (the `--steps` grid).
 fn parse_steps(s: &str) -> Result<Vec<f64>, String> {
     let v: Vec<f64> = s
@@ -1978,9 +1954,9 @@ fn cmd_dsweep(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-// ----- bench (trifle-overlap engine, synthetic bitmaps) -----------------------
+// ----- overlap (trifle-overlap engine microbench, synthetic bitmaps) ----------
 
-fn cmd_bench(args: &[String]) -> Result<(), String> {
+fn cmd_overlap(args: &[String]) -> Result<(), String> {
     use croaring::Bitmap;
     use rng::Rng;
     use trifle_overlap::Counter;
@@ -2092,9 +2068,9 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-// ----- write (write-path throughput) ------------------------------------------
+// ----- ingest (write-path throughput) -----------------------------------------
 
-fn cmd_write(args: &[String]) -> Result<(), String> {
+fn cmd_ingest(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args, &[])?;
     flags.reject_unknown(&["corpus", "docs", "seed", "batch"])?;
     let seed = flags.u64("seed", DEFAULT_SEED)?;
@@ -2186,4 +2162,28 @@ fn cmd_write(args: &[String]) -> Result<(), String> {
         rate(ndocs, t_rebuild)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_edits_range, parse_steps};
+
+    #[test]
+    fn edits_range_single_value_and_inclusive_range() {
+        assert_eq!(parse_edits_range("2").unwrap(), vec![2]);
+        assert_eq!(parse_edits_range("0,2").unwrap(), vec![0, 1, 2]);
+        assert_eq!(parse_edits_range("1,2").unwrap(), vec![1, 2]);
+        // Order-insensitive: lo,hi is min..=max either way.
+        assert_eq!(parse_edits_range("2,0").unwrap(), vec![0, 1, 2]);
+        // Non-integers are rejected.
+        assert!(parse_edits_range("x").is_err());
+        assert!(parse_edits_range("0,x").is_err());
+    }
+
+    #[test]
+    fn steps_parses_a_float_list() {
+        assert_eq!(parse_steps("0.5,1.0,2.0").unwrap(), vec![0.5, 1.0, 2.0]);
+        assert_eq!(parse_steps("1").unwrap(), vec![1.0]);
+        assert!(parse_steps("nope").is_err());
+    }
 }

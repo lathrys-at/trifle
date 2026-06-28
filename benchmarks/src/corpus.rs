@@ -156,9 +156,12 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 ///
 /// Verification is strict: when the manifest pins a `sha256`, a cached *or* freshly
 /// downloaded file whose hash differs is a hard error (see [`sha256_mismatch`]) — the
-/// run stops rather than silently serving or re-downloading the wrong bytes. An empty
-/// manifest `sha256` is "unpinned": the file is used as-is with a loud warning
-/// carrying the computed hash to pin back into the manifest.
+/// run stops rather than silently serve the wrong bytes. A mismatched download is **kept**
+/// (not deleted) at the canonical path, so a legitimate upstream change can be inspected and
+/// re-pinned in the manifest without re-fetching; the cached-copy path re-verifies before any
+/// reuse, so the kept file is never served until its hash is pinned. An empty manifest
+/// `sha256` is "unpinned": the file is used as-is with a loud warning carrying the computed
+/// hash to pin back into the manifest.
 fn ensure(m: &Manifest, corpus: &str) -> io::Result<PathBuf> {
     let dir = cache_dir(corpus);
     std::fs::create_dir_all(&dir)?;
@@ -203,7 +206,12 @@ fn ensure(m: &Manifest, corpus: &str) -> io::Result<PathBuf> {
             m.name
         );
     } else if got != m.sha256 {
-        let _ = std::fs::remove_file(&tmp);
+        // Keep the download rather than delete it: a sha mismatch is usually a legitimate
+        // upstream change, and re-fetching a multi-GiB archive just to re-pin is wasteful.
+        // Promote it to the canonical path so it can be inspected and re-pinned in the manifest
+        // (after which the cached-copy path verifies and reuses it). Still a hard error — the
+        // cached path re-verifies before any reuse, so an unpinned-hash file is never served.
+        let _ = std::fs::rename(&tmp, &dest);
         return Err(io::Error::other(sha256_mismatch(m, &dest, &got)));
     }
     std::fs::rename(&tmp, &dest)?; // atomic: a half-written download never looks complete

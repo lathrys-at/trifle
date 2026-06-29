@@ -1,6 +1,6 @@
 [package]
 name = "trifle-overlap"
-version = "0.0.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "IDF-weighted bit-sliced overlap engine for trifle, on the CRoaring (SIMD) backend with zero-copy posting views."

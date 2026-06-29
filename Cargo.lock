@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "trifle"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "croaring",
  "proptest",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "trifle-overlap"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "croaring",
 ]

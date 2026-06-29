@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.3.0 — `rev-v0.3` (lean)
+
+The lean revision, shipped on top of the (unreleased) 0.2.0 draft below. It strips the parts of
+0.2.0 whose complexity didn't earn its keep and commits to a single spine: **IDF-weighted overlap
+*is* the ranking, and provenance streams best-first before any text is touched.** Another **hard
+cache reset** — the on-disk `SCHEMA_VERSION` bumps to 4, so an existing index drops its cache on
+open and must be `rebuild()`-ed (data-loss-free for the *cache*; the caller's source of truth is
+untouched).
+
+### Bitmaps — CRoaring everywhere
+- The `roaring` crate is dropped for **`croaring`** (the CRoaring SIMD bindings), used for **both**
+  the storage posting layer and the overlap engine. Blobs are the standard CRoaring portable
+  format — byte-identical, so there is no migration beyond the schema-version reset.
+
+### Storage — flattened, no `doc` table
+- The two-level `doc`+`seg` store collapses to **one `seg` table** carrying the key directly:
+  `(id, key, label, text, len)`, with `seg.id` the posting id. A key with no segments can no longer
+  materialize a ghost row, and provenance is a single-table point read.
+
+### Ranking — the weighted-overlap order is final (no rerank tier)
+- The pluggable `Ranker`, the over-fetch pool, and the `Effort` knob are **removed** (`src/rank.rs`
+  is gone). The IDF-weighted, class-normalized overlap order computed in the bit-sliced counter is
+  the result; a caller wanting a domain reorder composes it over the candidate stream rather than an
+  in-engine tier. `weight_step` (`D`) stays as the rarity-spacing knob.
+- **Kept from the 0.2.0 draft** (proposed for deletion, deliberately retained): the per-script-class
+  Welford rarity (multi-script awareness) and the band-spread `WeightStepHint`
+  (`Stats.weight_step_hint`).
+
+### Read API — a provenance-first candidate stream
+- Alongside `Reader::matches`/`matches_batch` (eager, top-`limit` hydrated), **`Reader::candidates`
+  → `CandidateStream`**: a best-first cursor of provenance-only `Candidate`s that fuses on the first
+  error. Compose rerank / pagination / fusion on top, then `hydrate` only what you keep — text and
+  span are read in one batched pass for exactly those candidates.
+- **`df_budget`** — a new `SearchOpts` knob capping selection by a `Σdf` work budget: an adaptive,
+  tail-bounding alternative to the fixed `t_max` count.
+
+### Filtering — raw SQL over the caller's live data
+- The structured `Filter` grammar (`Cmp`/`In`/`Between`/`Like`/…), `Schema::filterable` columns,
+  `FilterType`, and the stored filter/payload columns are **removed** — trifle-stored filter columns
+  go stale against a derived cache. In their place, **`SqlFilter { fragment, params }`**: an opt-in
+  raw parameterized predicate folded into the per-chunk provenance query against the caller's *live*
+  data (universal mode `key IN rarray(?)`; a co-located join via `ATTACH`).
+
+### Write API — segments only
+- The writer is three methods: `upsert(key, &[(label, text)])`, `remove(key)`, and
+  `remove_segment(key, label)`. The payload-carrying `insert` / `*_document` variants are gone with
+  the payload columns.
+
+### Type surface
+- `Index<T: Tokenizer = DefaultTokenizer>` is generic over the tokenizer only, over the concrete
+  `Sidecar` store; the `Backend` trait and `Shared` wrapper are removed.
+
+### Tooling
+- `benchmarks/` is reworked against the streaming API (commands `latency`/`relevance`/`fuzzy`/
+  `selsweep`/`dsweep`/`overlap`/`ingest`/`profile`), excluded from the workspace, with a `selsweep`
+  selection-cost-frontier plotter at `benchmarks/scripts/plot_selsweep.py`.
+
 ## 0.2.0 — `rev-v0.2` (unreleased)
 
 A ground-up rework. **Breaking across the board, and a hard cache reset:** the on-disk

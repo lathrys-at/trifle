@@ -223,14 +223,7 @@ mod tests {
     #[test]
     fn df_budget_caps_sigma_df_but_never_drops_below_the_floor() {
         // Rarest-first dfs 1,2,3,4,5,6,7,8; m=2 → floor F=6. With typo_damage 0 the floor is m=2.
-        let t = toks(&[
-            ("a", 1),
-            ("b", 2),
-            ("c", 3),
-            ("d", 4),
-            ("e", 5),
-            ("f", 6),
-        ]);
+        let t = toks(&[("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5), ("f", 6)]);
         let p = |budget: Option<u64>| SelectParams {
             min_shared: 2,
             typo_damage: 0,
@@ -252,7 +245,11 @@ mod tests {
             },
             &snap(),
         );
-        assert_eq!(floor3, ["a", "b", "c"], "the floor (m=3) is kept despite the tiny budget");
+        assert_eq!(
+            floor3,
+            ["a", "b", "c"],
+            "the floor (m=3) is kept despite the tiny budget"
+        );
     }
 
     #[test]

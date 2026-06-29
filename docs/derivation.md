@@ -298,7 +298,7 @@ score_query(query, channel):
         if not Q: continue                                          # this rank-view is empty -> skip it, never abort the query (Section 8)
         for g in Q:
             g.df = lookup_df(g);  g.E = energy(g.df, channel, N)     # GLOBAL energy (n-independent), the honest log-odds (Section 2)
-            g.n  = order_of(g)                                       # this gram's order = its script's order at rank rv (CJK 2/1, else 3/2)
+            g.script = script_of(g);  g.n = order_of(g)              # selection class = the (script, order) pair (CJK 2/1, else 3/2)
             g.r  = (channel == DOC_SIDE) ? SIGMA * (1 - eps)**g.n : SIGMA   # PER-GRAM reliability: topicality SIGMA x per-order survival
             g.floored = (g.df <= df_min)
             g.word = query_word_of(g)                                # comonotone-block id = g's query word (one script run -> single order/r per block)

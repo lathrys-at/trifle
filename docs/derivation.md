@@ -37,7 +37,7 @@ Throughout, logs are natural (nats), scoring is "more is better" so energy is *a
 | $\Delta H = H_3 - H_2$ | vocabulary-complexity gap between trigram/bigram df-distributions, setting the fusion weight (§8) |
 | $k_{\mathrm{RRF}},\ w_{\mathrm{tri}},\ w_{\mathrm{bi}}$ | reciprocal-rank-fusion rank constant; per-view weights |
 
-Logs are natural (nats); scoring is "more is better," so energy is added; a *segment* is the unit of indexing.
+Logs are natural (nats); scoring is "more is better," so energy is added; a *segment* is the unit of indexing. Gram **order** $n$ is a property of the script (CJK bigrams, else trigrams; §8), so $n$ varies per gram in a mixed-script query; the selection **class** is the `(script, order)` pair; a stopping **block** is one query word (§5).
 
 ---
 
@@ -125,7 +125,7 @@ This is a reparametrization: choosing the floor as a power of $N$ caps the singl
 
 $$E_{\max} = \ln\frac{N}{df_{\min}} = \tfrac{1}{\nu}\ln N.$$
 
-Identifying one of $N$ segments costs $\ln N$ nats, so a ceiling of $\tfrac1\nu\ln N$ means **no single gram can identify a segment alone; at least $\nu$ matched grams must agree.** (The expression for $E_{\max}$ drops the $\kappa$ and the $\log(1-\hat p_{\min})$ correction — together $\lesssim\!10^{-2}$ in relative terms for $N\gtrsim 10^4$, growing as $N$ shrinks since $\hat p_{\min}=N^{-1/\nu}\to 0$ only asymptotically; logit-idf and surprisal coincide at the floor.) The parameter $\nu$ (default 2) is the corroboration depth. The floor is applied only on the query-side channel; under doc-side noise every gram is a genuine word and a low df is real information, so only the estimation smoothing applies. One caution, carried to §9: the floor does not push a junk gram *below* real grams — it caps its energy at the ceiling $E_{\max}$, which still *exceeds* every non-floored real gram's energy (all of which have $df > df_{\min}$). What actually orders junk below real is the count-credit policy of §9, not the floor.
+Identifying one of $N$ segments costs $\ln N$ nats, so a ceiling of $\tfrac1\nu\ln N$ means **no single gram can identify a segment alone; at least $\nu$ matched grams must agree.** (The expression for $E_{\max}$ drops the $\kappa$ and the $\log(1-\hat p_{\min})$ correction — together $\lesssim\!10^{-2}$ in relative terms for $N\gtrsim 10^4$, growing as $N$ shrinks since $\hat p_{\min}=N^{-1/\nu}\to 0$ only asymptotically; logit-idf and surprisal coincide at the floor.) The parameter $\nu$ (default 2) is the corroboration depth. The floor is applied only on the query-side channel; under doc-side noise every gram is a genuine word and a low df is real information, so only the estimation smoothing applies. One caution, carried to §9: the floor does not push a junk gram *below* real grams — it caps its energy at the ceiling $E_{\max}$, which still *exceeds* every non-floored real gram's energy (all of which have $df > df_{\min}$). What actually orders junk below real is the count-credit policy of §9, not the floor. Numbers, symbols, and punctuation tokenize as a `Common`-class run (§8) and are floored on the same footing: a genuinely rare number or ID is capped at $E_{\max}$ and denied the credit — recall-*safe* (the document is still retrieved, and excluding the gram from the stop's running mean only *defers* the stop, §5/§9), precision-suboptimal, and the right default, because IDs are mistyped too (a fat-fingered ID produces exactly the rare artifacts the floor exists to cap). An application that *knows* a field is a structured identifier can opt that field into the doc-side channel (no floor, full idf, credit) — explicit opt-in, floor-on by default.
 
 A caution on reading $\nu$ as a typo margin: one substitution destroys not one gram but the $\sim n$ contiguous $n$-grams that span the changed character (in "hello", changing the second character kills two of the three trigrams), and surviving grams that are positionally adjacent share characters, so a single substitution can take both. Robustness therefore depends on the *positional spread* of the surviving grams, not merely their count, and the per-typo tolerance is closer to $(m-\nu)/n$ than $m-\nu$.
 
@@ -137,9 +137,9 @@ A caution on reading $\nu$ as a typo margin: one substitution destroys not one g
 
 ## 5. Pruning
 
-To bound tail latency, the query is pruned to a subset $P \subseteq Q$ before scoring. This is a knapsack: maximize collected energy $\sum_{g\in P} E_g$ subject to a work budget $\sum_{g\in P} df_g \le C$ (the posting-list cost). Value per unit cost is $E_g/df_g$, which decreases in $df_g$, so **rarest-first** is near-optimal.
+To bound tail latency, the query is pruned to a subset $P \subseteq Q$ before scoring. This is a knapsack: maximize collected energy $\sum_{g\in P} E_g$ subject to a work budget $\sum_{g\in P} df_g \le C$ (the posting-list cost). Value per unit cost is $E_g/df_g$, which decreases in $df_g$, so **rarest-first** is near-optimal. "Rarest" is measured by **class-normalized rarity** — a `z`-score of the gram's df within its own `(script, order)` class, not raw global df — so a multi-script query interleaves each script's rarest grams, turning a *systematic* burial of a low-global-energy script into a benign tie-break. Interleaving alone is not a guarantee, though — one script can still monopolize the few grams collected before the stop fires — so the pruner additionally seats **the rarest real gram of every present `(script, order)` class** unconditionally (a per-class floor that generalizes the typo floor below, at ≤ one extra posting walk per script), making per-script representation a true invariant (§8). The energy that is *scored* stays the honest global log-odds of §2; only the selection *key* is class-normalized. Within a single class this reduces to plain rarest-by-df.
 
-One subtlety: every gram below the contamination floor has the same energy $E_{\max}$, so sorting by energy alone leaves a block of ties whose order is undefined, while the budget uses true $df$. Breaking ties by **true $df$ ascending** restores the value/cost greedy within that block (constant energy, so the ratio is maximized by the cheapest gram) and makes the kept sequence monotone in $df$, which lets the budget cutoff exit safely. Grams with $df = 0$ (artifacts with no postings) are dropped before pruning: they match nothing and only consume budget and weight range.
+Two subtleties. First, the class-normalized key is **not** globally monotone in $df$ (a rare-within-class CJK bigram can carry a larger global $df$ than a common-within-class Latin trigram), so the budget cutoff cannot be a clean prefix break — a break at the first over-budget gram could exclude later, *cheaper* minority-script grams and undo the interleaving. The cutoff is therefore **skip-and-continue**: a gram that would breach $C$ is skipped and scanning continues, filling the budget with the cheapest grams the class-normalized order surfaces. (This also keeps the $E_{\max}$-priced floored grams of §9 from monopolizing $C$ — an over-budget floored gram is skipped, not a barrier.) Second, within the floored block every gram shares energy $E_{\max}$; ordering those by **true $df$ ascending** keeps the cheapest-first greedy there. Grams with $df = 0$ (artifacts with no postings) are dropped before pruning: they match nothing and only consume weight range.
 
 ### How far to prune: a confidence-bounded stop
 
@@ -199,13 +199,17 @@ Finally, the count-credit and length terms are post-accumulation floats, so any 
 
 ---
 
-## 8. Multiple gram orders
+## 8. Multiple gram orders and scripts
 
-Bigrams and trigrams should not be pooled into one weighted sum. A bigram is a near-deterministic function of its containing trigram (`abc` implies `ab` and `bc`), so a single contiguous trigram match fires the count credit three times and adds the two sub-bigram energies on top — counting one piece of evidence as three, with the overcount correlated with contiguity and with length. Instead, the gram orders are scored as **separate views** and combined by reciprocal-rank fusion, which reads only ranks and is therefore robust to this additive double-counting. Per-query statistics (richness, fragility) are computed within each view.
+Two different situations put grams of different orders in one query, and they combine differently. **Same-run multi-order** — one script run windowed at two orders (a Latin word as both trigrams and bigrams) — is **redundant**: a bigram is a near-deterministic function of its containing trigram (`abc` implies `ab` and `bc`), so pooling a single contiguous trigram match would fire the count credit three times and add the two sub-bigram energies on top, counting one piece of evidence as three, with the overcount correlated with contiguity and length. **Cross-script multi-order** — a mixed-script query whose Latin run yields trigrams and whose CJK run yields bigrams — is **complementary**: those grams span disjoint characters with no containment, so they are simply more evidence about the same segment and **pool** into one accumulator (the ordinary heterogeneous overlap sum, already what a single-order multi-script index does). The rule is therefore **pool the disjoint, fuse the contained**: fusion is reciprocal-rank fusion (RRF), which reads only ranks and is robust to the additive double-counting; pooling is the plain weighted sum.
 
-Which orders to run is gated by richness. When the query is rich in rare trigrams, trigrams alone suffice and the bigram pass — whose posting lists are longer and costlier — is skipped. When the query is starved or heavily corrupted, the bigram pass is added: a substitution corrupts fewer of the shorter-spanning bigrams (each spans fewer characters), and there are more of them, so bigrams are the more robust, less selective layer.
+Gram **order is a property of the script**, not a global choice. A dense script — CJK (Han, Hiragana, Katakana, Hangul) — is windowed at bigrams, where one bigram is already about as discriminating as a Latin trigram; everything else at trigrams. Each script run is scored at its **primary order** plus, when the query is starved or corrupted, a **richness-gated secondary one order shorter** — Latin trigram + bigram, CJK bigram + unigram — RRF-fused (the secondary is sub-gram-contained in the primary). The secondary is the more robust, less selective layer: a substitution corrupts fewer of the shorter grams (each spans fewer characters) and there are more of them. The shortest order doubles as the **structural fallback** for a query too short to produce the primary (a two-character Latin query, a one-character CJK query). A CJK unigram secondary is not noise even though a lone common character is unselective: a Han character is a morpheme (nearer a Latin *word* than a Latin letter), and the rarity weighting already drives a common character's energy to zero and prunes its long posting list on the budget — so only rare, discriminating morphemes survive selection, exactly the corroboration a starved bigram view lacks.
 
-The fusion weight between the two views is informed by how much richer the trigram inventory is than the bigram inventory — a vocabulary-complexity gap $\Delta H = H_3 - H_2$ between the two document-frequency distributions, computed once per index. This is a directional heuristic, not a conditional entropy even approximately: the two distributions are tabulated independently over different supports and are not a joint/marginal pair ($\sum_c df(xyc) \ne df(xy)$ in general), so $\Delta H$ supplies the sign and scale directly from the index — more trigram types than bigram types argues for weighting trigrams more — while the monotone map from $\Delta H$ to the fusion weight is a fixed shape choice (a linear map suffices). The fusion's rank constant plays the role of a temperature — flatter fusion trusts more candidates — and a segment retrieved by one view but not the other is simply omitted from the absent view's contribution rather than treated as worst-ranked.
+For a mixed-script query the two layers generalize to **rank-views**, not absolute orders. The **primary view** pools every script's primary-order grams (Latin trigrams ∪ CJK bigrams — disjoint, so pooled without double-counting); the **secondary view** pools every script's richness-gated secondary (Latin bigrams ∪ CJK unigrams). One RRF over `[primary, secondary]` fuses them, with `missing="omit"` so a per-script gate that runs no secondary for a script simply omits it. The sub-gram containment (trigram⊃bigram within Latin, bigram⊃unigram within CJK) lives *across* the two rank-views, where RRF reads ranks not summed energy — so a contiguous match ranks well in both views (the intended robustness) without being additively tripled. Pooling and fusion thus compose: pool disjoint scripts *within* a view, fuse the contained orders *across* views.
+
+Pooling cross-script grams into one view does not by itself make scripts compare fairly — a globally-rarer script would out-score and, worse, **out-collect**: the rarest-first pruning (§5) would fill the budget with one script's grams and the confidence stop (§5) could fire before a minority script's grams are ever selected, dropping documents relevant only to the minority script. The fix lives in selection, not in the energy: the energy that is *scored* stays the honest global log-odds (§2), while the rarest-first **selection key is the class-normalized rarity** — a `z`-score of the gram's df within its own `(script, order)` class — so each script's rarest grams interleave into the pool, turning a systematic burial into a benign tie-break; a **per-class floor** that seats the rarest real gram of every present `(script, order)` class unconditionally (§5) then turns representation from a tendency into a guarantee. This is the multi-script half of §5's pruning, and it is why the energy can remain global without starving a script (class-normalizing the *energy* itself would be worse, not better — it only lowers a minority gram's weight further, since within-class df-fraction ≥ global).
+
+The fusion weight between two rank-views is informed by how much richer each script's primary inventory is than its secondary — a per-`(script, order)` vocabulary-complexity gap $\Delta H = H_{\text{primary}} - H_{\text{secondary}}$ between the two document-frequency distributions, computed once per index. This is a directional heuristic, not a conditional entropy even approximately: the two distributions are tabulated independently over different supports and are not a joint/marginal pair ($\sum_c df(xyc) \ne df(xy)$ in general), so $\Delta H$ supplies the sign and scale directly from the index, while the monotone map from $\Delta H$ to the fusion weight is a fixed shape choice (a linear map suffices); a mixed-script query combines the per-script gaps (or, simplest, equal-weights them). The fusion's rank constant plays the role of a temperature — flatter fusion trusts more candidates — and a segment retrieved by one view but not the other is simply omitted from the absent view's contribution rather than treated as worst-ranked.
 
 ---
 
@@ -236,7 +240,7 @@ The whole system moves along a single axis with a chemical-potential and tempera
 | contamination floor | off / light | $N^{(\nu-1)/\nu}$, $\nu=2$ | off |
 | count credit $\mu$ | $\operatorname{logit}\sigma$ (constant) | same, with composition shifting and the concentration cap if structurally concentrated | $\operatorname{logit}\rho,\ \rho=\sigma(1-\varepsilon)^n$ |
 | credit on floored grams | — | no | yes |
-| gram views | trigram only | trigram + bigram, fused | per query cleanliness |
+| gram views | primary order only | primary + richness-gated secondary (one shorter), RRF-fused | per query cleanliness |
 | pruning budget | tight | keep reserve | tight |
 | length correction | always on | always on | always on |
 | stopping variance | small ($\sigma\to1$) | per-word comonotone block, $\varphi=1$ (exact) | per-word comonotone block, $\varphi=1$ Fréchet bound (iid $\varphi_d$ the no-clustering reference) |
@@ -255,6 +259,7 @@ The lens is reliable for **local, per-gram** quantities — surprisal and its lo
 - **The pruning budget assumes $C$ dwarfs the floored mass.** Floored grams all carry $E_{\max}$ and sort to the front of the budget queue (§9); the df-ascending tiebreak admits the genuinely-rare reals first, so the rare signal is preserved, but if the leaked-junk mass near $df_{\min}$ is a large fraction of $C$ it can crowd out non-floored *common* reals (which the budget drops by design anyway). Bounded and recall-benign provided $C \gg \#\text{floored}\cdot df_{\min}$, with $df_{\min}=N^{(\nu-1)/\nu}$.
 - **$\Delta H$** (§8) is a vocabulary-complexity gap used as a directional fusion heuristic, not a conditional entropy, for the structural reason noted there.
 - **The concentration cap** (§9) has the right form and sign; its "common" threshold is query-relative ($E_g < \tfrac12 E_{\text{top}}$), so it needs no corpus cutoff, leaving only the fraction and the hard-versus-smooth clamp as universal shape constants to settle.
+- **Multi-script handling is class-aware in selection, global in energy.** Gram *order* is per script (CJK bigrams, else trigrams), so a mixed-script query carries several orders, pooled into one accumulator with per-gram reliability $r = \sigma(1-\varepsilon)^n$ (§8); the *energy* stays the global log-odds (§2), while multi-script *fairness* is carried by the **class-normalized selection key** (§5) — rarest-within-`(script, order)`, so a minority script's burial becomes a benign tie-break rather than systematic — and a **per-class floor** (seat the rarest real gram of every present `(script, order)` class unconditionally, §5) makes per-script representation a true invariant. Class-normalizing the *energy* itself would be strictly worse (it only lowers a minority gram's weight, since within-class df-fraction $\ge$ global). Two residual class-asymmetries are recall-safe and deferred: the global floor $df_{\min}$ over-floors a large-vocabulary script (the CJK bigram space dwarfs the Latin trigram space, so more genuinely-rare CJK bigrams hit $E_{\max}$) — a precision skew a per-class $df_{\min}$ would remove; and the `Common` class (numbers, symbols, punctuation) is one bucket a finer general-category split would refine. The stop's word blocks come from whitespace and delimiter punctuation, which also break gram windows so no gram straddles two query words (§5/§8); intra-word punctuation (the apostrophe in *don't*) is word-internal and optionally stripped for recall.
 - **Parameters, and how few are corpus-bound.** What looks like a parameter sweep is mostly not. The **doc-side** channel reduces to one *declarable* number — the ingestion error rate $\varepsilon$ — together with the same topicality $\sigma$ the query side already needs, from which $\rho = \sigma(1-\varepsilon)^n$, the count credit, and the stopping variance's diagonal and no-clustering reference follow in closed form (§3.2, §5); an application declares $\varepsilon$ from provenance or estimates it label-free at index time. (The recall-safe operating covariance uses the parameter-free comonotone-block $\varphi = 1$ bound, not $\varepsilon$.) The **fusion ratio** comes from $\Delta H$, computed from the df distributions the index already holds, so it self-calibrates the moment data lands; only the monotone $\Delta H \to$ weight map is a shape choice. The **cap threshold** is query-relative (above). The one genuinely corpus- and relevance-bound quantity is the **query-side reliability $\sigma$** — it depends on what "relevant" means and cannot be read from index statistics — but its sensitivity is low (rare grams are dominated by summed energy, commons are bounded by the cap, and $\mu$ is inert on single-gram queries), so a high constant default ($\sigma \approx 0.9$) is safe day-one, with optional self-supervision from click/selection logs. The stopping margin $c$ and the work budget $C$ are latency/safety dials, not corpus quantities. So the irreducible corpus dependence is essentially $\varepsilon$ plus a low-sensitivity $\sigma$ default — both supplied without a sweep.
 
 ---
@@ -264,10 +269,12 @@ The lens is reliable for **local, per-gram** quantities — surprisal and its lo
 ```text
 # index-time, once per snapshot
 constants(index):
-    N    = segment_count
-    Lbar = mean(distinct_gram_count(d) for d in segments)
-    Emax = ln(N) / nu                                                 # single-gram energy ceiling (Section 4); DELTA must be < 2*Emax (Section 7)
-    dH   = H(trigram_df_distribution) - H(bigram_df_distribution)
+    N       = segment_count
+    Lbar    = mean(distinct_gram_count(d) for d in segments)
+    Emax    = ln(N) / nu                                              # single-gram energy ceiling (Section 4); DELTA must be <= Emax (Section 7)
+    order(script)            = CJK(script) ? 2 : 3                    # primary gram order per script class (Section 8); secondary = order - 1
+    zstats[(script, order)]  = (mean, sd) of ln(df) over that class   # class-normalized SELECTION key (Section 5/8); welford, online, never persisted
+    dH[(script, order)]      = H(df over (script,order)) - H(df over (script,order-1))   # per-(script,order) fusion gap (Section 8)
 
 energy(df_g, channel, N):                                              # RSJ log-odds (logit-idf); surprisal is the rare-gram limit
     df_min = (channel == QUERY_SIDE) ? N**((nu - 1) / nu) : 0
@@ -275,49 +282,56 @@ energy(df_g, channel, N):                                              # RSJ log
     return ln( (N - df_eff - KAPPA) / (df_eff + KAPPA) )               # KAPPA = 0.5; < 0 for p>0.5, zeroed by max(0,.) at use
 
 score_query(query, channel):
-    Q_strings = set(tokenize(query))                                  # deduplicated by string (presence is binary)
-    views = needs_bigrams(richness_estimate) ? [TRIGRAM, BIGRAM] : [TRIGRAM]
-    while views and not any(any(lookup_df(g) > 0 for g in grams_of_order(v)) for v in views):
-        nxt = next_lower_order(views[0])                              # structural fallback trigram -> bigram -> unigram, only when
-        views = [nxt] if nxt else []                                 #   EVERY view lacks an in-corpus (df>0) gram; test df>0, not raw presence
+    # Tokenize into grams tagged with script + order; a mixed-script query yields several orders. Word
+    # boundaries come from whitespace + delimiter punctuation, which ALSO break gram windows so no gram
+    # straddles two words (Section 8/4). RANK-VIEWS, not absolute orders: grams_at_rank(PRIMARY) pools every
+    # script's primary-order grams (cross-script disjoint); grams_at_rank(SECONDARY) pools each script's
+    # one-shorter order (Latin bigram, CJK unigram). The shortest order doubles as the structural fallback.
+    rank_views = needs_secondary(richness_estimate) ? [PRIMARY, SECONDARY] : [PRIMARY]
+    while rank_views and not any(any(lookup_df(g) > 0 for g in grams_at_rank(rv)) for rv in rank_views):
+        rank_views = (rank_views == [PRIMARY]) ? [SECONDARY] : []    # structural fallback to the shorter rank, only when EVERY
+        #                                                              #   rank-view lacks an in-corpus (df>0) gram (test df>0, not raw presence)
     per_view = []
 
-    for view in views:
-        n = gram_order(view)
-        r = (channel == DOC_SIDE) ? SIGMA * (1 - eps)**n : SIGMA      # doc-side reliability = topicality SIGMA x survival (eps = ingestion rate; SIGMA ~ 0.9)
-        Q = [g for g in grams_of_order(view) if lookup_df(g) > 0]     # deduplicated strings; drop df=0 artifacts
-        if not Q: continue                                           # this view is empty (too short or all-artifact) -> skip it,
-        #                                                              #   NEVER abort the query: a later view may still match (Section 8)
+    for rv in rank_views:                                            # rv = a RANK (PRIMARY / SECONDARY), pooling all scripts at that rank
+        Q = [g for g in grams_at_rank(rv) if lookup_df(g) > 0]       # pool each script's grams at this rank; drop df=0 artifacts
+        if not Q: continue                                          # this rank-view is empty -> skip it, never abort the query (Section 8)
         for g in Q:
-            g.df = lookup_df(g);  g.E = energy(g.df, channel, N)
+            g.df = lookup_df(g);  g.E = energy(g.df, channel, N)     # GLOBAL energy (n-independent), the honest log-odds (Section 2)
+            g.n  = order_of(g)                                       # this gram's order = its script's order at rank rv (CJK 2/1, else 3/2)
+            g.r  = (channel == DOC_SIDE) ? SIGMA * (1 - eps)**g.n : SIGMA   # PER-GRAM reliability: topicality SIGMA x per-order survival
             g.floored = (g.df <= df_min)
-            g.word = query_word_of(g)                                # comonotone-block id: g's (first) query word; tokenizer marks word boundaries
+            g.word = query_word_of(g)                                # comonotone-block id = g's query word (one script run -> single order/r per block)
 
-        # pruning: rarest-first, df-ascending tiebreak (kept sequence monotone in df)
-        sort Q by (E desc, true df asc)
-        P = [];  sum_df = 0;  sumE = 0;  sumVar = 0;  target = ln(N / k)
-        block_sum = {}                                              # query word (comonotone block) -> running sum of max(0,E)
-        for g in Q:
-            if sum_df + g.df > C: break                              # safe: sequence is df-monotone
+        # pruning: CLASS-NORMALIZED rarest-first (z-score of df within (script,order)); per-class floor, then
+        # skip-and-continue budget. The z-score key only de-biases collection (turns a systematic burial of a
+        # low-global-energy script into a benign tie-break); the per-class FLOOR is what guarantees a seat.
+        sort Q by (zscore(g, zstats) asc, true df asc)              # rarest-within-class first (Section 5/8); df-asc tiebreak in the floored block
+        P = [];  sum_df = 0;  sumE = 0;  sumVar = 0;  target = ln(N / k);  block_sum = {}
+        def admit(g):                                              # add g to P and fold it into the stop's running mean/variance
             P.append(g);  sum_df += g.df
             if channel == DOC_SIDE or not g.floored:                  # floored grams carry no identification power
-                e = max(0, g.E)                                       # mirror the accumulator's clamp
-                sumE += r * e
-                # comonotone-block variance: g's whole query word co-fails together (phi = 1) -- EXACT query-side
-                # (a word matches whole or not at all); recall-safe Frechet UPPER bound doc-side (a burst can span
-                # the run). PSD by construction; per distinct string (Q is deduped) -> no per-occurrence double-count.
-                s = block_sum.get(g.word, 0)
-                sumVar += r * (1 - r) * (2*s*e + e*e)                # Var(block) grows by r(1-r)*((s+e)^2 - s^2)
-                block_sum[g.word] = s + e
-            if sumE - c * sqrt(sumVar) >= target: break              # iid phi_d=(r^(d/n)-r)/(1-r) is the no-clustering reference
+                e = max(0, g.E)                                       # mirror the accumulator's clamp; PER-GRAM reliability g.r
+                s = block_sum.get(g.word, 0)                         # comonotone-block variance (phi=1): EXACT query-side, Frechet UB doc-side;
+                sumE += g.r * e                                      #   a block is one script run -> one r; PSD; per distinct string
+                sumVar += g.r * (1 - g.r) * (2*s*e + e*e);  block_sum[g.word] = s + e
+        # (1) per-class floor: the rarest non-floored gram of EACH present (script,order) class, seated
+        floor_seats = [ first non-floored g per distinct (g.script, g.n), in z-score order ]   # >= 1 real gram per present script
+        for g in floor_seats: admit(g)                             # UNCONDITIONAL (even past C and the stop) -- generalizes the typo floor; per-script representation is now invariant
+        # (2) budget/stop greedy over the rest, rarest-within-class first
+        for g in (Q minus floor_seats):
+            if sum_df + g.df > C: continue                          # SKIP over-budget (z-score order is NOT df-monotone), keep scanning (Section 5)
+            admit(g)
+            if sumE - c * sqrt(sumVar) >= target: break             # enough class-fair identification evidence; iid phi_d is the no-clustering reference
         if not P and Q: P = [Q[0]]                                   # honor Section 7: admit cheapest gram even if over budget (one posting walk)
-        # P is now non-empty here: the empty-Q view was already skipped above, and the line above rescues P from a non-empty Q
+        # P is now non-empty: the empty-Q view was skipped above, and the line above rescues P from a non-empty Q
         if collected_energy_far_below(full_query): loosen_budget_or_restore_reserve()
 
-        mu = max(0, logit(r))                                        # per-channel constant
+        # per-gram count credit mu_g = max(0, logit(g.r)); one value per ORDER present (query-side: uniform SIGMA)
+        for g in P: g.mu = max(0, logit(g.r))
         # concentrated(P): a dominant gram (top energy) AND >= 2 query-relative commons (E < E_top/2).
         # An all-common query has no dominant gram -> not concentrated -> mu survives (Section 7).
-        if concentrated(P): mu = min(mu, concentration_cap(P))
+        if concentrated(P): for g in P: g.mu = min(g.mu, concentration_cap(P))
 
         # bit-sliced accumulation of the ENERGY part only (hot loop)
         assert DELTA <= Emax                                         # Section 7: since the realized floored energy E_floored<=Emax, this
@@ -326,25 +340,26 @@ score_query(query, channel):
         for g in P: g.wq = max(0, round(g.E / DELTA))
         planes  = max(1, ceil(log2(max(g.wq for g in P) + 1)))       # floored at 1
         E_acc   = bitsliced_overlap(P, [g.wq], planes)               # {segment -> integer energy sum}
-        cnt_acc = overlap_count([g for g in P if not g.floored])     # {segment -> # matched non-floored grams}
+        # count credit is added per gram-ORDER: mu_n varies by order (doc-side), so the popcount is BUCKETED by n
+        cred_acc = {seg -> sum over orders n of mu_n * popcount_n(seg)}   # mu_n = max(0,logit(SIGMA*(1-eps)^n)); non-floored only
 
         # null = expected score of a random length-L segment; saturating presence pi_g = 1-(1-p_g)^(L/Lbar).
         # rare grams are ~linear -> separable; only commons need the per-candidate saturating term (Section 6).
-        weight(g) = g.wq*DELTA + (mu if not g.floored else 0)
+        weight(g) = g.wq*DELTA + (g.mu if not g.floored else 0)      # per-gram credit
         K_rare  = sum( (g.df/N) * weight(g) for g in P if g.df/N <  P_LINEAR )    # precomputed once
         commons = [g for g in P if g.df/N >= P_LINEAR]
         scored = {}
-        for seg in keys(E_acc) | keys(cnt_acc):                      # union: count-only candidates survive
+        for seg in keys(E_acc) | keys(cred_acc):                     # union: count-only candidates survive
             null = (L[seg]/Lbar) * K_rare
             for g in commons: null += (1 - (1 - g.df/N)**(L[seg]/Lbar)) * weight(g)
-            scored[seg] = E_acc.get(seg, 0)*DELTA + mu*cnt_acc.get(seg, 0) - null
+            scored[seg] = E_acc.get(seg, 0)*DELTA + cred_acc.get(seg, 0) - null
         per_view.append(scored)
 
-    if not per_view: return EMPTY                                    # every view came back empty even after the fallback (e.g. a 1-char query)
+    if not per_view: return EMPTY                                    # every rank-view empty even after the fallback (e.g. a 1-char Latin query)
     if len(per_view) == 1:
         return emit(sort_desc(per_view[0]), with_components=True)
-    w_tri, w_bi = view_weights_from(dH)
-    return emit(RRF(per_view, [w_tri, w_bi], k_rrf, missing="omit"), with_components=True)
+    w_primary, w_secondary = view_weights_from(dH)                   # per-(script,order) dH; combined / equal-weighted for mixed-script queries (Section 8)
+    return emit(RRF(per_view, [w_primary, w_secondary], k_rrf, missing="omit"), with_components=True)
 ```
 
 ---

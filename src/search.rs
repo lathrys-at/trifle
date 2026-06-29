@@ -97,13 +97,18 @@ fn query_terms<Tk: IntoTerm>(
 
 /// One query, planned against a snapshot: the engine [`Counter`] plus the present (df > 0)
 /// selected tokens (kept for `present_terms`/`matched_terms`) and the full selected-token
-/// strings (for span location at hydrate).
+/// strings (for span location at hydrate). `n_segments` (`N`) and `avgdl` (`L̄`) are the
+/// snapshot-wide corpus stats the N-anchored v0.4 scoring (energy/floor/stop/null) needs; read
+/// once per batch so they are identical for every query (the shared snapshot), preserving
+/// `batch == serial`.
 struct QueryPlan {
     counter: Counter,
     present_tokens: Vec<String>,
     present_postings: Vec<Bitmap>,
     present_dfs: Vec<u64>,
     selected_strings: Vec<String>,
+    n_segments: u64,
+    avgdl: f64,
 }
 
 /// Resolve, select (class-aware rarest-first), load postings, and build the engine [`Counter`]
@@ -183,6 +188,17 @@ fn prepare<T: Tokenizer>(
         .collect();
     let postings_map = postings::effective_postings(conn, ns, &sel_ids)?;
 
+    // Snapshot-wide corpus stats (N, L̄) for the N-anchored scoring path (energy/floor/stop/null).
+    // Read once for the whole batch from this snapshot's rolling counters, so every query sees the
+    // same N/avgdl (batch == serial). `matches_batch` ignores these; `CandidateStream` exposes them.
+    let (seg_count, seg_len_sum) = schema::read_seg_stats(conn, ns)?;
+    let n_segments = seg_count.max(0) as u64;
+    let avgdl = if seg_count > 0 {
+        seg_len_sum as f64 / seg_count as f64
+    } else {
+        0.0
+    };
+
     let mut plans = Vec::with_capacity(queries.len());
     for selected in &selected_per {
         let mut selected_strings = Vec::with_capacity(selected.len());
@@ -215,6 +231,8 @@ fn prepare<T: Tokenizer>(
             present_postings,
             present_dfs,
             selected_strings,
+            n_segments,
+            avgdl,
         });
     }
     Ok(plans)
@@ -430,15 +448,10 @@ pub(crate) fn candidates<'a, T: Tokenizer>(
             return Err(e);
         }
     };
-    // n_segments / avgdl from this snapshot's rolling counters (a corpus-relative custom score
-    // must not cross a snapshot boundary).
-    let (seg_count, seg_len_sum) = schema::read_seg_stats(&conn, ns)?;
-    let n_segments = seg_count.max(0) as u64;
-    let avgdl = if seg_count > 0 {
-        seg_len_sum as f64 / seg_count as f64
-    } else {
-        0.0
-    };
+    // N / avgdl come from the plan (computed once in `prepare` from this snapshot's rolling
+    // counters); a corpus-relative custom score must not cross a snapshot boundary.
+    let n_segments = plan.n_segments;
+    let avgdl = plan.avgdl;
     let walk = plan.counter.walk();
     Ok(CandidateStream {
         index,

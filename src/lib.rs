@@ -107,6 +107,36 @@ pub(crate) const TYPO_DAMAGE: u32 = 4;
 pub(crate) const DEFAULT_T_MAX: usize = 12;
 /// Default `D` — df-doublings per IDF weight step in the overlap counter.
 const DEFAULT_WEIGHT_STEP: f64 = 1.0;
+
+// v0.4 scoring-knob defaults (`docs/derivation.md`). These are scaffolding in M0: declared on
+// [`SearchOpts`] but not yet read by the scoring path, so each carries an `#[expect(dead_code)]`
+// that M1+ removes the moment it wires the knob in — an unfulfilled expectation then fails the
+// lint gate, forcing the cleanup. The companion `Option` fields default to `None`; a consumer
+// resolves the effective value with `unwrap_or(DEFAULT_*)`.
+/// Default `ν` — corroboration depth; sets the contamination floor `df_min = N^((ν−1)/ν)` and
+/// the single-gram energy ceiling `E_max = (1/ν)·ln N` (derivation §4).
+#[expect(dead_code)]
+pub(crate) const DEFAULT_NU: f64 = 2.0;
+/// Default `κ` — Jeffreys smoothing pseudocount in the logit-idf energy estimate (derivation §4).
+#[expect(dead_code)]
+pub(crate) const DEFAULT_KAPPA: f64 = 0.5;
+/// Default `Δ` — energy quantization step, in nats, for the bit-sliced weights (derivation §7).
+#[expect(dead_code)]
+pub(crate) const DEFAULT_DELTA: f64 = 0.5;
+/// Default `σ` — query-side reliability / topicality (derivation §3).
+#[expect(dead_code)]
+pub(crate) const DEFAULT_SIGMA: f64 = 0.9;
+/// Default `ε` — doc-side per-character error rate; `0` selects the clean / query-side channel
+/// (derivation §3.2).
+#[expect(dead_code)]
+pub(crate) const DEFAULT_EPSILON: f64 = 0.0;
+/// Default `k` — the stop's target candidate-pool size; the stop aims for `ln(N/k)` nats
+/// (derivation §5).
+#[expect(dead_code)]
+pub(crate) const DEFAULT_K_TARGET: u64 = 128;
+/// Default `c` — the Cantelli stopping margin (derivation §5).
+#[expect(dead_code)]
+pub(crate) const DEFAULT_C_MARGIN: f64 = 2.0;
 /// Buckets in the per-query band-spread histogram (the [`Stats`] weight-step hint). 33 × 0.5 =
 /// 16.5 df-doublings of range (a df ratio up to ~92 000:1).
 const HINT_BUCKETS: usize = 33;
@@ -143,12 +173,38 @@ pub struct SearchOpts<'a> {
     /// `B` — an optional cap on the cumulative document frequency (`Σdf`) of the selected
     /// tokens, which is what candidate generation scans — so this bounds *work* directly
     /// (`t_max` bounds count). Rarest-first tokens are kept while `Σdf` stays within budget; the
-    /// typo floor is always kept. `None` (the default) = no cap.
+    /// typo floor is always kept. `None` (the default) = no cap. This is the derivation's work
+    /// budget `C` (the cap on `Σdf` over the pruned set, derivation §5/§7).
     pub df_budget: Option<u64>,
     /// `D` — df-doublings per IDF weight step in the overlap counter. `1.0` (the default) means
     /// each weight level is one more halving of df relative to the query's commonest survivor.
     /// `N`-invariant. [`Stats::weight_step_hint`] suggests a corpus-fitted value.
     pub weight_step: f64,
+    /// `ν` — corroboration depth (derivation §4): sets the contamination floor
+    /// `df_min = N^((ν−1)/ν)` and the single-gram energy ceiling `E_max = (1/ν)·ln N`. `None` →
+    /// `2.0`. *v0.4 M0 scaffolding — declared, not yet consumed by scoring.*
+    pub nu: Option<f64>,
+    /// `κ` — the Jeffreys smoothing pseudocount in the logit-idf energy estimate (derivation §4).
+    /// `None` → `0.5`. *v0.4 M0 scaffolding — declared, not yet consumed by scoring.*
+    pub kappa: Option<f64>,
+    /// `Δ` — the energy quantization step, in nats, for the bit-sliced energy weights (derivation
+    /// §7). `None` → `0.5`. *v0.4 M0 scaffolding — declared, not yet consumed by scoring.*
+    pub delta: Option<f64>,
+    /// `σ` — query-side reliability / topicality, driving the count credit `μ = logit r`
+    /// (derivation §3). `None` → `0.9`. *v0.4 M0 scaffolding — declared, not yet consumed by
+    /// scoring.*
+    pub sigma: Option<f64>,
+    /// `ε` — the doc-side per-character error rate; `0` selects the clean / query-side channel
+    /// (`ρ = σ(1−ε)^n`, derivation §3.2). `None` → `0.0`. *v0.4 M0 scaffolding — declared, not yet
+    /// consumed by scoring.*
+    pub epsilon: Option<f64>,
+    /// `k` — the confidence-bounded stop's target candidate-pool size; the stop aims for `ln(N/k)`
+    /// nats (derivation §5). `None` → `128`. *v0.4 M0 scaffolding — declared, not yet consumed by
+    /// scoring.*
+    pub k_target: Option<u64>,
+    /// `c` — the Cantelli stopping margin (a distribution-free bound, *not* a z-score; derivation
+    /// §5). `None` → `2.0`. *v0.4 M0 scaffolding — declared, not yet consumed by scoring.*
+    pub c_margin: Option<f64>,
     /// An opt-in raw-SQL [`SqlFilter`] over the caller's live data, folded into per-bucket
     /// provenance. `None` = unfiltered.
     pub filter: Option<SqlFilter<'a>>,
@@ -162,6 +218,13 @@ impl<'a> SearchOpts<'a> {
             t_max: None,
             df_budget: None,
             weight_step: DEFAULT_WEIGHT_STEP,
+            nu: None,
+            kappa: None,
+            delta: None,
+            sigma: None,
+            epsilon: None,
+            k_target: None,
+            c_margin: None,
             filter: None,
         }
     }
@@ -187,6 +250,48 @@ impl<'a> SearchOpts<'a> {
     /// Set `D`, the df-doublings per IDF weight step.
     pub fn weight_step(mut self, d: f64) -> Self {
         self.weight_step = d;
+        self
+    }
+
+    /// Set `ν` — corroboration depth (derivation §4).
+    pub fn nu(mut self, nu: f64) -> Self {
+        self.nu = Some(nu);
+        self
+    }
+
+    /// Set `κ` — the Jeffreys smoothing pseudocount (derivation §4).
+    pub fn kappa(mut self, kappa: f64) -> Self {
+        self.kappa = Some(kappa);
+        self
+    }
+
+    /// Set `Δ` — the energy quantization step in nats (derivation §7).
+    pub fn delta(mut self, delta: f64) -> Self {
+        self.delta = Some(delta);
+        self
+    }
+
+    /// Set `σ` — query-side reliability / topicality (derivation §3).
+    pub fn sigma(mut self, sigma: f64) -> Self {
+        self.sigma = Some(sigma);
+        self
+    }
+
+    /// Set `ε` — the doc-side per-character error rate (derivation §3.2).
+    pub fn epsilon(mut self, epsilon: f64) -> Self {
+        self.epsilon = Some(epsilon);
+        self
+    }
+
+    /// Set `k` — the stop's target candidate-pool size (derivation §5).
+    pub fn k_target(mut self, k: u64) -> Self {
+        self.k_target = Some(k);
+        self
+    }
+
+    /// Set `c` — the Cantelli stopping margin (derivation §5).
+    pub fn c_margin(mut self, c: f64) -> Self {
+        self.c_margin = Some(c);
         self
     }
 
@@ -448,16 +553,16 @@ impl<T: Tokenizer> Index<T> {
     // ----- write internals (used by the `Writer` lease) -----------------------
 
     /// Tokenize `text` once, returning both its distinct resolved term-ids (each assigned via
-    /// `assign`) and its total gram count with repetition — the stored segment length `|d|`.
+    /// `assign`) and its **distinct** gram count — the stored segment length `L_d` (the
+    /// derivation §0/§6 presence-length the length null is computed against; distinct, *not*
+    /// with-repetition).
     fn distinct_term_ids(
         &self,
         text: &str,
         mut assign: impl FnMut(Term) -> Result<TermId>,
     ) -> Result<(Vec<TermId>, i64)> {
         let mut distinct: FxHashSet<T::Token> = FxHashSet::default();
-        let mut seg_len: i64 = 0;
         for tok in self.tokenizer.tokenize(text) {
-            seg_len += 1;
             distinct.insert(tok);
         }
         let mut ids: Vec<TermId> = Vec::with_capacity(distinct.len());
@@ -471,6 +576,9 @@ impl<T: Tokenizer> Index<T> {
             })?;
             ids.push(assign(term)?);
         }
+        // `L_d` is the number of *distinct* grams (derivation §0): one per deduplicated token,
+        // equal to `ids.len()`.
+        let seg_len = distinct.len() as i64;
         Ok((ids, seg_len))
     }
 

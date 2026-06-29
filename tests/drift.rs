@@ -5,7 +5,7 @@ mod common;
 use common::*;
 use std::path::Path;
 use trifle::store::Sidecar;
-use trifle::tokenize::{DefaultTokenizer, Normalization};
+use trifle::tokenize::{DefaultTokenizer, Normalization, Tokenizer};
 use trifle::{Config, Index, Schema, SearchOpts};
 
 fn open_default(path: &Path, data_version: u64) -> Index<DefaultTokenizer> {
@@ -92,8 +92,66 @@ fn changing_the_tokenizer_empties_the_cache() {
 fn schema_version_is_stamped_and_observable() {
     let h = Harness::new();
     let s = h.index.stats().unwrap();
-    assert_eq!(s.schema_version, 4);
+    assert_eq!(s.schema_version, 5);
     assert_eq!(s.data_version, 0);
+}
+
+#[test]
+fn an_old_schema_version_stamp_resets_the_cache() {
+    // trifle is a rebuildable cache: an on-disk `schema_version` from an earlier format must drop
+    // (reset) the cache on open, never migrate it. (v0.4 bumped the version: `seg.len` now stores
+    // the distinct gram count, so a pre-v0.4 cache must be rebuilt.)
+    let h = Harness::new();
+    load_fixture(&h);
+    let path = h.db_path();
+    drop(h.index);
+
+    // Forge a stale on-disk schema version directly in the file.
+    let raw = trifle::rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE meta SET value = '4' WHERE key = 'schema_version'",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+
+    let reopened = open_default(&path, 0);
+    assert!(
+        is_empty(&reopened, "quick brown fox"),
+        "a schema_version mismatch drops the cache (reset, never migrate)"
+    );
+    assert_eq!(reopened.stats().unwrap().segments, 0);
+    // The reset re-stamps the current version.
+    assert_eq!(reopened.stats().unwrap().schema_version, 5);
+    drop(h.dir);
+}
+
+#[test]
+fn stored_seg_len_is_the_distinct_gram_count() {
+    use std::collections::HashSet;
+
+    // A text with repeated grams (so distinct ≠ with-repetition) locks the v0.4 `seg.len`
+    // redefinition: the stored length must be `L_d`, the distinct gram count (derivation §0/§6).
+    let h = Harness::new();
+    let text = "the the the quick brown fox";
+    h.put(1, "body", text);
+    let path = h.db_path();
+
+    let tok = DefaultTokenizer::new();
+    let expected = tok.tokenize(text).collect::<HashSet<_>>().len() as i64;
+
+    // Read the stored length straight from the file, independent of the code under test.
+    let raw = trifle::rusqlite::Connection::open(&path).unwrap();
+    let stored: i64 = raw
+        .query_row("SELECT len FROM seg WHERE key = 1", [], |r| r.get(0))
+        .unwrap();
+    drop(raw);
+
+    assert_eq!(
+        stored, expected,
+        "seg.len must store the DISTINCT gram count L_d (§0/§6), not the with-repetition count"
+    );
+    drop(h.dir);
 }
 
 #[test]

@@ -1,19 +1,14 @@
-//! Storage backends — where connections come from and how trifle's tables are
-//! named.
+//! Storage: the owned-sidecar SQLite store and how trifle's tables are named.
 //!
-//! trifle's SQLite surface is small and self-contained, so *where connections come
-//! from* (an owned file, or a database the caller owns) is abstracted behind
-//! [`Backend`]. With no virtual tables, that surface is plain tables and BLOBs,
-//! which makes the backend genuinely portable.
+//! trifle owns its own SQLite file ([`Sidecar`]): it sets WAL / `mmap` / pragmas and runs a
+//! single mutexed write connection plus a pool of read-only connections that, under WAL, run
+//! concurrently with the writer. The whole surface is plain tables and BLOBs (no virtual
+//! tables beyond the `carray`/`rarray` helper), so it is genuinely portable.
 //!
-//! - [`Sidecar`] (default, recommended) — trifle opens and owns its own file,
-//!   sets WAL / `mmap` / pragmas, and runs a single-writer connection plus a
-//!   read-only pool. The caller passes a path.
-//! - [`Shared`] (opt-in) — trifle's tables live, [namespaced](Namespace), inside a
-//!   database the caller owns; the caller supplies connection access. Only for a
-//!   hard co-location requirement.
+//! The only store is the concrete [`Sidecar`]. Co-locating trifle's tables inside a
+//! caller-owned database is available, if needed, via an `ATTACH` on the read-connection
+//! factory.
 
-use std::ops::{Deref, DerefMut};
 use std::sync::Once;
 
 use rusqlite::Connection;
@@ -21,49 +16,10 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 mod pool;
-mod shared;
 mod sidecar;
 
 pub use pool::ReadConn;
-pub use shared::Shared;
 pub use sidecar::Sidecar;
-
-/// Abstracts where trifle's SQLite connections come from and how its tables are
-/// named.
-///
-/// trifle is single-writer: [`write`](Backend::write) hands out the one exclusive
-/// writer, [`read`](Backend::read) a pooled read-only connection that (under WAL)
-/// runs concurrently with the writer and with other readers.
-pub trait Backend: Send + Sync {
-    /// The exclusive write connection guard; derefs to the [`Connection`].
-    type WriteGuard<'a>: DerefMut<Target = Connection>
-    where
-        Self: 'a;
-    /// A pooled read-only connection guard; derefs to the [`Connection`].
-    type ReadGuard<'a>: Deref<Target = Connection>
-    where
-        Self: 'a;
-
-    /// Acquire the exclusive write connection. Blocks until the writer is free.
-    fn write(&self) -> Result<Self::WriteGuard<'_>>;
-
-    /// Acquire a pooled read-only connection.
-    fn read(&self) -> Result<Self::ReadGuard<'_>>;
-
-    /// The table-naming namespace for this backend.
-    fn namespace(&self) -> &Namespace;
-
-    /// Per-connection setup that registers the `carray`/`rarray` vtab (for batched
-    /// `WHERE id IN rarray(?1)` hydration) and, in [`Sidecar`] mode, sets pragmas.
-    ///
-    /// **The backend is responsible for running this** (or equivalent setup) on every
-    /// connection it hands out from [`write`](Backend::write) / [`read`](Backend::read)
-    /// before first use — the built-in backends do so in their connection factories.
-    /// trifle never calls it for you; it relies on the backend having upheld the
-    /// invariant. Exposed on the trait so a wrapping/custom backend can reuse the
-    /// setup. Must be idempotent.
-    fn init_conn(&self, conn: &Connection) -> Result<()>;
-}
 
 /// One-time, process-global SQLite tuning. Best-effort and behavior-transparent.
 ///
@@ -87,7 +43,10 @@ pub(crate) fn configure_sqlite_perf() {
 
 /// Register the `carray`/`rarray` virtual table on a connection so a whole id list
 /// binds to one prepared `WHERE id IN rarray(?1)` statement. Idempotent.
-pub(crate) fn register_carray(conn: &Connection) -> Result<()> {
+///
+/// trifle's batched reads (provenance, hydration, delete) rely on it; [`Sidecar`] calls this
+/// on every connection it opens. Exposed for an embedder wiring an `ATTACH` factory.
+pub fn register_carray(conn: &Connection) -> Result<()> {
     rusqlite::vtab::array::load_module(conn)?;
     Ok(())
 }
@@ -101,22 +60,28 @@ pub(crate) fn register_carray(conn: &Connection) -> Result<()> {
 pub struct TableMap {
     /// Key/value metadata: schema/data/tokenizer version stamps, rolling counters.
     pub meta: String,
-    /// One row per indexed segment (id, provenance, snapshot text).
+    /// One row per indexed segment (id, caller key, label, snapshot text, gram length).
+    /// `seg.id` is the roaring posting id.
     pub seg: String,
-    /// Contentless-mode forward index (per-segment token set); unused in snapshot
-    /// mode.
+    /// Per-segment forward index: the interned `u32` term-id set of each segment, as a
+    /// roaring posting. Read by delete, so delete needs neither the text nor the tokenizer.
     pub fwd: String,
-    /// Per-token effective document frequency (the pruner reads this).
+    /// Per-token effective document frequency (the pruner reads this), keyed by the
+    /// interned `u32` term-id.
     pub term: String,
-    /// Per-token base roaring posting (written only by fold/rebuild).
+    /// Per-token base roaring posting (written only by fold/rebuild), keyed by term-id.
     pub post: String,
-    /// Per-token added/removed roaring delta (written on every incremental write).
+    /// Per-token added/removed roaring delta (written on every incremental write),
+    /// keyed by term-id.
     pub delta: String,
+    /// The interning dictionary: `term-id <-> gram` (the gram is the only place gram
+    /// text/encoding is stored; postings reference the `u32` id).
+    pub dict: String,
 }
 
 impl TableMap {
     /// Every persistent table name, in a stable order.
-    fn names(&self) -> [&str; 6] {
+    fn names(&self) -> [&str; 7] {
         [
             &self.meta,
             &self.seg,
@@ -124,6 +89,7 @@ impl TableMap {
             &self.term,
             &self.post,
             &self.delta,
+            &self.dict,
         ]
     }
 }
@@ -144,6 +110,7 @@ pub struct Namespace {
     term_shadow: String,
     post_shadow: String,
     delta_shadow: String,
+    dict_shadow: String,
 }
 
 impl Default for Namespace {
@@ -175,6 +142,7 @@ impl Namespace {
             term: t("term"),
             post: t("post"),
             delta: t("delta"),
+            dict: t("dict"),
         })
     }
 
@@ -200,6 +168,7 @@ impl Namespace {
             term_shadow: format!("{}_shadow", map.term),
             post_shadow: format!("{}_shadow", map.post),
             delta_shadow: format!("{}_shadow", map.delta),
+            dict_shadow: format!("{}_shadow", map.dict),
             map,
         };
         // Validate the derived shadow names too — a base name within the length bound
@@ -211,6 +180,7 @@ impl Namespace {
             &ns.term_shadow,
             &ns.post_shadow,
             &ns.delta_shadow,
+            &ns.dict_shadow,
         ] {
             validate_ident(shadow)?;
         }
@@ -227,8 +197,7 @@ impl Namespace {
     }
 
     /// Every table name trifle will create under this namespace — the persistent
-    /// tables and the two-per-table rebuild shadows. Useful for a caller's
-    /// collision check or migration tooling.
+    /// tables and the rebuild shadows. Useful for a caller's collision check.
     pub fn table_names(&self) -> impl Iterator<Item = &str> {
         [
             self.map.meta.as_str(),
@@ -237,11 +206,13 @@ impl Namespace {
             self.map.term.as_str(),
             self.map.post.as_str(),
             self.map.delta.as_str(),
+            self.map.dict.as_str(),
             self.seg_shadow.as_str(),
             self.fwd_shadow.as_str(),
             self.term_shadow.as_str(),
             self.post_shadow.as_str(),
             self.delta_shadow.as_str(),
+            self.dict_shadow.as_str(),
         ]
         .into_iter()
     }
@@ -265,6 +236,9 @@ impl Namespace {
     pub(crate) fn delta(&self) -> &str {
         &self.map.delta
     }
+    pub(crate) fn dict(&self) -> &str {
+        &self.map.dict
+    }
     pub(crate) fn seg_shadow(&self) -> &str {
         &self.seg_shadow
     }
@@ -280,11 +254,15 @@ impl Namespace {
     pub(crate) fn delta_shadow(&self) -> &str {
         &self.delta_shadow
     }
+    pub(crate) fn dict_shadow(&self) -> &str {
+        &self.dict_shadow
+    }
 }
 
 /// Validate a SQL identifier: ASCII, starts with a letter or `_`, then letters /
-/// digits / `_`, length-bounded, and not a reserved `sqlite_` name.
-fn validate_ident(name: &str) -> Result<()> {
+/// digits / `_`, length-bounded, and not a reserved `sqlite_` name. Used for table
+/// names and for schema-derived names (the key field label).
+pub(crate) fn validate_ident(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::namespace("empty table name"));
     }
@@ -321,24 +299,6 @@ fn validate_prefix(prefix: &str) -> Result<()> {
         .map_err(|_| Error::namespace(format!("invalid namespace prefix: {prefix:?}")))
 }
 
-/// Resolves the *current* text of segments for a [contentless](crate#text-storage)
-/// index, so trifle need not store a copy.
-///
-/// trifle calls this where it would otherwise read its stored text snapshot:
-/// hydrating survivors for [`Match.text`](crate::Match::text) and a ranker's
-/// literal-verify. That use is drift-tolerant — a `None` yields `Match.text = None`,
-/// a stale string only mis-highlights a span.
-pub trait TextResolver: Send + Sync {
-    /// The current text for each requested `(doc_id, source, ref)`, in order.
-    /// `None` marks a segment whose text is unavailable at the source.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the source cannot be consulted at all (distinct from a
-    /// per-segment `None`).
-    fn resolve(&self, segs: &[(i64, &str, &str)]) -> Result<Vec<Option<String>>>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,7 +324,7 @@ mod tests {
         let names: Vec<&str> = ns.table_names().collect();
         assert!(names.contains(&"seg"));
         assert!(names.contains(&"seg_shadow"));
-        assert_eq!(names.len(), 11); // 6 persistent + 5 shadows
+        assert_eq!(names.len(), 13); // 7 persistent + 6 shadows
     }
 
     #[test]
@@ -384,6 +344,7 @@ mod tests {
             term: "c".into(),
             post: "d".into(),
             delta: "e".into(),
+            dict: "f".into(),
         };
         assert!(Namespace::explicit(map).is_err());
     }
@@ -398,6 +359,7 @@ mod tests {
             term: "term".into(),
             post: "post".into(),
             delta: "delta".into(),
+            dict: "dict".into(),
         };
         assert!(Namespace::explicit(map).is_err());
     }

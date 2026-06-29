@@ -1,4 +1,4 @@
-//! The default backend: trifle opens and owns its own SQLite file.
+//! The store: trifle opens and owns its own SQLite file.
 
 use std::path::Path;
 use std::time::Duration;
@@ -8,23 +8,24 @@ use rusqlite::{Connection, OpenFlags};
 use crate::error::{Error, Result};
 
 use super::pool::{ReadConn, Store};
-use super::{Backend, Namespace, configure_sqlite_perf, register_carray};
+use super::{Namespace, configure_sqlite_perf, register_carray};
 
 /// Per-connection memory-map ceiling. 1 GiB maps the whole store at every standard
 /// scale and stays under the 64-bit `mmap_size` cap, so reads serve pages straight
 /// from the mapped file and bypass the page cache.
 const MMAP_SIZE_BYTES: i64 = 1024 * 1024 * 1024;
 
-/// A read or write that overlaps another connection's commit waits the lock out
-/// rather than taking an instant `SQLITE_BUSY`.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// `busy_timeout = 0`: lock contention returns `SQLITE_BUSY` **immediately** rather than
+/// blocking the calling thread to wait the lock out. Library code must never sleep/block the
+/// caller; the fault is mapped to the retryable [`Error::Busy`](crate::Error::Busy) at the error
+/// boundary and the application owns the backoff/retry.
+const BUSY_TIMEOUT: Duration = Duration::ZERO;
 
-/// A backend that owns its own SQLite file: one write connection (WAL,
-/// `synchronous=NORMAL`) plus a pool of read-only connections that, under WAL, run
-/// concurrently with the writer. Full encapsulation — the caller passes a path.
+/// trifle's owned SQLite file: one write connection (WAL, `synchronous=NORMAL`) plus a pool of
+/// read-only connections that, under WAL, run concurrently with the writer. The caller passes a
+/// path; trifle owns everything else.
 ///
-/// This is the recommended backend, and the right choice whenever the source of
-/// truth is foreign, remote, or expensive to reach.
+/// [`Index`](crate::Index) holds one `Sidecar` and reads/writes through it.
 pub struct Sidecar {
     store: Store,
 }
@@ -70,31 +71,25 @@ impl Sidecar {
             store: Store::new(namespace, write, factory),
         })
     }
-}
 
-impl Backend for Sidecar {
-    type WriteGuard<'a> = std::sync::MutexGuard<'a, Connection>;
-    type ReadGuard<'a> = ReadConn<'a>;
-
-    fn write(&self) -> Result<Self::WriteGuard<'_>> {
+    /// Acquire the exclusive write connection. Blocks until the writer is free.
+    pub(crate) fn write(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         Ok(self.store.write())
     }
 
-    fn read(&self) -> Result<Self::ReadGuard<'_>> {
+    /// Acquire a pooled read-only connection (returned to the pool on drop).
+    pub(crate) fn read(&self) -> Result<ReadConn<'_>> {
         self.store.read()
     }
 
-    fn namespace(&self) -> &Namespace {
+    /// The table-naming namespace for this store.
+    pub(crate) fn namespace(&self) -> &Namespace {
         self.store.namespace()
-    }
-
-    fn init_conn(&self, conn: &Connection) -> Result<()> {
-        setup_read_conn(conn)
     }
 }
 
 /// Per-connection setup shared by read connections (and the non-WAL part of the
-/// writer): wait budget, memory-map, and the `carray` vtab.
+/// writer): the no-wait busy policy, memory-map, and the `carray` vtab.
 fn setup_read_conn(conn: &Connection) -> Result<()> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES)?;

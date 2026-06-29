@@ -9,13 +9,12 @@ use crate::error::Result;
 
 use super::Namespace;
 
-/// Opens a fully-initialized connection (post-`init_conn`) on demand.
+/// Opens a fully-initialized read connection (WAL, mmap, `carray` registered) on demand.
 type ConnFactory = Box<dyn Fn() -> Result<Connection> + Send + Sync>;
 
-/// The connection state common to both [`Sidecar`](super::Sidecar) and
-/// [`Shared`](super::Shared): the one write connection (serialized behind a
-/// `Mutex`) plus a read pool. Both backends are thin wrappers that delegate their
-/// [`Backend`](super::Backend) methods here.
+/// The connection state behind [`Sidecar`](super::Sidecar): the one write connection (serialized
+/// behind a `Mutex`) plus a read pool opened on demand. `Sidecar` is a thin wrapper that delegates
+/// its `write`/`read`/`namespace` to here.
 pub(crate) struct Store {
     namespace: Namespace,
     write: Mutex<Connection>,
@@ -79,6 +78,14 @@ impl ReadPool {
     }
 
     fn checkin(&self, conn: Connection) {
+        // Defensive rollback on check-in (not only on `CandidateStream::Drop`): a stream that
+        // leaked its read transaction — `mem::forget`, `panic = "abort"`, or a double-panic that
+        // bypasses `Drop` — would otherwise hand the next checkout a connection still pinning an
+        // open WAL snapshot. Returning it to the pool clean keeps the snapshot lifetime bounded by
+        // the checkout, not by some past leak.
+        if !conn.is_autocommit() {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
         self.idle
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -88,8 +95,10 @@ impl ReadPool {
 
 /// A borrowed read-only connection that returns itself to its pool on drop.
 ///
-/// Returned by [`Backend::read`](super::Backend::read); `Deref`s to the underlying
-/// [`Connection`] and is held only for the duration of one read.
+/// Handed out by the read pool ([`Sidecar`](super::Sidecar)'s reads); `Deref`s to the underlying
+/// [`Connection`] and is held only for the duration of one read (or one [`CandidateStream`]).
+///
+/// [`CandidateStream`]: crate::CandidateStream
 pub struct ReadConn<'p> {
     pool: &'p ReadPool,
     /// `Some` until drop; `take`n in `Drop` to hand the connection back.

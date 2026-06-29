@@ -3,7 +3,7 @@
   "license": "CC BY 4.0 (GeoNames)",
   "repo": "https://download.geonames.org/export/dump/",
   "url": "https://download.geonames.org/export/dump/cities15000.zip",
-  "sha256": "9bd8a48a27b6805de34aa6fb96335b0179d567e9c948030a56c56912a730b733",
+  "sha256": "",
   "bytes": 3285056,
-  "note": "zip of cities15000.txt — tab-separated GeoNames dump (col 1 = geonameid, col 2 = name, col 3 = asciiname, col 15 = population). Populated places > 15000 people (~34k rows). Pinned to a frozen snapshot. GeoNames regenerates the dump ~daily; on an upstream refresh strict verification fails until this sha256 is re-pinned (delete the cached zip, re-fetch, and paste the new hash)."
+  "note": "zip of cities15000.txt — tab-separated GeoNames dump (col 1 = geonameid, col 2 = name, col 3 = asciiname, col 15 = population). Populated places > 15000 people (~34k rows). Intentionally UNPINNED (empty sha256): GeoNames regenerates the dump ~daily, so a pinned hash would go stale every day; the download is used as-is without content verification (the fetch prints the computed hash for reference)."
 }

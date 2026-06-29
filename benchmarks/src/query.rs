@@ -1,8 +1,8 @@
 //! Query generation.
 //!
-//! - **Latency** ([`perf_queries`]): in-corpus document snippets ± typos. No labels —
-//!   the snippet's vocabulary/co-occurrence are exactly the corpus's, which sidesteps
-//!   "where do realistic queries come from" for a pure latency measurement.
+//! - **Latency** ([`perf_queries`]): clean in-corpus document snippets (no typos — latency is
+//!   a pure speed measurement). No labels — the snippet's vocabulary/co-occurrence are exactly
+//!   the corpus's, which sidesteps "where do realistic queries come from".
 //! - **Fuzzy/typo recall** ([`fuzzy_queries`]): an **entity name + injected edits**,
 //!   labeled by the entity. On an entity corpus this construction is faithful — the user
 //!   types a corrupted target name and wants the target — unlike the same trick on prose
@@ -14,17 +14,15 @@
 use crate::corpus::{Corpus, Entity};
 use crate::rng::Rng;
 
-/// A generated latency query: the text, how many typos it carries (for the run's
-/// recorded typo mix), and the id of the document the snippet was drawn from.
+/// A generated latency query: a clean in-corpus snippet plus the id of the document it was
+/// drawn from.
 ///
-/// The latency *timing* needs no label, but the snippet's source doc is the natural
-/// relevant answer for an in-corpus recall@k readout: a clean snippet should retrieve
-/// its own document, and a typo'd one tests whether the fuzzy machinery still does. The
-/// `latency` command reports recall@k over `target` so the speed numbers carry a quality
+/// The latency *timing* needs no label, but the snippet's source doc is the natural relevant
+/// answer for an in-corpus recall@k readout: a clean snippet should retrieve its own document.
+/// The `latency` command reports recall@k over `target` so the speed numbers carry a quality
 /// figure alongside (see `cmd_latency`).
 pub struct Query {
     pub text: String,
-    pub edits: usize,
     /// The id of the corpus document this snippet came from — the relevant id for the
     /// latency command's in-corpus recall@k.
     pub target: i64,
@@ -36,6 +34,9 @@ pub struct FuzzyQuery {
     pub text: String,
     pub target: i64,
     pub clean: String,
+    /// The number of typos actually injected into this query (a random draw from the requested
+    /// `[lo, hi]` range), kept for the run's reported edit-mix.
+    pub edits: usize,
 }
 
 /// Take a contiguous run of `len` words starting at a random offset in `text`.
@@ -113,8 +114,8 @@ fn corrupt(mut s: String, k: usize, rng: &mut Rng) -> String {
     s
 }
 
-/// Generate `n` perf queries: snippets of varied length (2–5 words) with 0–2 typos.
-/// Latency only — no labels needed.
+/// Generate `n` clean perf queries: in-corpus snippets of varied length (2–5 words), **no
+/// typos** — latency is a pure speed measurement. No labels needed beyond the source doc id.
 pub fn perf_queries(corpus: &Corpus, n: usize, seed: u64) -> Vec<Query> {
     let mut rng = Rng::new(seed ^ 0xBEEF);
     (0..n)
@@ -125,14 +126,8 @@ pub fn perf_queries(corpus: &Corpus, n: usize, seed: u64) -> Vec<Query> {
             if snip.chars().count() < 3 {
                 return None;
             }
-            let edits = match rng.below(3) {
-                0 => 0,
-                1 => 1,
-                _ => 2,
-            };
             Some(Query {
-                text: corrupt(snip, edits, &mut rng),
-                edits,
+                text: snip,
                 target: doc.id,
             })
         })
@@ -162,18 +157,20 @@ pub fn labeled_snippets(corpus: &Corpus, n: usize, edits: usize, seed: u64) -> V
         .collect()
 }
 
-/// Generate one fuzzy query per target entity: the entity name with exactly `edits`
-/// single-character typos, labeled by the entity id. Deterministic per
-/// `(seed, edits)`, so 1-edit and 2-edit runs use distinct corruptions. Names too short
-/// to form a trigram query after corruption are skipped (a 1–2 char name can't).
-pub fn fuzzy_queries(targets: &[Entity], edits: usize, seed: u64) -> Vec<FuzzyQuery> {
-    let mut rng = Rng::new(seed ^ 0x00C0_FFEE_u64 ^ ((edits as u64) << 32));
+/// Generate one fuzzy query per target entity: the entity name with a **random** number of
+/// single-character typos drawn uniformly from the inclusive range `[lo, hi]` (so a single
+/// batch carries a realistic mix of typo counts), labeled by the entity id. Deterministic per
+/// `(seed, lo, hi)`. Names too short to form a trigram query after corruption are skipped (a
+/// 1–2 char name can't). `lo == hi` pins every query to that exact count.
+pub fn fuzzy_queries(targets: &[Entity], lo: usize, hi: usize, seed: u64) -> Vec<FuzzyQuery> {
+    let mut rng = Rng::new(seed ^ 0x00C0_FFEE_u64 ^ ((lo as u64) << 32) ^ ((hi as u64) << 48));
     targets
         .iter()
         .filter_map(|t| {
             if t.name.chars().count() < 4 {
                 return None;
             }
+            let edits = rng.range(lo, hi); // a random typo count per query, uniform in [lo, hi]
             let text = corrupt(t.name.clone(), edits, &mut rng);
             if text.chars().count() < 3 {
                 return None;
@@ -182,6 +179,7 @@ pub fn fuzzy_queries(targets: &[Entity], edits: usize, seed: u64) -> Vec<FuzzyQu
                 text,
                 target: t.id,
                 clean: t.name.clone(),
+                edits,
             })
         })
         .collect()

@@ -3,7 +3,7 @@
   "license": "CC BY 4.0 (GeoNames)",
   "repo": "https://download.geonames.org/export/dump/",
   "url": "https://download.geonames.org/export/dump/allCountries.zip",
-  "sha256": "e31f57cddbbc7fbadf7c9f72f9ac39b119fec54ed18e7f40055bc0fd3c8379bd",
+  "sha256": "",
   "bytes": 419500856,
-  "note": "zip of allCountries.txt — the full GeoNames gazetteer (~12M rows, same columns as cities15000: col 1 = geonameid, col 2 = name, col 15 = population). ~400 MB zipped. The corpus-scale fuzzy run. Pinned to a frozen snapshot; GeoNames regenerates ~daily, so on an upstream refresh strict verification fails until this sha256 is re-pinned (see geonames-cities15000.json)."
+  "note": "zip of allCountries.txt — the full GeoNames gazetteer (~12M rows, same columns as cities15000: col 1 = geonameid, col 2 = name, col 15 = population). ~400 MB zipped. The corpus-scale fuzzy run. Intentionally UNPINNED (empty sha256): GeoNames regenerates ~daily, so a pinned hash would go stale every day; the download is used as-is without content verification (see geonames-cities15000.json)."
 }

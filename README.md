@@ -14,13 +14,12 @@
 
 Trifle is an embedded, typo-tolerant fuzzy search engine for Rust, backed by SQLite
 and tuned for large corpora of mostly small document segments with read-often and
-write-infrequent characteristics. Trifle uses roaring bitmaps internally for fast and
+write-infrequent characteristics. Trifle uses CRoaring bitmaps internally for fast and
 space-efficient storage of n-gram token posting lists.
 
-Trifle indexes text segments and returns ranked matches for quries. The backing store is
-a rebuildable cache over a caller-owned full-text source. Trifle's storage can be built
-as a separate sidecar or inlined within your existing SQLite database as a set of
-namespaced tables.
+Trifle indexes text segments and returns ranked matches for queries. The backing store is
+a rebuildable cache over a caller-owned full-text source: an owned SQLite sidecar file that
+trifle manages itself.
 
 Trifle performs lexical matching only, and is tuned for mostly small-document retrieval
 by default but longer documents may be indexed and search-ranked using whatever custom
@@ -35,60 +34,75 @@ trifle = "0.1"
 
 ```rust
 use std::path::Path;
-use trifle::{Config, Index, SearchOpts};
+use trifle::{Config, Index, Schema, SearchOpts};
 
 fn main() -> trifle::Result<()> {
-    let index = Index::open_at(Path::new("search.db"), Config::default())?;
+    // A flat schema: an integer key plus one text field (any segment label, stored).
+    let index = Index::open_at(Path::new("search.db"), Schema::flat(), Config::default())?;
 
-    // A segment is (doc_id, source, ref, text); source and ref are opaque
-    // provenance labels returned on a match.
-    index.insert(1, "field", &[("title", "the quick brown fox")])?;
-    index.insert(2, "field", &[("title", "the quack brown ox")])?;
+    // Writes go through a single-writer lease; commit() makes them durable.
+    let mut w = index.writer()?;
+    w.upsert(1, &[("title", "the quick brown fox")])?;
+    w.upsert(2, &[("title", "the quack brown ox")])?;
+    w.commit()?;
 
-    // A misspelled query still matches.
-    let hits = index.search("quikc brown", SearchOpts::new(10))?;
-    assert_eq!(hits[0].doc_id, 1);
+    // Reads go through a reader lease; each search runs under a consistent snapshot
+    // (a single matches_batch shares one). A misspelled query still matches.
+    let hits = index.reader()?.matches("quikc brown", &SearchOpts::new(), 10)?;
+    assert_eq!(hits[0].key.as_i64(), Some(1));
     Ok(())
 }
 ```
 
 ## Data model
 
-A segment is `(doc_id, source, ref, text)`. The fields are caller-assigned and play
-distinct operational roles:
+A `Schema` declares the shape of your data; trifle generates its tables from it. A document
+has a **key** and one or more named **segments**:
 
-- `doc_id` — the unit of retrieval. A search returns at most one match per `doc_id`, its
-  best-matching segment, and `limit` counts `doc_id`s. Make `doc_id` whatever you want back
-  as a single result.
-- `source` — the unit of write. `insert(doc_id, source, …)` replaces every segment under a
-  `(doc_id, source)` pair; `remove_source(doc_id, source)` deletes that pair; `remove(doc_id)`
-  deletes every source of a doc.
-- `ref` — a free-form label on one segment, returned on a match so you know which segment
-  matched. It is metadata, not a key: there is no replace or delete by `ref`.
-- `text` — stored raw; the tokenizer normalizes it for matching.
+- **key** — the unit of retrieval, of a declared shape (`Integer`, `Text`, or `Blob`). A
+  search returns at most one match per key — its best-matching segment — and `limit` counts
+  keys. A `Match` carries the `key`, the matched segment's `label`, its `text`, and (when
+  locatable) a byte `span`.
+- **segment** — a `(label, text)` pair under a key. `label` is a free-form name returned on
+  a match so you know which segment matched; a document holds each label at most once. Every
+  indexed text field is **stored** and returned on a match. The segment is the ranking unit
+  (IDF-weighted overlap over its grams); fuse across a key's segments above trifle (aggregate
+  across your keys).
+- `Schema::flat()` is the simplest shape: an integer key and one default text field that
+  accepts any label. `Schema::chunked()` / the builder declare named text fields.
 
-These roles cover two distinct patterns:
+This covers two common patterns:
 
-- **Provenance** — one logical document per `doc_id`, with a segment per place its text comes
-  from: `source` the category (`"ocr"`, `"caption"`, `"field"`), `ref` the sub-location (a
-  filename or field name). A search returns the document and its best-matching segment.
-- **Chunking a large document** — if one best passage per document is enough, keep `doc_id`
-  the document, put the chunks under a single `source`, and use `ref` for each chunk's
-  position; a match returns the best chunk, with its text and (when locatable) a byte span.
-  To retrieve several passages from the same document at once, give each chunk its own
-  `doc_id` (results are deduplicated per `doc_id`) and record the parent in `source` or `ref`.
+- **Provenance** — one document per key, a segment per place its text comes from (label the
+  sub-location: `"ocr"`, `"title"`, a filename). A search returns the document and its
+  best-matching segment.
+- **Chunking a large document** — keep the document as the key and put each passage under its
+  own label; a match returns the best chunk, with its text and (when locatable) a byte span.
+  To retrieve several passages from one document at once, give each chunk its own key
+  (results are deduplicated per key).
 
 ## Features
 
-- **Typo / partial tolerance** via trigram overlap; strictness (`min_shared`) and recall
+- **Typo / partial tolerance** via n-gram overlap; strictness (`min_shared`) and recall
   (`t_max`, the rarest query tokens kept) dials.
+- **Mixed-script aware** — the default `DefaultTokenizer` splits text into same-script runs
+  and windows each appropriately (CJK bigrams, else trigrams), so no gram straddles a script
+  boundary. `NgramTokenizer<N>` (`TrigramTokenizer` / `BigramTokenizer`) is the plain
+  fixed-width tokenizer for single-script corpora.
 - **Configurable normalization** — NFC (default), NFD, accent-insensitive
   (`NfdStripMarks`), or none. Unicode casefolding is on by default.
-- **Reranking** — bit-sliced posting list overlap generates candidates; the default
-  `Effort::Medium` reranks a pool of ~`c·√(k·N)` with a BM25-shaped tier (idf, length
-  normalization, literal verification). Tune via `SearchOpts::rerank(Effort)` (`None`
-  through `Max`), or supply a custom `Ranker`.
-- **Scoped search** — a provenance predicate evaluated over candidates only.
+- **Ranking** — **IDF-weighted bit-sliced overlap**, computed in the counter itself: each
+  selected gram is weighted by rarity (a per-query, df-anchored 4-tier scheme, weights
+  `{1,2,3,4}`; knob `D` via `SearchOpts::weight_step`), and rarity is **class-normalized across
+  scripts** so a rare shared gram outweighs a common one even across different script regimes.
+  This is a fuzzy lexical overlap engine, **not** a relevance engine — there is no BM25 tier.
+  For a domain-specific reorder, pull a candidate pool from `reader.candidates(...)`, reorder it
+  yourself (the stream exposes each candidate's score, overlap, and matched terms with their df),
+  and hydrate the winners.
+- **Filtering** — pass a `SqlFilter` (a trusted-constant SQL predicate fragment plus bound
+  params) to cut the candidate set against your **live** data — `key IN rarray(?)` with your own
+  allowed-key set, or a co-located join via `ATTACH`. trifle stores no filter columns of its own
+  (they would go stale), so filtering is staleness-free by construction.
 
 ## Usage
 
@@ -106,28 +120,12 @@ connections — and manages the pragmas and write serialization itself. You open
 it; nothing else is required:
 
 ```rust
-let index = Index::open_at(Path::new("search.db"), Config::default())?;
+let index = Index::open_at(Path::new("search.db"), Schema::flat(), Config::default())?;
 ```
 
-### Shared mode
-
-Trifle's tables live namespaced inside a database you own and supply connections to. Use it
-only for a hard co-location requirement. You give it the write connection and a factory for
-read-only connections, and you take on three guarantees Trifle cannot enforce across a file
-it does not own:
-
-- single-writer serialization across the **whole** database, not just Trifle's tables;
-- a WAL and pragma setup compatible with concurrent reads;
-- never holding an open transaction across a `rebuild()` — its shadow-table swap must commit.
-
-```rust
-let backend = Shared::new(
-    Namespace::prefixed("trifle_")?,   // tables become trifle_seg, trifle_post, …
-    write_conn,                        // the one connection writes serialize through
-    || open_readonly_connection(),     // read-only factory: || -> rusqlite::Result<Connection>
-)?;
-let index = Index::open(backend, TrigramTokenizer::new(), Config::default())?;
-```
+A custom tokenizer or table namespace goes through `Index::open(Sidecar::open(path)?, tokenizer,
+schema, config)`. To co-locate trifle's tables inside a database you own, `ATTACH` it to the
+sidecar's read connections and reference it from a `SqlFilter` fragment.
 
 ### Maintenance
 
@@ -151,7 +149,7 @@ when choosing one:
 
 | | embedded (no server)? | updates | scales to 1M+ small docs? | provenance | matching semantics | storage |
 |---|---|---|---|---|---|---|
-| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | source / ref | trigram overlap + BM25-shaped rerank | disk (SQLite) |
+| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | key / label | IDF-weighted trigram overlap | disk (SQLite) |
 | **[SQLite FTS5](https://www.sqlite.org/fts5.html#the_trigram_tokenizer)** | yes | incremental | yes | rowid | trigram substring (`MATCH` / `LIKE`) | disk (SQLite) |
 | **[pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html)** | no (server) | incremental (GIN / GiST) | yes | table rows | trigram similarity | disk (server) |
 | **[Tantivy](https://github.com/quickwit-oss/tantivy)** | yes | incremental (segments) | yes | stored fields | Levenshtein automaton (≤ 2 edits) | disk (segments) |
@@ -163,14 +161,14 @@ RAM-resident and is rebuilt each run, but they keep no durable index. pg_trgm fi
 already run Postgres; Tantivy is the fuller embedded library — field schemas, stored
 documents, edit-distance term queries — when you want Lucene-shaped search. FTS5 and Trifle
 both live in a SQLite file: FTS5 matches substrings against its trigram index through
-`MATCH`/`LIKE`, while Trifle generates candidates by trigram overlap and reranks them with a
-BM25-shaped scorer.
+`MATCH`/`LIKE`, while Trifle ranks by IDF-weighted trigram overlap (rarer shared grams weigh
+more) — a fuzzy lexical engine, not a relevance engine.
 
 ## Non-goals
 
 Embeddings and semantic search; fusion (e.g. RRF) with other signals; an exact precision
-tier beyond a custom `Ranker`; sub-trigram (< 3-char) queries; and deciding when the cache
-is stale relative to your source of truth.
+tier beyond what you compose over the candidate stream; sub-trigram (< 3-char) queries; and
+deciding when the cache is stale relative to your source of truth.
 
 ## License
 

@@ -9,9 +9,18 @@
 //! cost is the sum of the kept tokens' document frequencies (`Σdf`) — the number of
 //! posting rows read — so `t_max` is the cap on rows scanned, the latency proxy.
 //!
-//! Selection derives only from this query's own token document frequencies — never
-//! a batch aggregate or the corpus size — so `search_batch([…, q, …])` ranks `q`
-//! identically to `search(q)` (batch == serial).
+//! Selection derives only from this query's own token document frequencies (and the
+//! per-class statistics snapshot it is handed) — never a batch aggregate or the corpus
+//! size — so `search_batch([…, q, …])` ranks `q` identically to `search(q)`
+//! (batch == serial).
+//!
+//! "Rarest" is **class-normalized**: tokens are ranked by [`ClassSnap::rarity`] (a
+//! `z`-score within the token's script class, falling back to raw DF for a degenerate
+//! class), so a CJK bigram and a Latin trigram — different DF regimes — compare on the
+//! same footing. Within a single script (the common per-query case) this reduces to the
+//! old rarest-by-DF order.
+
+use crate::welford::ClassSnap;
 
 /// The behavior + performance knobs the pruner reads (from [`SearchOpts`](crate::SearchOpts)).
 #[derive(Clone, Copy, Debug)]
@@ -22,6 +31,11 @@ pub(crate) struct SelectParams {
     pub typo_damage: u32,
     /// `t_max` — the number of rarest tokens to keep (never fewer than the typo floor).
     pub t_max: usize,
+    /// `B` — an optional cap on the cumulative document frequency (`Σdf`) of the kept present
+    /// tokens. The scan cost is `Σdf`, so this caps *work* directly (rather than count, as
+    /// `t_max` does). The typo floor is always kept even if it exceeds `B`; beyond the floor,
+    /// rarest-first tokens are kept while `Σdf` stays within budget. `None` = no cap.
+    pub df_budget: Option<u64>,
 }
 
 /// Select the tokens to scan, from each distinct query token paired with its live
@@ -33,13 +47,26 @@ pub(crate) struct SelectParams {
 /// token has a provably empty posting, so it costs nothing to scan and never reaches
 /// the overlap floor (which the ranker derives from the postings actually present).
 ///
-/// `tokens` must be the *distinct* query tokens (deduplicated). The returned
-/// selection is in scan order: kept present tokens rarest-first, then absent tokens
+/// `tokens` are the *distinct* query tokens (deduplicated) as `(token, df, class)`
+/// triples — `class` is the token's script-tag byte. `classes` is the per-class stats
+/// snapshot used to rank rarity. The returned selection is in scan order: kept present
+/// tokens rarest-first (by class-normalized rarity, token tie-break), then absent tokens
 /// in token order — deterministic run to run.
-pub(crate) fn select<Tk: Clone + Ord>(tokens: &[(Tk, i64)], params: SelectParams) -> Vec<Tk> {
-    // Present tokens rarest-first; token as a deterministic tie-break.
-    let mut present: Vec<&(Tk, i64)> = tokens.iter().filter(|(_, df)| *df > 0).collect();
-    present.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+pub(crate) fn select<Tk: Clone + Ord>(
+    tokens: &[(Tk, i64, u8)],
+    params: SelectParams,
+    classes: &ClassSnap,
+) -> Vec<Tk> {
+    // Present tokens rarest-first by class-normalized rarity; token as a deterministic
+    // tie-break (and a stable secondary when two rarities compare equal).
+    let mut present: Vec<&(Tk, i64, u8)> = tokens.iter().filter(|(_, df, _)| *df > 0).collect();
+    present.sort_by(|a, b| {
+        classes
+            .rarity(a.1, a.2)
+            .partial_cmp(&classes.rarity(b.1, b.2))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     // The typo floor, clamped to the match floor and to what's present; `t_max` can
     // never undercut it. Summed in usize so a caller-supplied `min_shared` near
@@ -48,17 +75,32 @@ pub(crate) fn select<Tk: Clone + Ord>(tokens: &[(Tk, i64)], params: SelectParams
     let floor = f.max(params.min_shared as usize).min(present.len());
     let keep = params.t_max.max(floor).min(present.len());
 
-    let mut kept: Vec<Tk> = present
-        .into_iter()
-        .take(keep)
-        .map(|(tok, _)| tok.clone())
-        .collect();
+    // Keep the rarest-first prefix up to `keep` (the count cap), but once past the floor stop
+    // as soon as the cumulative df (`Σdf` — the scan cost) would exceed the `df_budget`. The
+    // floor is kept unconditionally so a typo'd query never loses its tolerance to the cap.
+    let mut kept: Vec<Tk> = Vec::with_capacity(keep);
+    let mut cum_df: u64 = 0;
+    for (i, (tok, df, _)) in present.iter().enumerate() {
+        if i >= keep {
+            break;
+        }
+        let df = (*df).max(0) as u64;
+        if i >= floor {
+            if let Some(budget) = params.df_budget {
+                if cum_df + df > budget {
+                    break;
+                }
+            }
+        }
+        kept.push(tok.clone());
+        cum_df += df;
+    }
 
     // Append the absent tokens (deterministic token order), charged nothing.
     let mut absent: Vec<Tk> = tokens
         .iter()
-        .filter(|(_, df)| *df <= 0)
-        .map(|(tok, _)| tok.clone())
+        .filter(|(_, df, _)| *df <= 0)
+        .map(|(tok, _, _)| tok.clone())
         .collect();
     absent.sort();
     kept.extend(absent);
@@ -68,18 +110,29 @@ pub(crate) fn select<Tk: Clone + Ord>(tokens: &[(Tk, i64)], params: SelectParams
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::welford::ClassSnap;
 
     fn params(min_shared: u32, t_max: usize) -> SelectParams {
         SelectParams {
             min_shared,
             typo_damage: 4,
             t_max,
+            df_budget: None,
         }
     }
 
-    /// Helper: `(name, df)` pairs with single-char string tokens.
-    fn toks(pairs: &[(&str, i64)]) -> Vec<(String, i64)> {
-        pairs.iter().map(|(t, d)| (t.to_string(), *d)).collect()
+    /// Helper: `(name, df)` pairs as `(token, df, class)` triples, all class 0. With an
+    /// empty [`ClassSnap`] (below) the pruner ranks by raw DF — these exercise that path.
+    fn toks(pairs: &[(&str, i64)]) -> Vec<(String, i64, u8)> {
+        pairs
+            .iter()
+            .map(|(t, d)| (t.to_string(), *d, 0u8))
+            .collect()
+    }
+
+    /// The raw-DF (empty) class snapshot these tests rank against.
+    fn snap() -> ClassSnap {
+        ClassSnap::empty()
     }
 
     #[test]
@@ -95,7 +148,10 @@ mod tests {
             ("g", 7),
             ("h", 8),
         ]);
-        assert_eq!(select(&t, params(2, 6)), ["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(
+            select(&t, params(2, 6), &snap()),
+            ["a", "b", "c", "d", "e", "f"]
+        );
     }
 
     #[test]
@@ -112,7 +168,7 @@ mod tests {
         ]);
         // t_max=8 keeps all eight, still rarest-first.
         assert_eq!(
-            select(&t, params(2, 8)),
+            select(&t, params(2, 8), &snap()),
             ["a", "b", "c", "d", "e", "f", "g", "h"]
         );
     }
@@ -130,7 +186,7 @@ mod tests {
             ("g", 7),
         ]);
         assert_eq!(
-            select(&t, params(2, 3)).len(),
+            select(&t, params(2, 3), &snap()).len(),
             6,
             "floor F=6 wins over t_max=3"
         );
@@ -138,21 +194,21 @@ mod tests {
 
     #[test]
     fn t_max_caps_under_many_present_tokens() {
-        let t: Vec<(String, i64)> = (0..20).map(|i| (format!("{i:02}"), i + 1)).collect();
-        assert_eq!(select(&t, params(2, 12)).len(), 12);
+        let t: Vec<(String, i64, u8)> = (0..20).map(|i| (format!("{i:02}"), i + 1, 0u8)).collect();
+        assert_eq!(select(&t, params(2, 12), &snap()).len(), 12);
     }
 
     #[test]
     fn floor_caps_at_present_count() {
         let t = toks(&[("a", 1), ("b", 2)]); // only 2 present, F would be 6
-        assert_eq!(select(&t, params(2, 12)), ["a", "b"]);
+        assert_eq!(select(&t, params(2, 12), &snap()), ["a", "b"]);
     }
 
     #[test]
     fn floor_clamps_when_m_exceeds_present_count() {
         // m=5 -> F=9, but only 2 tokens present: keep both, not 9.
         let t = toks(&[("a", 1), ("b", 2)]);
-        assert_eq!(select(&t, params(5, 12)).len(), 2);
+        assert_eq!(select(&t, params(5, 12), &snap()).len(), 2);
     }
 
     #[test]
@@ -160,14 +216,46 @@ mod tests {
         // A pathological `min_shared` near u32::MAX must not panic on the floor add
         // (debug overflow check); the floor just clamps to what is present.
         let t = toks(&[("a", 1), ("b", 2), ("c", 3)]);
-        let kept = select(&t, params(u32::MAX, 12));
+        let kept = select(&t, params(u32::MAX, 12), &snap());
         assert_eq!(kept, ["a", "b", "c"]); // clamped to present.len()
+    }
+
+    #[test]
+    fn df_budget_caps_sigma_df_but_never_drops_below_the_floor() {
+        // Rarest-first dfs 1,2,3,4,5,6,7,8; m=2 → floor F=6. With typo_damage 0 the floor is m=2.
+        let t = toks(&[("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5), ("f", 6)]);
+        let p = |budget: Option<u64>| SelectParams {
+            min_shared: 2,
+            typo_damage: 0,
+            t_max: 12,
+            df_budget: budget,
+        };
+        // No budget: all six present tokens kept (Σdf = 21).
+        assert_eq!(select(&t, p(None), &snap()).len(), 6);
+        // Budget 6 keeps the floor (a,b = Σdf 3) then c (Σdf 6); d would push Σdf to 10 > 6.
+        assert_eq!(select(&t, p(Some(6)), &snap()), ["a", "b", "c"]);
+        // A budget below the floor's own Σdf still keeps the whole floor (typo tolerance wins).
+        let floor3 = select(
+            &t,
+            SelectParams {
+                min_shared: 3,
+                typo_damage: 0,
+                t_max: 12,
+                df_budget: Some(1),
+            },
+            &snap(),
+        );
+        assert_eq!(
+            floor3,
+            ["a", "b", "c"],
+            "the floor (m=3) is kept despite the tiny budget"
+        );
     }
 
     #[test]
     fn absent_tokens_kept_uncharged_and_after_present() {
         let t = toks(&[("z", 0), ("a", 5), ("y", 0), ("b", 3)]);
-        let kept = select(&t, params(2, 12));
+        let kept = select(&t, params(2, 12), &snap());
         // present rarest-first: b(3), a(5); then absent in token order: y, z.
         assert_eq!(kept, ["b", "a", "y", "z"]);
     }
@@ -176,7 +264,10 @@ mod tests {
     fn batch_equals_serial_is_a_pure_function_of_this_querys_dfs() {
         // Identical inputs -> identical output, regardless of any external state.
         let t = toks(&[("a", 1), ("b", 2), ("c", 9)]);
-        assert_eq!(select(&t, params(2, 12)), select(&t, params(2, 12)));
+        assert_eq!(
+            select(&t, params(2, 12), &snap()),
+            select(&t, params(2, 12), &snap())
+        );
     }
 
     #[test]
@@ -189,6 +280,7 @@ mod tests {
                 typo_damage: 0,
                 ..params(3, 12)
             },
+            &snap(),
         );
         assert_eq!(kept, ["a", "b", "c"]);
     }
@@ -207,12 +299,35 @@ mod tests {
         ]);
         let mut prev = 0usize;
         for tm in [0usize, 6, 7, 8, 100] {
-            let n = select(&t, params(2, tm)).len();
+            let n = select(&t, params(2, tm), &snap()).len();
             assert!(
                 n >= prev,
                 "kept count must not shrink as t_max grows ({tm})"
             );
             prev = n;
         }
+    }
+
+    #[test]
+    fn class_normalized_rarity_reorders_across_classes() {
+        use crate::welford::ClassStats;
+        // Two classes with different DF regimes: class 1 ("dense", high DFs) and class 2
+        // ("sparse", low DFs). Populate both past the normalize floor.
+        let mut stats = ClassStats::new();
+        for df in 50..=200 {
+            stats.add_sample(1, df);
+        }
+        for df in 1..=60 {
+            stats.add_sample(2, df);
+        }
+        let cs = stats.snapshot_for([1u8, 2u8]);
+        // A df-40 token in the dense class is rarer-for-its-kind than a df-40 token in
+        // the sparse class, so it sorts first even though raw DF ties.
+        let t = vec![
+            ("sparse40".to_string(), 40i64, 2u8),
+            ("dense40".to_string(), 40i64, 1u8),
+        ];
+        let kept = select(&t, params(1, 2), &cs);
+        assert_eq!(kept, ["dense40", "sparse40"]);
     }
 }

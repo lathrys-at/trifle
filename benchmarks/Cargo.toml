@@ -20,9 +20,26 @@ serde_json = "1"
 tempfile = "3"
 # The work-done collector reads trifle's hot-path event fields.
 tracing = "0.1"
+# The overlap engine + CRoaring, benched directly on synthetic bitmaps by `bench` (no SQLite
+# in the loop), to measure the build/walk in isolation.
+trifle-overlap = { path = "../crates/trifle-overlap" }
+croaring = "2.6"
 
 [lints]
 workspace = true
+
+# Standalone workspace root. The benchmark crate is `exclude`d from the trifle workspace
+# (it is unpublished and adds no dependency to what downstream users compile), so building
+# it via its own manifest needs its own `[workspace]` table — otherwise cargo resolves the
+# parent workspace that excludes it and errors. The lint bar below mirrors the trifle
+# workspace's so the same `clippy::all` / `unsafe_op_in_unsafe_fn` deny gate applies here.
+[workspace]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
 
 [[bin]]
 name = "trifle-bench"

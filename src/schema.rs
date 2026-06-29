@@ -4,49 +4,74 @@
 //! All names come from a validated [`Namespace`], so interpolating them into DDL
 //! has no injection surface. The store is a rebuildable cache: a version mismatch
 //! drops everything rather than migrating.
+//!
+//! There is no `doc` table: the caller key lives directly on `seg` (one row per
+//! `(key, label)` segment; `seg.id` is the posting id), so a key with no segments cannot
+//! materialize a ghost row and provenance is a single-table point read.
 
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
+use crate::model::Schema;
 use crate::store::Namespace;
 
-/// trifle's on-disk format version. Bump on any incompatible schema change; an
-/// index stamped with a different value is reset on open.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+/// trifle's on-disk format version. Bump on any incompatible schema change; an index stamped
+/// with a different value is reset on open (the cache is rebuilt, never migrated).
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 
 pub(crate) const KEY_SCHEMA_VERSION: &str = "schema_version";
 pub(crate) const KEY_DATA_VERSION: &str = "data_version";
 pub(crate) const KEY_FINGERPRINT: &str = "tokenizer_fingerprint";
+pub(crate) const KEY_SCHEMA_FINGERPRINT: &str = "schema_fingerprint";
 pub(crate) const KEY_NEXT_ID: &str = "next_id";
+/// Rolling segment count (`N`: reported by `stats()`, the corpus size a custom score may
+/// use), maintained in the write transaction so a search reads it as an O(1) point lookup
+/// rather than an O(N) `count(*)`.
+pub(crate) const KEY_SEG_COUNT: &str = "seg_count";
+/// Rolling sum of per-segment gram lengths. `avgdl = seg_len_sum / seg_count`.
+pub(crate) const KEY_SEG_LEN_SUM: &str = "seg_len_sum";
+/// The dictionary generation (id-assignment epoch): bumped on every reassignment of
+/// term-ids (rebuild + reset). The read path compares the snapshot's value to the
+/// in-memory dictionary's loaded generation to detect a concurrent reassignment.
+pub(crate) const KEY_DICT_GENERATION: &str = "dict_generation";
 
 /// Create every persistent table and index if absent. Idempotent.
-pub(crate) fn create_tables(conn: &Connection, ns: &Namespace) -> Result<()> {
-    // `seg.txt` is NULL in contentless mode; `fwd` is populated only in contentless
-    // mode (the per-segment token set used by delete). The three-way write-frequency
-    // split — `term`/`delta` on every write, `post` only on fold/rebuild — is
-    // deliberate: a write never rewrites the big base posting.
+pub(crate) fn create_tables(conn: &Connection, ns: &Namespace, schema: &Schema) -> Result<()> {
+    let key_sql_type = schema.key_shape().sql_type();
+    // The flattened model: `seg` is the only document table — one row per `(key, label)`
+    // segment, `seg.id` is the roaring posting id, `seg.key` is the caller key (the one
+    // schema-typed column), `seg.txt` the stored text, `seg.len` its gram count.
+    // `fwd` holds every segment's term-id set (a roaring bitmap), so delete needs neither
+    // the text nor the tokenizer. Postings are keyed by the interned term-id from `dict`;
+    // the three-way write-frequency split — `term`/`delta` on every write, `post` only on
+    // fold/rebuild — keeps a write from rewriting the big base posting.
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {meta}(key TEXT PRIMARY KEY, value);
          CREATE TABLE IF NOT EXISTS {seg}(
-            id     INTEGER PRIMARY KEY,
-            doc_id INTEGER NOT NULL,
-            source TEXT    NOT NULL,
-            ref    TEXT    NOT NULL,
-            txt    TEXT
+            id    INTEGER PRIMARY KEY,
+            key   {keyty} NOT NULL,
+            label TEXT    NOT NULL,
+            txt   TEXT    NOT NULL,
+            len   INTEGER NOT NULL DEFAULT 0
          );
-         CREATE INDEX IF NOT EXISTS {seg}_by_doc ON {seg}(doc_id, source);
+         CREATE INDEX IF NOT EXISTS {seg}_by_key ON {seg}(key);
+         CREATE UNIQUE INDEX IF NOT EXISTS {seg}_by_key_label ON {seg}(key, label);
          CREATE TABLE IF NOT EXISTS {fwd}(id INTEGER PRIMARY KEY, tokens BLOB NOT NULL);
-         CREATE TABLE IF NOT EXISTS {term}(term TEXT PRIMARY KEY, df INTEGER NOT NULL);
-         CREATE TABLE IF NOT EXISTS {post}(term TEXT PRIMARY KEY, base BLOB NOT NULL);
+         CREATE TABLE IF NOT EXISTS {dict}(id INTEGER PRIMARY KEY, gram BLOB NOT NULL);
+         CREATE UNIQUE INDEX IF NOT EXISTS {dict}_by_gram ON {dict}(gram);
+         CREATE TABLE IF NOT EXISTS {term}(id INTEGER PRIMARY KEY, df INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS {post}(id INTEGER PRIMARY KEY, base BLOB NOT NULL);
          CREATE TABLE IF NOT EXISTS {delta}(
-            term TEXT PRIMARY KEY, added BLOB NOT NULL, removed BLOB NOT NULL
+            id INTEGER PRIMARY KEY, added BLOB NOT NULL, removed BLOB NOT NULL
          );",
         meta = ns.meta(),
         seg = ns.seg(),
         fwd = ns.fwd(),
+        dict = ns.dict(),
         term = ns.term(),
         post = ns.post(),
         delta = ns.delta(),
+        keyty = key_sql_type,
     );
     conn.execute_batch(&sql)?;
     Ok(())
@@ -55,14 +80,18 @@ pub(crate) fn create_tables(conn: &Connection, ns: &Namespace) -> Result<()> {
 /// Drop every persistent table and index (the version-mismatch / desync response).
 pub(crate) fn drop_persistent(conn: &Connection, ns: &Namespace) -> Result<()> {
     let sql = format!(
-        "DROP INDEX IF EXISTS {seg}_by_doc;
+        "DROP INDEX IF EXISTS {seg}_by_key;
+         DROP INDEX IF EXISTS {seg}_by_key_label;
+         DROP INDEX IF EXISTS {dict}_by_gram;
          DROP TABLE IF EXISTS {seg};
          DROP TABLE IF EXISTS {fwd};
+         DROP TABLE IF EXISTS {dict};
          DROP TABLE IF EXISTS {term};
          DROP TABLE IF EXISTS {post};
          DROP TABLE IF EXISTS {delta};",
         seg = ns.seg(),
         fwd = ns.fwd(),
+        dict = ns.dict(),
         term = ns.term(),
         post = ns.post(),
         delta = ns.delta(),
@@ -76,11 +105,13 @@ pub(crate) fn drop_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
     let sql = format!(
         "DROP TABLE IF EXISTS {seg};
          DROP TABLE IF EXISTS {fwd};
+         DROP TABLE IF EXISTS {dict};
          DROP TABLE IF EXISTS {term};
          DROP TABLE IF EXISTS {post};
          DROP TABLE IF EXISTS {delta};",
         seg = ns.seg_shadow(),
         fwd = ns.fwd_shadow(),
+        dict = ns.dict_shadow(),
         term = ns.term_shadow(),
         post = ns.post_shadow(),
         delta = ns.delta_shadow(),
@@ -90,47 +121,58 @@ pub(crate) fn drop_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
 }
 
 /// Create fresh, empty rebuild-shadow tables (dropping any leftovers first). No
-/// `seg`-by-doc index — it is recreated on the live table after the swap.
-pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
+/// `seg`/`dict` indexes — all are recreated on the live tables after the swap (the
+/// shadow bulk-inserts are dup-free, so the unique indexes are not needed during build).
+pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace, schema: &Schema) -> Result<()> {
     drop_shadows(conn, ns)?;
     let sql = format!(
         "CREATE TABLE {seg}(
-            id INTEGER PRIMARY KEY, doc_id INTEGER NOT NULL,
-            source TEXT NOT NULL, ref TEXT NOT NULL, txt TEXT
+            id INTEGER PRIMARY KEY, key {keyty} NOT NULL, label TEXT NOT NULL,
+            txt TEXT NOT NULL, len INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE {fwd}(id INTEGER PRIMARY KEY, tokens BLOB NOT NULL);
-         CREATE TABLE {term}(term TEXT PRIMARY KEY, df INTEGER NOT NULL);
-         CREATE TABLE {post}(term TEXT PRIMARY KEY, base BLOB NOT NULL);
-         CREATE TABLE {delta}(term TEXT PRIMARY KEY, added BLOB NOT NULL, removed BLOB NOT NULL);",
+         CREATE TABLE {dict}(id INTEGER PRIMARY KEY, gram BLOB NOT NULL);
+         CREATE TABLE {term}(id INTEGER PRIMARY KEY, df INTEGER NOT NULL);
+         CREATE TABLE {post}(id INTEGER PRIMARY KEY, base BLOB NOT NULL);
+         CREATE TABLE {delta}(id INTEGER PRIMARY KEY, added BLOB NOT NULL, removed BLOB NOT NULL);",
         seg = ns.seg_shadow(),
         fwd = ns.fwd_shadow(),
+        dict = ns.dict_shadow(),
         term = ns.term_shadow(),
         post = ns.post_shadow(),
         delta = ns.delta_shadow(),
+        keyty = schema.key_shape().sql_type(),
     );
     conn.execute_batch(&sql)?;
     Ok(())
 }
 
 /// Swap the freshly-built shadow tables in for the live ones in one transaction:
-/// drop live, rename each shadow to its live name, recreate the `seg`-by-doc index.
+/// drop live, rename each shadow to its live name, recreate the `seg`/`dict` indexes.
 /// A reader sees complete-old or complete-new — never partial.
-pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
+pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace, _schema: &Schema) -> Result<()> {
     let sql = format!(
-        "DROP INDEX IF EXISTS {seg}_by_doc;
+        "DROP INDEX IF EXISTS {seg}_by_key;
+         DROP INDEX IF EXISTS {seg}_by_key_label;
+         DROP INDEX IF EXISTS {dict}_by_gram;
          DROP TABLE IF EXISTS {seg};   ALTER TABLE {seg_s}   RENAME TO {seg};
          DROP TABLE IF EXISTS {fwd};   ALTER TABLE {fwd_s}   RENAME TO {fwd};
+         DROP TABLE IF EXISTS {dict};  ALTER TABLE {dict_s}  RENAME TO {dict};
          DROP TABLE IF EXISTS {term};  ALTER TABLE {term_s}  RENAME TO {term};
          DROP TABLE IF EXISTS {post};  ALTER TABLE {post_s}  RENAME TO {post};
          DROP TABLE IF EXISTS {delta}; ALTER TABLE {delta_s} RENAME TO {delta};
-         CREATE INDEX {seg}_by_doc ON {seg}(doc_id, source);",
+         CREATE INDEX {seg}_by_key ON {seg}(key);
+         CREATE UNIQUE INDEX {seg}_by_key_label ON {seg}(key, label);
+         CREATE UNIQUE INDEX {dict}_by_gram ON {dict}(gram);",
         seg = ns.seg(),
         fwd = ns.fwd(),
+        dict = ns.dict(),
         term = ns.term(),
         post = ns.post(),
         delta = ns.delta(),
         seg_s = ns.seg_shadow(),
         fwd_s = ns.fwd_shadow(),
+        dict_s = ns.dict_shadow(),
         term_s = ns.term_shadow(),
         post_s = ns.post_shadow(),
         delta_s = ns.delta_shadow(),
@@ -142,10 +184,48 @@ pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
 /// Reset the store to empty: drop persistent tables and any shadows, then recreate
 /// the persistent tables. Used when a version stamp mismatches or the id-allocation
 /// invariant is found broken at open.
-pub(crate) fn reset(conn: &Connection, ns: &Namespace) -> Result<()> {
+pub(crate) fn reset(conn: &Connection, ns: &Namespace, schema: &Schema) -> Result<()> {
     drop_shadows(conn, ns)?;
     drop_persistent(conn, ns)?;
-    create_tables(conn, ns)
+    create_tables(conn, ns, schema)?;
+    // `drop_persistent` keeps `meta`, so explicitly zero the rolling segment stats — the
+    // data tables are now empty.
+    set_seg_stats(conn, ns, 0, 0)
+}
+
+/// The `(seg_count, seg_len_sum)` rolling stats (absent → `0`). `seg_count` is the corpus
+/// size `N`; `avgdl = seg_len_sum / seg_count`.
+pub(crate) fn read_seg_stats(conn: &Connection, ns: &Namespace) -> Result<(i64, i64)> {
+    let count = meta_get(conn, ns, KEY_SEG_COUNT)?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let len_sum = meta_get(conn, ns, KEY_SEG_LEN_SUM)?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Ok((count, len_sum))
+}
+
+/// Set the rolling segment stats to absolute values (rebuild swap, reset).
+pub(crate) fn set_seg_stats(
+    conn: &Connection,
+    ns: &Namespace,
+    count: i64,
+    len_sum: i64,
+) -> Result<()> {
+    meta_set(conn, ns, KEY_SEG_COUNT, &count.to_string())?;
+    meta_set(conn, ns, KEY_SEG_LEN_SUM, &len_sum.to_string())
+}
+
+/// Apply `(count_delta, len_delta)` to the rolling segment stats (an incremental write).
+/// Runs inside the caller's transaction, so a `SAVEPOINT` rollback reverts it.
+pub(crate) fn bump_seg_stats(
+    conn: &Connection,
+    ns: &Namespace,
+    count_delta: i64,
+    len_delta: i64,
+) -> Result<()> {
+    let (count, len_sum) = read_seg_stats(conn, ns)?;
+    set_seg_stats(conn, ns, count + count_delta, len_sum + len_delta)
 }
 
 /// Read a meta value as a string.
@@ -167,12 +247,13 @@ pub(crate) fn meta_set(conn: &Connection, ns: &Namespace, key: &str, value: &str
     Ok(())
 }
 
-/// The three drift stamps, read together.
+/// The drift stamps, read together.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Stamps {
     pub schema_version: Option<u32>,
     pub data_version: Option<u64>,
     pub fingerprint: Option<u64>,
+    pub schema_fingerprint: Option<u64>,
 }
 
 /// Read the current drift stamps (any absent → `None`, treated as drift on open).
@@ -181,20 +262,30 @@ pub(crate) fn read_stamps(conn: &Connection, ns: &Namespace) -> Result<Stamps> {
         schema_version: meta_get(conn, ns, KEY_SCHEMA_VERSION)?.and_then(|s| s.parse().ok()),
         data_version: meta_get(conn, ns, KEY_DATA_VERSION)?.and_then(|s| s.parse().ok()),
         fingerprint: meta_get(conn, ns, KEY_FINGERPRINT)?.and_then(|s| s.parse().ok()),
+        schema_fingerprint: meta_get(conn, ns, KEY_SCHEMA_FINGERPRINT)?
+            .and_then(|s| s.parse().ok()),
     })
 }
 
-/// Stamp the current schema/data/tokenizer versions. Called after a reset and after
-/// a successful rebuild — the stamps describe what the index now reflects.
+/// Stamp the current schema/data/tokenizer/schema-fingerprint versions. Called after a
+/// reset and after a successful rebuild — the stamps describe what the index now
+/// reflects.
 pub(crate) fn write_stamps(
     conn: &Connection,
     ns: &Namespace,
     data_version: u64,
     fingerprint: u64,
+    schema_fingerprint: u64,
 ) -> Result<()> {
     meta_set(conn, ns, KEY_SCHEMA_VERSION, &SCHEMA_VERSION.to_string())?;
     meta_set(conn, ns, KEY_DATA_VERSION, &data_version.to_string())?;
     meta_set(conn, ns, KEY_FINGERPRINT, &fingerprint.to_string())?;
+    meta_set(
+        conn,
+        ns,
+        KEY_SCHEMA_FINGERPRINT,
+        &schema_fingerprint.to_string(),
+    )?;
     Ok(())
 }
 
@@ -226,14 +317,35 @@ pub(crate) fn set_next_id(conn: &Connection, ns: &Namespace, next_id: i64) -> Re
     meta_set(conn, ns, KEY_NEXT_ID, &next_id.to_string())
 }
 
+/// The current dictionary generation (term-id-assignment epoch). Absent → 0.
+pub(crate) fn dict_generation(conn: &Connection, ns: &Namespace) -> Result<u64> {
+    Ok(meta_get(conn, ns, KEY_DICT_GENERATION)?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0))
+}
+
+/// Bump the dictionary generation. Called whenever term-ids are reassigned — a
+/// [`rebuild`](crate::Index::rebuild)'s shadow swap or a drift/desync `reset` — so a
+/// reader can detect that the in-memory dictionary it resolved against no longer
+/// matches its SQLite snapshot. A plain incremental write does *not* bump it.
+pub(crate) fn bump_dict_generation(conn: &Connection, ns: &Namespace) -> Result<()> {
+    let next = dict_generation(conn, ns)?.wrapping_add(1);
+    meta_set(conn, ns, KEY_DICT_GENERATION, &next.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Schema;
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         rusqlite::vtab::array::load_module(&c).unwrap();
         c
+    }
+
+    fn schema() -> Schema {
+        Schema::flat()
     }
 
     fn count(conn: &Connection, table: &str) -> i64 {
@@ -245,8 +357,8 @@ mod tests {
     fn create_tables_is_idempotent() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
-        create_tables(&c, &ns).unwrap(); // second call must not error
+        create_tables(&c, &ns, &schema()).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap(); // second call must not error
         assert_eq!(count(&c, ns.seg()), 0);
     }
 
@@ -254,7 +366,7 @@ mod tests {
     fn meta_round_trips_and_missing_is_none() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         assert_eq!(meta_get(&c, &ns, "k").unwrap(), None);
         meta_set(&c, &ns, "k", "v1").unwrap();
         assert_eq!(meta_get(&c, &ns, "k").unwrap().as_deref(), Some("v1"));
@@ -266,19 +378,20 @@ mod tests {
     fn stamps_round_trip_including_u64_max() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
-        write_stamps(&c, &ns, u64::MAX, 0xDEAD_BEEF_CAFE_F00D).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
+        write_stamps(&c, &ns, u64::MAX, 0xDEAD_BEEF_CAFE_F00D, 0x1234_5678).unwrap();
         let s = read_stamps(&c, &ns).unwrap();
         assert_eq!(s.schema_version, Some(SCHEMA_VERSION));
         assert_eq!(s.data_version, Some(u64::MAX));
         assert_eq!(s.fingerprint, Some(0xDEAD_BEEF_CAFE_F00D));
+        assert_eq!(s.schema_fingerprint, Some(0x1234_5678));
     }
 
     #[test]
     fn read_stamps_on_fresh_store_is_all_none() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         assert_eq!(read_stamps(&c, &ns).unwrap(), Stamps::default());
     }
 
@@ -286,7 +399,7 @@ mod tests {
     fn alloc_ids_is_monotonic_and_never_reuses() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         assert_eq!(alloc_ids(&c, &ns, 3).unwrap(), 1); // [1,2,3]
         assert_eq!(alloc_ids(&c, &ns, 2).unwrap(), 4); // [4,5]
         assert_eq!(alloc_ids(&c, &ns, 1).unwrap(), 6); // [6]
@@ -298,13 +411,12 @@ mod tests {
     fn alloc_ids_overflow_is_a_clean_error_not_a_wrap() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         // Ids land in u32 roaring postings, so the ceiling is u32::MAX, not i64::MAX.
         set_next_id(&c, &ns, u32::MAX as i64).unwrap();
         // The last legal id, leaving next_id one past u32::MAX.
         assert_eq!(alloc_ids(&c, &ns, 1).unwrap(), u32::MAX as i64);
-        // A further allocation would mint an id that truncates in u32; it must error,
-        // never wrap to a reused id.
+        // A further allocation would mint an id that truncates in u32; it must error.
         assert!(matches!(
             alloc_ids(&c, &ns, 5),
             Err(crate::Error::Corrupt(_))
@@ -315,9 +427,7 @@ mod tests {
     fn set_next_id_rejects_marks_past_u32() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
-        // One past the last legal id (the "exhausted" high-water) is allowed; beyond it
-        // means an id that does not fit u32 was already in use.
+        create_tables(&c, &ns, &schema()).unwrap();
         assert!(set_next_id(&c, &ns, u32::MAX as i64 + 1).is_ok());
         assert!(set_next_id(&c, &ns, u32::MAX as i64 + 2).is_err());
     }
@@ -326,17 +436,17 @@ mod tests {
     fn reset_empties_data_but_keeps_meta() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         c.execute(
             &format!(
-                "INSERT INTO {}(id, doc_id, source, ref, txt) VALUES(1, 1, 's', 'r', 't')",
+                "INSERT INTO {}(id, key, label, txt) VALUES(1, 1, 'l', 't')",
                 ns.seg()
             ),
             [],
         )
         .unwrap();
         meta_set(&c, &ns, "keep", "yes").unwrap();
-        reset(&c, &ns).unwrap();
+        reset(&c, &ns, &schema()).unwrap();
         assert_eq!(count(&c, ns.seg()), 0);
         assert_eq!(meta_get(&c, &ns, "keep").unwrap().as_deref(), Some("yes"));
     }
@@ -345,26 +455,26 @@ mod tests {
     fn shadow_build_and_swap_replaces_live_atomically() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         // Live has one row; the shadow will carry a different one.
         c.execute(
             &format!(
-                "INSERT INTO {}(id, doc_id, source, ref, txt) VALUES(1, 1, 's', 'r', 'old')",
+                "INSERT INTO {}(id, key, label, txt) VALUES(1, 1, 'l', 'old')",
                 ns.seg()
             ),
             [],
         )
         .unwrap();
-        create_shadows(&c, &ns).unwrap();
+        create_shadows(&c, &ns, &schema()).unwrap();
         c.execute(
             &format!(
-                "INSERT INTO {}(id, doc_id, source, ref, txt) VALUES(9, 2, 's', 'r', 'new')",
+                "INSERT INTO {}(id, key, label, txt) VALUES(9, 2, 'l', 'new')",
                 ns.seg_shadow()
             ),
             [],
         )
         .unwrap();
-        swap_shadows(&c, &ns).unwrap();
+        swap_shadows(&c, &ns, &schema()).unwrap();
         // Live now reflects the shadow's content, and the index exists again.
         let (id, txt): (i64, String) = c
             .query_row(&format!("SELECT id, txt FROM {}", ns.seg()), [], |r| {
@@ -372,11 +482,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!((id, txt.as_str()), (9, "new"));
-        // The seg-by-doc index was recreated.
+        // The seg-by-key index was recreated.
         let idx: i64 = c
             .query_row(
                 &format!(
-                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='{}_by_doc'",
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='{}_by_key'",
                     ns.seg()
                 ),
                 [],
@@ -390,7 +500,7 @@ mod tests {
     fn drop_shadows_is_a_safe_noop_when_absent() {
         let c = conn();
         let ns = Namespace::bare();
-        create_tables(&c, &ns).unwrap();
+        create_tables(&c, &ns, &schema()).unwrap();
         drop_shadows(&c, &ns).unwrap(); // no shadows yet — must not error
     }
 }

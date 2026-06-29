@@ -1,5 +1,7 @@
 [workspace]
-members = ["benchmarks"]
+members = ["crates/trifle-overlap"]
+# `benchmarks/` is excluded until its harness is reworked against the streaming candidate API.
+exclude = ["benchmarks"]
 
 # Shared lint bar, inherited by every workspace member (incl. the benchmark crate).
 [workspace.lints.rust]
@@ -10,7 +12,7 @@ all = { level = "deny", priority = -1 }
 
 [package]
 name = "trifle"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Embedded, typo-tolerant trigram fuzzy search backed by SQLite, for large corpora of small documents."
@@ -40,16 +42,22 @@ tracing = ["dep:tracing"]
 # whole id list to one prepared `WHERE id IN rarray(?1)` statement (batched
 # provenance hydration), avoiding a temp btree on the page-cache mutex.
 rusqlite = { version = "0.37", features = ["bundled", "array"] }
-# The owned inverted index: one base+delta roaring posting per token.
-roaring = "0.11"
+# The IDF-weighted bit-sliced overlap engine (Layer 1): postings -> scored candidate ids.
+trifle-overlap = { path = "crates/trifle-overlap", version = "0.3.0" }
+# CRoaring (SIMD) bitmaps — the bitmap library EVERYWHERE: the owned inverted index
+# (one base+delta posting per token) AND the engine. The croaring portable format is
+# byte-identical to the old `roaring`-crate blobs, so storage needs no migration, and an
+# effective posting feeds the engine directly with no serialize-bridge. Permissive `^2.6`
+# (MSRV 1.85; 2.7+ needs Rust 1.95). See docs/design/rev-simplify/HANDOFF-integration.md.
+croaring = "2.6"
 # NFC/NFD normalization so canonically-equivalent forms match (configurable per
 # tokenizer; the default folds to NFC + lowercase).
 unicode-normalization = "0.1"
+# Unicode Script property: the script-segmented tokenizer splits text into maximal
+# same-script runs, and the term encoding derives a per-gram script tag from it.
+unicode-script = "0.5"
 thiserror = "2"
 tracing = { version = "0.1", optional = true }
-# SIMD substring search for the default ranker's literal-verification tier: a
-# `memmem::Finder` built once per query, reused across every candidate's text.
-memchr = "2"
 
 [dev-dependencies]
 tempfile = "3"

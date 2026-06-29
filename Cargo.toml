@@ -43,7 +43,7 @@ tracing = ["dep:tracing"]
 # provenance hydration), avoiding a temp btree on the page-cache mutex.
 rusqlite = { version = "0.37", features = ["bundled", "array"] }
 # The IDF-weighted bit-sliced overlap engine (Layer 1): postings -> scored candidate ids.
-trifle-overlap = { path = "crates/trifle-overlap" }
+trifle-overlap = { path = "crates/trifle-overlap", version = "0.3.0" }
 # CRoaring (SIMD) bitmaps — the bitmap library EVERYWHERE: the owned inverted index
 # (one base+delta posting per token) AND the engine. The croaring portable format is
 # byte-identical to the old `roaring`-crate blobs, so storage needs no migration, and an

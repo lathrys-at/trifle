@@ -448,11 +448,10 @@ pub(crate) fn candidates<'a, T: Tokenizer>(
             return Err(e);
         }
     };
-    // N / avgdl come from the plan (computed once in `prepare` from this snapshot's rolling
-    // counters); a corpus-relative custom score must not cross a snapshot boundary.
-    let n_segments = plan.n_segments;
-    let avgdl = plan.avgdl;
     let walk = plan.counter.walk();
+    // N / avgdl live on the plan (computed once in `prepare` from this snapshot's rolling
+    // counters); the accessors read them from there. A corpus-relative custom score must not
+    // cross a snapshot boundary.
     Ok(CandidateStream {
         index,
         conn,
@@ -461,8 +460,6 @@ pub(crate) fn candidates<'a, T: Tokenizer>(
         filter: opts.filter,
         ready: VecDeque::new(),
         seen: FxHashSet::default(),
-        n_segments,
-        avgdl,
         done: false,
         errored: false,
     })
@@ -484,8 +481,6 @@ pub struct CandidateStream<'a, T: Tokenizer> {
     filter: Option<SqlFilter<'a>>,
     ready: VecDeque<Candidate>,
     seen: FxHashSet<Key>,
-    n_segments: u64,
-    avgdl: f64,
     done: bool,
     errored: bool,
 }
@@ -493,11 +488,11 @@ pub struct CandidateStream<'a, T: Tokenizer> {
 impl<T: Tokenizer> CandidateStream<'_, T> {
     /// Total live segments `N`, from **this search's** snapshot (not `stats()`).
     pub fn n_segments(&self) -> u64 {
-        self.n_segments
+        self.plan.n_segments
     }
     /// Mean segment gram length (`avgdl`) on this snapshot. `0.0` on an empty corpus.
     pub fn avgdl(&self) -> f64 {
-        self.avgdl
+        self.plan.avgdl
     }
     /// The selected tokens that have a posting, each with its document frequency `df` (no SQL —
     /// the postings are already in hand).

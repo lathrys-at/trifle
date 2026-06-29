@@ -36,6 +36,43 @@ fn is_empty(idx: &Index<DefaultTokenizer>, query: &str) -> bool {
         .is_empty()
 }
 
+/// The distinct gram count of `text` under the live default tokenizer (the derivation §0/§6
+/// `L_d`, the same quantity `seg.len` stores).
+fn distinct_gram_count(text: &str) -> i64 {
+    use std::collections::HashSet;
+    DefaultTokenizer::new()
+        .tokenize(text)
+        .collect::<HashSet<_>>()
+        .len() as i64
+}
+
+/// Read a meta counter as an `i64` straight from the file (independent of the code under test).
+fn raw_meta_i64(path: &Path, key: &str) -> i64 {
+    let raw = trifle::rusqlite::Connection::open(path).unwrap();
+    raw.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+        r.get::<_, String>(0)
+    })
+    .unwrap()
+    .parse()
+    .unwrap()
+}
+
+/// Read a segment's stored `len` column straight from the file.
+fn raw_seg_len(path: &Path, key: i64) -> i64 {
+    let raw = trifle::rusqlite::Connection::open(path).unwrap();
+    raw.query_row("SELECT len FROM seg WHERE key = ?1", [key], |r| r.get(0))
+        .unwrap()
+}
+
+/// `avgdl` on the index's current snapshot, via a throwaway candidate stream (the only public
+/// surface that exposes it). The query is irrelevant — `avgdl` is corpus-wide.
+fn avgdl_of(idx: &Index<DefaultTokenizer>) -> f64 {
+    let reader = idx.reader().unwrap();
+    let opts = SearchOpts::new();
+    let stream = reader.candidates("zzz", &opts).unwrap();
+    stream.avgdl()
+}
+
 #[test]
 fn reopen_with_same_versions_is_warm() {
     let h = Harness::with_config(Config::new(7));
@@ -128,29 +165,124 @@ fn an_old_schema_version_stamp_resets_the_cache() {
 
 #[test]
 fn stored_seg_len_is_the_distinct_gram_count() {
-    use std::collections::HashSet;
-
     // A text with repeated grams (so distinct ≠ with-repetition) locks the v0.4 `seg.len`
-    // redefinition: the stored length must be `L_d`, the distinct gram count (derivation §0/§6).
+    // redefinition: the *incremental upsert* path must store `L_d`, the distinct gram count
+    // (derivation §0/§6).
     let h = Harness::new();
     let text = "the the the quick brown fox";
     h.put(1, "body", text);
     let path = h.db_path();
 
-    let tok = DefaultTokenizer::new();
-    let expected = tok.tokenize(text).collect::<HashSet<_>>().len() as i64;
-
-    // Read the stored length straight from the file, independent of the code under test.
-    let raw = trifle::rusqlite::Connection::open(&path).unwrap();
-    let stored: i64 = raw
-        .query_row("SELECT len FROM seg WHERE key = 1", [], |r| r.get(0))
-        .unwrap();
-    drop(raw);
-
     assert_eq!(
-        stored, expected,
+        raw_seg_len(&path, 1),
+        distinct_gram_count(text),
         "seg.len must store the DISTINCT gram count L_d (§0/§6), not the with-repetition count"
     );
+    drop(h.dir);
+}
+
+#[test]
+fn rebuild_stores_distinct_seg_len_and_agrees_with_upsert() {
+    // The `rebuild()` path is a separate code path from incremental upsert (and M5 rewrites it),
+    // so pin it to the same definition: a rebuilt segment's stored `seg.len` is the distinct gram
+    // count `L_d`, and the rolling `seg_len_sum` agrees with it. (The upsert path is pinned by
+    // `stored_seg_len_is_the_distinct_gram_count`, so matching `L_d` here means the two agree.)
+    let text = "the the the quick brown fox";
+    let h = Harness::new();
+    h.index
+        .rebuild(std::iter::once(trifle::Document::new(
+            1,
+            vec![("body".to_string(), text.to_string())],
+        )))
+        .unwrap();
+    let path = h.db_path();
+
+    let distinct = distinct_gram_count(text);
+    assert_eq!(
+        raw_seg_len(&path, 1),
+        distinct,
+        "rebuild stores the distinct seg.len (L_d)"
+    );
+    assert_eq!(
+        raw_meta_i64(&path, "seg_len_sum"),
+        distinct,
+        "seg_len_sum agrees with the single rebuilt segment's distinct gram count"
+    );
+    drop(h.dir);
+}
+
+#[test]
+fn upsert_and_rebuild_agree_on_n_and_avgdl() {
+    // The same corpus built two ways (incremental upsert vs `rebuild()`) must yield identical N
+    // and avgdl — the highest-value guard against the two paths diverging on "which op ran last".
+    // The 1-char segment produces zero grams and must still count toward N (its L_d is 0).
+    let corpus: &[(i64, &str)] = &[
+        (1, "the quick brown fox"),
+        (2, "a"), // 1 char → no trigram → distinct gram count 0
+        (3, "the the the lazy dog"),
+    ];
+
+    let inc = Harness::new();
+    {
+        let mut w = inc.index.writer().unwrap();
+        for (k, t) in corpus {
+            w.upsert(*k, &[("body", *t)]).unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    let reb = Harness::new();
+    reb.index
+        .rebuild(
+            corpus.iter().map(|(k, t)| {
+                trifle::Document::new(*k, vec![("body".to_string(), (*t).to_string())])
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(
+        inc.index.stats().unwrap().segments,
+        3,
+        "the zero-gram segment still counts toward N"
+    );
+    assert_eq!(
+        inc.index.stats().unwrap().segments,
+        reb.index.stats().unwrap().segments,
+        "upsert and rebuild agree on N"
+    );
+    let a_inc = avgdl_of(&inc.index);
+    let a_reb = avgdl_of(&reb.index);
+    assert_eq!(a_inc, a_reb, "upsert and rebuild agree on avgdl");
+    assert!(a_inc > 0.0, "avgdl is positive for a non-empty corpus");
+    drop(inc.dir);
+    drop(reb.dir);
+}
+
+#[test]
+fn empty_corpus_avgdl_is_zero_no_div_by_zero() {
+    let h = Harness::new();
+    assert_eq!(h.index.stats().unwrap().segments, 0);
+    assert_eq!(
+        avgdl_of(&h.index),
+        0.0,
+        "an empty corpus reports avgdl 0.0 (the seg_count > 0 guard avoids a div-by-zero)"
+    );
+    drop(h.dir);
+}
+
+#[test]
+fn drop_then_readd_restores_avgdl() {
+    // remove(key) then re-upsert the identical text must restore avgdl exactly (the rolling
+    // seg_len_sum / seg_count counters back out and re-add the same amounts).
+    let h = Harness::new();
+    load_fixture(&h);
+    let before = avgdl_of(&h.index);
+
+    h.remove(1);
+    h.put(1, "body", FIXTURE[0].1);
+    let after = avgdl_of(&h.index);
+
+    assert_eq!(before, after, "remove + re-upsert restores avgdl exactly");
     drop(h.dir);
 }
 

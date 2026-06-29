@@ -24,7 +24,7 @@ Throughout, logs are natural (nats), scoring is "more is better" so energy is *a
 | $\beta,\ Z$ | inverse temperature; partition function (Boltzmann form, §1) |
 | $Q$ | the (deduplicated) set of query grams |
 | $P \subseteq Q$ | the pruned set actually scored |
-| $r$ | reliability: probability a relevant document matches a real query gram — a per-channel corpus constant ($\sigma$ query-side, $\rho$ doc-side) |
+| $r$ | reliability: probability a relevant document matches a real query gram — a corpus constant per channel ($\sigma$ query-side; $\rho$ doc-side, itself per gram order $n$) |
 | $\sigma,\ \rho,\ \varepsilon$ | query-side / doc-side reliabilities and the doc-side per-character error rate, with $\rho = \sigma\,(1-\varepsilon)^n$ (topicality $\sigma$ × corruption-survival); $\rho < \sigma$ always — the doc-side channel carries the *same* topicality $\sigma$ as the query side, then multiplies in corruption |
 | $\mu = \max(0,\operatorname{logit} r)$ | count credit — nats per matched, non-floored gram |
 | $L_d,\ \bar L$ | distinct gram count of segment $d$; its corpus mean |
@@ -191,7 +191,7 @@ The accumulator weights are quantized to small non-negative integers, $\tilde w_
 
 $$\sum_{g\in P\cap d}(E_g + \mu) = \underbrace{\sum_{g\in P\cap d} E_g}_{\text{bit-sliced}} + \mu\cdot\underbrace{|P\cap d|}_{\text{popcount}},$$
 
-only the energy part is bit-sliced. The plane count is then at most $\lceil\log_2(E_{\max}/\Delta)\rceil$ — independent of $\mu$, and in practice the exact bit-width of the realized maximum weight — and the count credit is added in the post-pass as $\mu$ times a popcount of matched (non-floored) grams, the same quantity the engine's overlap mechanism already produces. This keeps the hot loop narrow and makes the count credit free to be zero or signed.
+only the energy part is bit-sliced. The plane count is then at most $\lceil\log_2(E_{\max}/\Delta + 1)\rceil$ — independent of $\mu$, and in practice the exact bit-width of the realized maximum weight — and the count credit is added in the post-pass as $\mu$ times a popcount of matched (non-floored) grams, the same quantity the engine's overlap mechanism already produces. This keeps the hot loop narrow and makes the count credit free to be zero or signed.
 
 Two corners need pinning. The plane count is floored at 1 (an all-common query whose grams all quantize to zero would otherwise request zero planes), and the post-pass iterates the **union** of the bit-sliced candidates and the popcount candidates — so a segment that matched only zero-weight (clamped) grams still receives its count-and-length score rather than vanishing. The result is that a query with no rarity discrimination degrades gracefully to a count-and-length ranking instead of returning empty. (One precondition: a segment matching *only floored* grams is recovered through the bit-sliced side, since floored grams are excluded from the popcount; this holds only if the quantization is fine enough to keep their weight nonzero, $\Delta < 2E_{\text{floored}}$ (the realized floored-gram energy, marginally below $E_{\max}$). A coarser step would zero them out and drop such segments.)
 
@@ -287,9 +287,10 @@ score_query(query, channel):
     # Tokenize into grams tagged with script + order; a mixed-script query yields several orders. Word
     # boundaries come from whitespace + delimiter punctuation, which ALSO break gram windows so no gram
     # straddles two words (Section 8/4). RANK-VIEWS, not absolute orders: grams_at_rank(PRIMARY) pools every
-    # script's primary-order grams (cross-script disjoint); grams_at_rank(SECONDARY) pools each script's
-    # one-shorter order (Latin bigram, CJK unigram). The shortest order doubles as the structural fallback.
-    rank_views = needs_secondary(richness_estimate) ? [PRIMARY, SECONDARY] : [PRIMARY]
+    # script's primary-order grams (cross-script disjoint); grams_at_rank(SECONDARY) pools the one-shorter
+    # order (Latin bigram, CJK unigram) of each STARVED script only -- a PER-SCRIPT gate (Section 8): a rich
+    # script omits its secondary. The shortest order doubles as the structural fallback.
+    rank_views = any_present_script_starved(query) ? [PRIMARY, SECONDARY] : [PRIMARY]   # SECONDARY runs if ANY present script is starved
     while rank_views and not any(any(lookup_df(g) > 0 for g in grams_at_rank(rv)) for rv in rank_views):
         rank_views = (rank_views == [PRIMARY]) ? [SECONDARY] : []    # structural fallback to the shorter rank, only when EVERY
         #                                                              #   rank-view lacks an in-corpus (df>0) gram (test df>0, not raw presence)
@@ -299,10 +300,10 @@ score_query(query, channel):
         Q = [g for g in grams_at_rank(rv) if lookup_df(g) > 0]       # pool each script's grams at this rank; drop df=0 artifacts
         if not Q: continue                                          # this rank-view is empty -> skip it, never abort the query (Section 8)
         for g in Q:
-            g.df = lookup_df(g);  g.E = energy(g.df, channel, N)     # GLOBAL energy (n-independent), the honest log-odds (Section 2)
+            g.df = lookup_df(g);  g.E = energy(g.df, channel, N)     # GLOBAL energy (n-independent), the log-odds (Section 2)
             g.script = script_of(g);  g.n = order_of(g)              # selection class = the (script, order) pair (CJK 2/1, else 3/2)
             g.r  = (channel == DOC_SIDE) ? SIGMA * (1 - eps)**g.n : SIGMA   # PER-GRAM reliability: topicality SIGMA x per-order survival
-            g.floored = (g.df <= df_min)
+            g.floored = (channel == QUERY_SIDE) and (g.df <= df_min)   # query-side only; doc-side has no floor (Section 4) so every gram keeps its credit
             g.word = query_word_of(g)                                # comonotone-block id = g's query word (one script run -> single order/r per block)
 
         # pruning: CLASS-NORMALIZED rarest-first (z-score of df within (script,order)); per-class floor, then

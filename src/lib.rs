@@ -174,9 +174,11 @@ pub struct SearchOpts<'a> {
     /// typo floor is always kept. `None` (the default) = no cap. This is the derivation's work
     /// budget `C` (the cap on `Σdf` over the pruned set, derivation §5/§7).
     pub df_budget: Option<u64>,
-    /// `D` — df-doublings per IDF weight step in the overlap counter. `1.0` (the default) means
-    /// each weight level is one more halving of df relative to the query's commonest survivor.
-    /// `N`-invariant. [`Stats::weight_step_hint`] suggests a corpus-fitted value.
+    /// `D` — df-doublings per IDF weight step. `1.0` is the default. **As of v0.4/M1 this no longer
+    /// reaches the overlap counter** — the v0.3 4-tier df-rarity weighting it tuned was replaced by
+    /// the `N`-anchored logit-idf energy planes (knob `Δ`/[`delta`](SearchOpts::delta)). It now only
+    /// feeds the band-spread [`Stats::weight_step_hint`] telemetry, so setting it no longer affects
+    /// ranking.
     pub weight_step: f64,
     /// `ν` — corroboration depth (derivation §4): sets the contamination floor
     /// `df_min = N^((ν−1)/ν)` and the single-gram energy ceiling `E_max = (1/ν)·ln N`. `None` →
@@ -186,7 +188,10 @@ pub struct SearchOpts<'a> {
     /// `None` → `0.5`. Consumed by the logit-idf energy weighting (derivation §2/§4).
     pub kappa: Option<f64>,
     /// `Δ` — the energy quantization step, in nats, for the bit-sliced energy weights (derivation
-    /// §7). `None` → `0.5`. Consumed by the logit-idf energy weighting (derivation §7).
+    /// §7). `None` → `0.5`. Consumed by the logit-idf energy weighting (derivation §7). Keep it
+    /// sane: work scales as `~1/Δ` (the engine's plane count, `max_score`, and reachability array
+    /// all grow with `E_max/Δ`), so a pathologically tiny `Δ` is a memory / `u32`-overflow hazard.
+    /// A non-finite, zero, or negative value falls back to the `0.5` default.
     pub delta: Option<f64>,
     /// `σ` — query-side reliability / topicality, driving the count credit `μ = logit r`
     /// (derivation §3). `None` → `0.9`. *v0.4 M0 scaffolding — declared, not yet consumed by

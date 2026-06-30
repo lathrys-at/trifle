@@ -140,8 +140,9 @@ fn df_min(n: f64, nu: f64) -> f64 {
 }
 
 /// Single-gram energy ceiling `E_max = (1/ν)·ln N` (derivation §4): no single gram can identify a
-/// segment alone, so at least `ν` matched grams must agree. Used as the plane-count bound
-/// (`⌈log2(E_max/Δ + 1)⌉`, §7) and as the upper bound on a floored gram's realized energy
+/// segment alone, so at least `ν` matched grams must agree. Bounds a *single* gram's quantized
+/// weight bit-width by `⌈log2(E_max/Δ + 1)⌉` (§7) — not the accumulator's plane count, which the
+/// engine sizes to `bits(Σ wq)`. Also the upper bound on a floored gram's realized energy
 /// (`E_floored ≤ E_max`). `0` for `N ≤ 1` (no discrimination possible).
 fn e_max(n: f64, nu: f64) -> f64 {
     if n <= 1.0 || nu <= 0.0 {
@@ -150,12 +151,14 @@ fn e_max(n: f64, nu: f64) -> f64 {
     n.ln() / nu
 }
 
-/// Per-gram query-side energy `E_g = ln((N − df_eff − κ)/(df_eff + κ))` — the RSJ logit-idf of the
-/// Jeffreys-smoothed, contamination-floored estimate (derivation §2/§4), with
-/// `df_eff = max(df, df_min)`. Negative for `p_eff > 0.5` (clamped to `0` at quantization); returns
-/// `−∞` for a gram present in (nearly) every segment, which [`quantize_energy`] maps to weight `0`.
-fn energy(df: f64, n: f64, nu: f64, kappa: f64) -> f64 {
-    let df_eff = df.max(df_min(n, nu));
+/// Per-gram query-side energy with a **precomputed** contamination floor — the hot-path form, so a
+/// per-query loop never recomputes the `df_min` `powf` (it is `N`/`ν`-constant across the batch).
+/// `E_g = ln((N − df_eff − κ)/(df_eff + κ))`, the RSJ logit-idf of the Jeffreys-smoothed, floored
+/// estimate (derivation §2/§4), with `df_eff = max(df, df_min)`. Negative for `p_eff > 0.5`
+/// (clamped to `0` at quantization); returns `−∞` for a gram present in (nearly) every segment,
+/// which [`quantize_energy`] maps to weight `0`.
+fn energy_with_floor(df: f64, df_min: f64, n: f64, kappa: f64) -> f64 {
+    let df_eff = df.max(df_min);
     let num = n - df_eff - kappa;
     let den = df_eff + kappa;
     if num <= 0.0 || den <= 0.0 {
@@ -164,11 +167,19 @@ fn energy(df: f64, n: f64, nu: f64, kappa: f64) -> f64 {
     (num / den).ln()
 }
 
+/// Per-gram query-side energy (derivation §2/§4) — the convenience form that derives the floor
+/// `df_min(N, ν)` itself; see [`energy_with_floor`] for the hoisted hot-path variant.
+fn energy(df: f64, n: f64, nu: f64, kappa: f64) -> f64 {
+    energy_with_floor(df, df_min(n, nu), n, kappa)
+}
+
 /// Realized floored-gram energy `E_floored = ln((N − df_min − κ)/(df_min + κ)) ≤ E_max` — the
 /// energy every floored (`df ≤ df_min`) gram carries (derivation §4/§7). The §7 quantization guard
 /// `Δ < 2·E_floored` keeps `round(E_floored/Δ) ≥ 1`, so a floored gram never quantizes to `0`. For
 /// a tiny corpus this is small or negative — see [`prepare`]'s guard.
 fn e_floored(n: f64, nu: f64, kappa: f64) -> f64 {
+    // Routes through `energy` (computing `df_min` for both the `df` argument and the floor) so the
+    // convenience wrapper stays exercised; called once per batch, so the extra `powf` is free.
     energy(df_min(n, nu), n, nu, kappa)
 }
 
@@ -214,13 +225,33 @@ fn prepare<T: Tokenizer>(
 
     let min_shared = opts.min_shared.unwrap_or(DEFAULT_MIN_SHARED).max(1);
     // v0.4 energy-weighting knobs (derivation §4/§7), resolved once for the whole batch so every
-    // query sees the same `ν/κ/Δ` (batch == serial). `Δ` is forced positive (it divides the
-    // energy at quantization).
+    // query sees the same `ν/κ/Δ` (batch == serial). All three are sanitized to their domains and
+    // fall back to the defaults on a degenerate value (recall-safe), because they are reachable via
+    // the public `SearchOpts` builders and feed `powf`/`ln`/divisions plus the debug guards below:
+    // `ν ≥ 1` (corroboration depth; `E_max = (1/ν)·ln N` is sensible only for `ν ≥ 1`), `κ ≥ 0`,
+    // and a finite `Δ > 0`. The `.is_finite()` checks also reject `NaN` and `+∞` (the latter would
+    // slip a bare `d > 0.0`). Note work scales as `~1/Δ`: the engine's plane count, `max_score`,
+    // and reachability array all grow with `E_max/Δ`, so a pathologically tiny `Δ` is a
+    // memory/`u32`-overflow hazard — the default `0.5` keeps this bounded; no hard lower clamp.
     let nu = opts.nu.unwrap_or(DEFAULT_NU);
+    let nu = if nu.is_finite() && nu >= 1.0 {
+        nu
+    } else {
+        DEFAULT_NU
+    };
     let kappa = opts.kappa.unwrap_or(DEFAULT_KAPPA);
+    let kappa = if kappa.is_finite() && kappa >= 0.0 {
+        kappa
+    } else {
+        DEFAULT_KAPPA
+    };
     let delta = {
         let d = opts.delta.unwrap_or(DEFAULT_DELTA);
-        if d > 0.0 { d } else { DEFAULT_DELTA }
+        if d.is_finite() && d > 0.0 {
+            d
+        } else {
+            DEFAULT_DELTA
+        }
     };
     let sel_params = SelectParams {
         min_shared,
@@ -300,9 +331,13 @@ fn prepare<T: Tokenizer>(
     );
     // Flatness ceiling (derivation §4/§7): every gram's energy is `≤ E_max` (the floored grams sit
     // at `E_floored ≤ E_max`, the rest below), so every quantized weight is `≤ ⌊E_max/Δ⌉`. This
-    // bound depends only on the weight range (`E_max/Δ`), never on `N` — the plane count the engine
-    // builds is therefore cardinality-independent. Asserted per query below.
+    // bound depends on `N` only through `E_max/Δ ~ (ln N)/(ν·Δ)` — i.e. the per-gram weight needs
+    // `~log log N` planes — and never on the posting cardinalities, so the engine's op count stays
+    // cardinality-independent (the flatness property). Asserted per query below.
     let wq_ceiling = quantize_energy(e_max(n_segments as f64, nu), delta);
+    // The contamination floor is `N`/`ν`-constant, so compute it once for the whole batch and
+    // thread it into the per-gram energy (no `powf` per gram); reinforces `batch == serial`.
+    let df_min_batch = df_min(n_segments as f64, nu);
 
     let mut plans = Vec::with_capacity(queries.len());
     for selected in &selected_per {
@@ -332,16 +367,28 @@ fn prepare<T: Tokenizer>(
         // v0.4 §2/§4/§7: quantized logit-idf energy weights (`N`-anchored, computed here since the
         // engine is `N`-free), fed as explicit per-posting weights — replacing v0.3's `N`-free
         // df-rarity tiers (`opts.weight_step`). `present_dfs[i]` is the cardinality of
-        // `present_postings[i]`, so the weights stay parallel to the postings.
+        // `present_postings[i]`, so the weights stay parallel to the postings; the batch-cached
+        // `df_min_batch` keeps the floor `powf` out of this per-gram map.
         let weights: Vec<u32> = present_dfs
             .iter()
-            .map(|&df| quantize_energy(energy(df as f64, n_segments as f64, nu, kappa), delta))
+            .map(|&df| {
+                quantize_energy(
+                    energy_with_floor(df as f64, df_min_batch, n_segments as f64, kappa),
+                    delta,
+                )
+            })
             .collect();
         debug_assert!(
             weights.iter().all(|&w| w <= wq_ceiling),
-            "energy weight exceeds the N-independent E_max ceiling ⌊E_max/Δ⌉={wq_ceiling}: \
+            "energy weight exceeds the cardinality-independent E_max ceiling ⌊E_max/Δ⌉={wq_ceiling}: \
              flatness bound violated"
         );
+        // Perf note (M1): unlike v0.3's `N`-free tiers, these are *absolute* energies, so a selected
+        // rare gram does not quantize to 1 — the engine's all-weight-1 fast path (overlap = score,
+        // no posting retention, no per-candidate `contains`) therefore stops firing for mixed/uniform
+        // queries, costing a bounded constant factor (k posting clones + k `contains` per yielded
+        // candidate, k ≤ t_max). Flatness still holds (`O(k)`, k bounded by selection); recovering
+        // the fast path is deferred to M3's walk reshape, not patched here.
         let counter = Counter::build_weighted(&present_postings, weights, min_shared);
         plans.push(QueryPlan {
             counter,
@@ -707,11 +754,12 @@ impl<T: Tokenizer> Drop for CandidateStream<'_, T> {
 #[cfg(test)]
 mod energy_tests {
     //! Numerical fixtures for the v0.4 logit-idf energy weighting (derivation §2, §4, §7): the
-    //! energy/floor/ceiling values by hand, the `E_floored ≤ E_max` relation, the plane-count
-    //! bound, and the `Δ < 2·E_floored` guard including its small-N edge.
+    //! energy/floor/ceiling values by hand, the `E_floored ≤ E_max` relation, energy monotonicity
+    //! and the floor-boundary plateau, the single-gram weight bit-width bound, and the
+    //! `Δ < 2·E_floored` guard including its small-N edge.
     use super::{
         DEFAULT_DELTA, DEFAULT_KAPPA, DEFAULT_NU, GUARD_MIN_E_FLOORED, df_min, e_floored, e_max,
-        energy, quantize_energy,
+        energy, energy_with_floor, quantize_energy,
     };
 
     const NU: f64 = DEFAULT_NU; // 2.0
@@ -757,7 +805,16 @@ mod energy_tests {
 
     #[test]
     fn e_floored_is_positive_and_at_or_below_e_max_on_a_real_corpus() {
-        for &n in &[100.0, 1_000.0, 10_000.0, 1_000_000.0] {
+        for &n in &[
+            50.0,
+            100.0,
+            500.0,
+            1_000.0,
+            5_000.0,
+            10_000.0,
+            100_000.0,
+            1_000_000.0,
+        ] {
             let ef = e_floored(n, NU, KAPPA);
             let em = e_max(n, NU);
             assert!(
@@ -766,6 +823,47 @@ mod energy_tests {
             );
             assert!(ef <= em + 1e-9, "E_floored {ef} ≤ E_max {em} at N={n}");
         }
+    }
+
+    #[test]
+    fn energy_wrapper_matches_explicit_floor() {
+        // The hot-path `energy_with_floor` (precomputed floor) agrees with the convenience `energy`.
+        let n = 100_000.0;
+        let dm = df_min(n, NU);
+        for &df in &[1.0, 50.0, 316.0, 1_000.0, 50_000.0, 99_999.0] {
+            approx(
+                energy(df, n, NU, KAPPA),
+                energy_with_floor(df, dm, n, KAPPA),
+            );
+        }
+    }
+
+    #[test]
+    fn energy_is_monotone_decreasing_in_df_above_the_floor() {
+        let n = 100_000.0;
+        let dm = df_min(n, NU); // ≈ 316.2
+        let mut prev = f64::INFINITY;
+        for &df in &[400.0, 1_000.0, 5_000.0, 20_000.0, 49_000.0] {
+            assert!(df > dm, "df {df} above the floor {dm}");
+            let e = energy(df, n, NU, KAPPA);
+            assert!(
+                e < prev,
+                "energy strictly decreases as df grows: {e} < {prev}"
+            );
+            prev = e;
+        }
+    }
+
+    #[test]
+    fn floor_boundary_is_a_plateau_then_strictly_below() {
+        let n = 10_000.0; // df_min = 100
+        let dm = df_min(n, NU);
+        // At and below the floor, energy plateaus at E_floored.
+        approx(energy(dm, n, NU, KAPPA), e_floored(n, NU, KAPPA));
+        approx(energy(dm * 0.5, n, NU, KAPPA), e_floored(n, NU, KAPPA));
+        approx(energy(1.0, n, NU, KAPPA), e_floored(n, NU, KAPPA));
+        // Strictly above the floor, energy drops strictly below E_floored.
+        assert!(energy(dm + 1.0, n, NU, KAPPA) < e_floored(n, NU, KAPPA));
     }
 
     #[test]
@@ -780,11 +878,12 @@ mod energy_tests {
     }
 
     #[test]
-    fn plane_count_bound_holds() {
-        // §7: a single gram's weight fits in ⌈log2(E_max/Δ + 1)⌉ planes, and the realized max
-        // weight is the floored-gram weight (E_floored ≤ E_max), so its bit width respects that
-        // bound — independent of N's magnitude (flatness: the plane count tracks the weight range,
-        // not the corpus size).
+    fn single_gram_weight_bit_width_bound_holds() {
+        // §7: a SINGLE gram's quantized weight fits in ⌈log2(E_max/Δ + 1)⌉ bits — this bounds the
+        // per-gram weight, NOT the accumulator's plane count (the engine sizes that to bits(Σ wq) =
+        // max_score). The realized max single weight is the floored-gram weight (E_floored ≤ E_max),
+        // so its bit width respects the bound and grows only as ~log2((ln N)/(νΔ)) — never with the
+        // posting cardinalities.
         for &n in &[1_000.0, 10_000.0, 1_000_000.0] {
             let bound = ((e_max(n, NU) / DELTA) + 1.0).log2().ceil() as u32;
             let wq_floored = quantize_energy(e_floored(n, NU, KAPPA), DELTA);

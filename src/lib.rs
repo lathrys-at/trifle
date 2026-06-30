@@ -121,8 +121,8 @@ pub(crate) const DEFAULT_NU: f64 = 2.0;
 pub(crate) const DEFAULT_KAPPA: f64 = 0.5;
 /// Default `Δ` — energy quantization step, in nats, for the bit-sliced weights (derivation §7).
 pub(crate) const DEFAULT_DELTA: f64 = 0.5;
-/// Default `σ` — query-side reliability / topicality (derivation §3).
-#[expect(dead_code)]
+/// Default `σ` — query-side reliability / topicality, driving the count credit `μ = max(0, logit σ)`
+/// (derivation §3/§9). An index-level corpus constant (lives on [`Config`], not [`SearchOpts`]).
 pub(crate) const DEFAULT_SIGMA: f64 = 0.9;
 /// Default `ε` — doc-side per-character error rate; `0` selects the clean / query-side channel
 /// (derivation §3.2).
@@ -142,17 +142,47 @@ const HINT_BUCKETS: usize = 33;
 const HINT_BUCKET_WIDTH: f64 = 0.5;
 
 /// Index configuration.
-#[derive(Default)]
 pub struct Config {
     /// The caller's drift/epoch token. Bumping it on reopen invalidates the cache
     /// (drops it to empty), so the next [`rebuild`](Index::rebuild) repopulates.
     pub data_version: u64,
+    /// `σ` — query-side reliability / topicality, driving the count credit `μ = max(0, logit σ)`
+    /// (derivation §3/§9). An **index-level** corpus constant (the reliability is a corpus, not a
+    /// query, property — derivation §3.3), so it lives here rather than on [`SearchOpts`]. It is a
+    /// **runtime-only scoring** field: it is *not* stamped to disk and changing it does **not**
+    /// drift-reset the cache (scoring is a query-time concern). `Config::default()`/`new` set it to
+    /// `0.9`; it is sanitized to `(0,1)` on [`Index::open`] (`logit σ` is finite only there).
+    pub sigma: f64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            data_version: 0,
+            sigma: DEFAULT_SIGMA,
+        }
+    }
 }
 
 impl Config {
-    /// A configuration with the given drift token and otherwise default settings.
+    /// A configuration with the given drift token and otherwise default settings (`σ = 0.9`).
     pub fn new(data_version: u64) -> Self {
-        Config { data_version }
+        Config {
+            data_version,
+            sigma: DEFAULT_SIGMA,
+        }
+    }
+}
+
+/// Sanitize a caller `σ` to the open interval `(0,1)` the count credit `μ = max(0, logit σ)`
+/// needs: `logit σ = ln(σ/(1−σ))` is finite only there, and `σ = 1` would send it to `+∞`. A
+/// non-finite or out-of-range value falls back to the recall-safe default, mirroring the M1
+/// `ν`/`κ`/`Δ` sanitization in the search path. Applied once, at [`Index::open`].
+fn sanitized_sigma(sigma: f64) -> f64 {
+    if sigma.is_finite() && sigma > 0.0 && sigma < 1.0 {
+        sigma
+    } else {
+        DEFAULT_SIGMA
     }
 }
 
@@ -193,10 +223,6 @@ pub struct SearchOpts<'a> {
     /// all grow with `E_max/Δ`), so a pathologically tiny `Δ` is a memory / `u32`-overflow hazard.
     /// A non-finite, zero, or negative value falls back to the `0.5` default.
     pub delta: Option<f64>,
-    /// `σ` — query-side reliability / topicality, driving the count credit `μ = logit r`
-    /// (derivation §3). `None` → `0.9`. *v0.4 M0 scaffolding — declared, not yet consumed by
-    /// scoring.*
-    pub sigma: Option<f64>,
     /// `ε` — the doc-side per-character error rate; `0` selects the clean / query-side channel
     /// (`ρ = σ(1−ε)^n`, derivation §3.2). `None` → `0.0`. *v0.4 M0 scaffolding — declared, not yet
     /// consumed by scoring.*
@@ -224,7 +250,6 @@ impl<'a> SearchOpts<'a> {
             nu: None,
             kappa: None,
             delta: None,
-            sigma: None,
             epsilon: None,
             k_target: None,
             c_margin: None,
@@ -271,12 +296,6 @@ impl<'a> SearchOpts<'a> {
     /// Set `Δ` — the energy quantization step in nats (derivation §7).
     pub fn delta(mut self, delta: f64) -> Self {
         self.delta = Some(delta);
-        self
-    }
-
-    /// Set `σ` — query-side reliability / topicality (derivation §3).
-    pub fn sigma(mut self, sigma: f64) -> Self {
-        self.sigma = Some(sigma);
         self
     }
 
@@ -381,6 +400,10 @@ pub struct Index<T: Tokenizer = DefaultTokenizer> {
     pub(crate) store: Sidecar,
     pub(crate) tokenizer: T,
     data_version: u64,
+    /// `σ` — the index-level query-side reliability (derivation §3.3), sanitized to `(0,1)` from
+    /// [`Config::sigma`] at open. Read by the scoring path (`search::prepare`) to form the count
+    /// credit `μ = max(0, logit σ)`. Runtime-only (never stamped; not a drift trigger).
+    pub(crate) sigma: f64,
     /// The declared data model (key shape, text fields).
     pub(crate) schema: Schema,
     /// The in-memory faulting term dictionary (gram → `u32` id) + per-class df statistics,
@@ -426,6 +449,9 @@ impl<T: Tokenizer> Index<T> {
             store,
             tokenizer,
             data_version: config.data_version,
+            // Sanitize σ once here (an index-level corpus constant); the scoring path then reads it
+            // without re-checking. Mirrors the M1 ν/κ/Δ sanitization (recall-safe fallback).
+            sigma: sanitized_sigma(config.sigma),
             schema,
             dict: Dictionary::empty(),
             poisoned: AtomicBool::new(false),
@@ -1251,6 +1277,42 @@ impl TokenChanges {
             })
             .collect();
         postings::apply_writes(conn, ns, &writes)
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::{Config, DEFAULT_SIGMA, sanitized_sigma};
+
+    #[test]
+    fn config_defaults_sigma_to_the_default() {
+        assert_eq!(Config::default().sigma, DEFAULT_SIGMA);
+        assert_eq!(Config::new(7).sigma, DEFAULT_SIGMA);
+        assert_eq!(Config::new(7).data_version, 7);
+    }
+
+    #[test]
+    fn sigma_sanitization_keeps_the_open_interval_and_falls_back_otherwise() {
+        // In-range values pass through.
+        assert_eq!(sanitized_sigma(0.9), 0.9);
+        assert_eq!(sanitized_sigma(0.5), 0.5);
+        assert_eq!(sanitized_sigma(0.001), 0.001);
+        // Boundary / out-of-range / non-finite all fall back (logit is non-finite there).
+        for bad in [
+            0.0,
+            1.0,
+            -0.1,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                sanitized_sigma(bad),
+                DEFAULT_SIGMA,
+                "σ={bad} must fall back"
+            );
+        }
     }
 }
 

@@ -138,6 +138,119 @@ fn degenerate_knobs_fall_back_to_defaults() {
     }
 }
 
+/// Position of doc `id` in result order, or `usize::MAX` if absent.
+fn rank_of(order: &[i64], id: i64) -> usize {
+    order.iter().position(|&d| d == id).unwrap_or(usize::MAX)
+}
+
+/// Load `(id, owned-text)` docs under label `"f"` in one writer batch.
+fn load_owned(h: &Harness, docs: &[(i64, String)]) {
+    let mut w = h.index.writer().unwrap();
+    for (id, text) in docs {
+        w.upsert(*id, &[("f", text.as_str())]).unwrap();
+    }
+    w.commit().unwrap();
+}
+
+#[test]
+fn junk_only_match_does_not_outrank_a_real_gram() {
+    // §9 junk-below-real, end to end. N=100 (df_min=10): a real word "kqxvz" in 12 docs (df=12 > 10
+    // → NON-floored, a rare-but-real high-energy gram that earns the count credit), a junk word
+    // "wjbhm" in 1 doc (df=1 ≤ 10 → FLOORED, E_max energy but NO credit). A doc matching only junk
+    // must not out-rank a doc matching the real gram — the count credit, not the floor, restores
+    // that order (the floor alone parks junk at the energy ceiling). The junk doc is still retrieved.
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    for i in 1..=12 {
+        docs.push((i, "kqxvz neutral".to_string())); // real word ⇒ df(kqxvz grams)=12
+    }
+    for i in 13..=99 {
+        docs.push((i, format!("padding number {i}"))); // bulk filler, no query grams
+    }
+    docs.push((100, "wjbhm neutral".to_string())); // junk word ⇒ df=1
+    load_owned(&h, &docs);
+
+    let hits = h
+        .search_opts("kqxvz wjbhm", &SearchOpts::new().min_shared(1), 20)
+        .unwrap();
+    let order = ids(&hits);
+    assert!(hit(&hits, 1), "the real-gram doc is retrieved");
+    assert!(
+        hit(&hits, 100),
+        "the junk-only doc is retrieved too (junk is not dropped, just un-credited)"
+    );
+    assert!(
+        rank_of(&order, 1) < rank_of(&order, 100),
+        "the real-gram doc out-ranks junk-only (order = {order:?})"
+    );
+}
+
+#[test]
+fn concentration_cap_demotes_a_commons_heavy_offtopic_doc() {
+    // §9 concentration cap, end to end. The query "kqxvz report system" is concentrated: one
+    // dominant rare gram (kqxvz, df=12) amid two common words (report, system; df=50 each → 8
+    // query-relative common grams). WITHOUT the cap, an off-topic doc matching the 8 commons earns
+    // a flat 8·μ credit that out-weighs an on-topic doc matching only the one rare gram; the cap
+    // shrinks μ so the discriminating gram wins.
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    for i in 1..=12 {
+        docs.push((i, "kqxvz".to_string())); // on-topic rare word ⇒ df(kqxvz grams)=12
+    }
+    for i in 13..=62 {
+        docs.push((i, "report system".to_string())); // commons ⇒ df(report)=df(system)=50
+    }
+    for i in 63..=100 {
+        docs.push((i, format!("padding number {i}"))); // filler
+    }
+    load_owned(&h, &docs);
+
+    let hits = h
+        .search_opts("kqxvz report system", &SearchOpts::new().min_shared(1), 30)
+        .unwrap();
+    let order = ids(&hits);
+    assert!(hit(&hits, 1), "the on-topic rare-gram doc is retrieved");
+    assert!(
+        hit(&hits, 13),
+        "the off-topic commons-heavy doc is retrieved"
+    );
+    assert!(
+        rank_of(&order, 1) < rank_of(&order, 13),
+        "the cap keeps the rare-gram doc above the commons-heavy doc (order = {order:?})"
+    );
+}
+
+#[test]
+fn batch_equals_serial_under_the_count_credit() {
+    // The credit μ and the §9 cap are pure functions of this query's grams + the shared
+    // (σ, N, ν, κ, Δ) snapshot, so a credit-bearing query ranks identically alone vs mid-batch.
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    for i in 1..=12 {
+        docs.push((i, "kqxvz report".to_string()));
+    }
+    for i in 13..=50 {
+        docs.push((i, "report only".to_string()));
+    }
+    load_owned(&h, &docs);
+
+    let q = "kqxvz report";
+    let opts = SearchOpts::new().min_shared(1);
+    let serial = ids(&h.search_opts(q, &opts, 20).unwrap());
+    assert!(!serial.is_empty(), "the probe query must hit something");
+    let batch = h
+        .index
+        .reader()
+        .unwrap()
+        .matches_batch(&["report only", q, "kqxvz"], &opts, 20)
+        .unwrap();
+    assert_eq!(
+        ids(&batch[1]),
+        serial,
+        "credit-bearing q ranks identically serial vs. mid-batch (batch == serial)"
+    );
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn coarse_delta_trips_the_quantization_guard_in_debug() {

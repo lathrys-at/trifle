@@ -26,7 +26,7 @@ use std::rc::Rc;
 use croaring::Bitmap;
 use rusqlite::Connection;
 use rusqlite::types::Value;
-use trifle_overlap::{Counter, Walk};
+use trifle_overlap::{Counter, Scored, Walk};
 
 use crate::dict::TermId;
 use crate::filter::SqlFilter;
@@ -114,9 +114,52 @@ struct QueryPlan {
     present_tokens: Vec<String>,
     present_postings: Vec<Bitmap>,
     present_dfs: Vec<u64>,
+    /// Per present gram (parallel to `present_postings`): whether it is **floored** — query-side
+    /// `df ≤ df_min` (derivation §4), i.e. a substitution-artifact suspect. A floored gram carries
+    /// `E_max` energy on the bit-sliced side but earns **no** count credit (§9); that withholding,
+    /// not the floor, is what restores junk-below-real ordering. (M4 also reads this to exclude
+    /// floored grams from the Cantelli stop; M2 uses it only to gate the credit.)
+    present_floored: Vec<bool>,
+    /// Per present gram (parallel to `present_postings`): its order `n` (gram codepoint count — 2
+    /// for a CJK bigram, else 3, fewer for a short structural-fallback gram). Keys the per-order
+    /// count credit (§7/§12 `Σ_n μ_n·popcount_n`). Query-side `σ` is uniform so every order maps to
+    /// the same `μ` in M2; the bucketing is kept structural so M5's per-order doc-side
+    /// `ρ = σ(1−ε)^n` drops in by repopulating [`mu_by_order`](QueryPlan::mu_by_order).
+    present_orders: Vec<u8>,
+    /// The §9-capped count credit `μ_n = min(max(0, logit σ), cap)`, keyed by the gram order `n`
+    /// present among the **non-floored** grams. Looked up by `present_orders` when scoring credit.
+    mu_by_order: FxHashMap<u8, f64>,
+    /// The energy quantization step `Δ` (nats) this plan was built with — reconverts the integer
+    /// bit-sliced energy back to nats for the float ranking key (derivation §7).
+    delta: f64,
     selected_strings: Vec<String>,
     n_segments: u64,
     avgdl: f64,
+}
+
+impl QueryPlan {
+    /// The derivation §3/§9 count credit for candidate `id`: `μ` times the popcount of matched
+    /// **non-floored** grams, bucketed by gram order (§7/§12 `Σ_n μ_n·popcount_n`). Floored
+    /// (junk-suspect) grams earn nothing (§9) — the policy that restores the junk-below-real
+    /// ordering the floor's `E_max` energy alone would invert. `O(k)` per candidate (`k ≤ t_max`),
+    /// so the post-pass stays bounded (flatness).
+    fn count_credit(&self, id: u32) -> f64 {
+        popcount_credit(
+            id,
+            &self.present_postings,
+            &self.present_floored,
+            &self.present_orders,
+            &self.mu_by_order,
+        )
+    }
+
+    /// The M2 float ranking key: the integer bit-sliced energy reconverted to nats plus the count
+    /// credit (`E_acc·Δ + Σ_n μ_n·popcount_n`, derivation §7/§12). The §6 length null is M3, so it
+    /// is not subtracted here. Top-k truncation must use this key, never the bare integer
+    /// [`Scored::score`].
+    fn float_score(&self, scored: &Scored) -> f64 {
+        scored.score as f64 * self.delta + self.count_credit(scored.id)
+    }
 }
 
 // --- v0.4 logit-idf energy weighting (derivation §2, §4, §7) ------------------------------------
@@ -194,6 +237,72 @@ fn quantize_energy(e: f64, delta: f64) -> u32 {
     } else {
         0
     }
+}
+
+// --- v0.4 count credit μ + the §9 concentration cap (derivation §3, §7, §9) --------------------
+//
+// The absent-real-gram evidence regroups into a flat per-match bonus μ on every matched, non-
+// floored gram (§3): each contributes the full RSJ weight `E_g + μ`. μ is the policy that orders a
+// real (non-floored) match above a junk (floored, `E_max`) one (§9), since the floor alone does not
+// (a floored gram sits at the energy ceiling). All of this is query-side and N-anchored, so it
+// lives here (the engine is N-free) as a post-pass over the retained postings, NOT a hot-loop add.
+
+/// The query-side count credit `μ = max(0, logit σ)` (derivation §3/§9) — nats per matched,
+/// non-floored gram. `σ` is sanitized to `(0,1)` at [`Index::open`](crate::Index::open), so
+/// `logit σ = ln(σ/(1−σ))` is finite here; an unreliable `σ ≤ ½` yields `μ = 0` (the `max(0,·)`
+/// clamp), a recall-safe no-op (a recall stage never penalizes matches).
+fn count_credit(sigma: f64) -> f64 {
+    (sigma / (1.0 - sigma)).ln().max(0.0)
+}
+
+/// The §9 **concentration cap** on the count credit. Returns `Some(cap)` when the pruned set's
+/// energies are *concentrated* — a single dominant rare gram (positive top energy `E_top`) amid
+/// **≥ 2** query-relative commons (a gram with `E < ½·E_top`) — else `None` (μ uncapped). An
+/// all-common set has `E_top ≤ 0` (no dominant gram) and is deliberately left **uncapped**, so it
+/// degrades to count-and-length ranking rather than having its credit zeroed (§7/§9); this guard
+/// is load-bearing (without it an all-common query would cap to 0).
+///
+/// `cap = max(0, (E_top − Σ_common max(0,E)) / (#common − 1))`. The hard floor at 0 (reached when
+/// the commons collectively outweigh the dominant gram) is the M2 baseline; §9's smoother shrink
+/// toward the cap is a deferred tuning refinement.
+///
+/// **Interpretation note (auditable):** floored grams are **not** excluded from `E_top`. This is
+/// the literal §12 reading — `concentrated(P)`/`concentration_cap(P)` range over all of `P` — and
+/// matches §9's framing of the cap as a *query-structure* property: a dominant gram (junk-suspect
+/// or not) should not be out-credited by commons. The floored *exclusion* governs only which grams
+/// earn credit (above) and the M4 stop, not the cap's `E_top`.
+fn concentration_cap(energies: &[f64]) -> Option<f64> {
+    let e_top = energies.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if e_top <= 0.0 {
+        return None; // no dominant rare gram (all-common / empty) — μ survives (§7/§9)
+    }
+    let half = 0.5 * e_top;
+    let commons: Vec<f64> = energies.iter().copied().filter(|&e| e < half).collect();
+    if commons.len() < 2 {
+        return None;
+    }
+    let sum_commons: f64 = commons.iter().map(|&e| e.max(0.0)).sum();
+    let cap = (e_top - sum_commons) / (commons.len() as f64 - 1.0);
+    Some(cap.max(0.0))
+}
+
+/// `μ`-weighted popcount of `id`'s matched **non-floored** grams, bucketed by gram order
+/// (derivation §7/§12 `Σ_n μ_n·popcount_n`). A floored gram is skipped (no credit, §9); a
+/// non-floored gram contributes its order's capped `μ_n`. Free function so it is unit-testable
+/// without a full [`QueryPlan`]. `O(k)` over the present grams (`k ≤ t_max`).
+fn popcount_credit(
+    id: u32,
+    postings: &[Bitmap],
+    floored: &[bool],
+    orders: &[u8],
+    mu_by_order: &FxHashMap<u8, f64>,
+) -> f64 {
+    postings
+        .iter()
+        .enumerate()
+        .filter(|&(i, bm)| !floored[i] && bm.contains(id))
+        .map(|(i, _)| mu_by_order.get(&orders[i]).copied().unwrap_or(0.0))
+        .sum()
 }
 
 /// Resolve, select (class-aware rarest-first), load postings, and build the engine [`Counter`]
@@ -338,6 +447,10 @@ fn prepare<T: Tokenizer>(
     // The contamination floor is `N`/`ν`-constant, so compute it once for the whole batch and
     // thread it into the per-gram energy (no `powf` per gram); reinforces `batch == serial`.
     let df_min_batch = df_min(n_segments as f64, nu);
+    // The count credit `μ = max(0, logit σ)` (derivation §3/§9). `σ` is the index-level corpus
+    // constant (sanitized at open), so this is one value for the whole batch — read once, never a
+    // per-batch aggregate (batch == serial). The per-query §9 concentration cap is applied below.
+    let mu = count_credit(index.sigma);
 
     let mut plans = Vec::with_capacity(queries.len());
     for selected in &selected_per {
@@ -364,25 +477,49 @@ fn prepare<T: Tokenizer>(
             sum_cardinality = present_dfs.iter().sum::<u64>(),
             "trifle: weighted overlap candidate generation"
         );
-        // v0.4 §2/§4/§7: quantized logit-idf energy weights (`N`-anchored, computed here since the
-        // engine is `N`-free), fed as explicit per-posting weights — replacing v0.3's `N`-free
-        // df-rarity tiers (`opts.weight_step`). `present_dfs[i]` is the cardinality of
-        // `present_postings[i]`, so the weights stay parallel to the postings; the batch-cached
+        // v0.4 §2/§4/§7: raw logit-idf energies, computed here since the engine is `N`-free. Reused
+        // for both the quantized bit-sliced weights (replacing v0.3's `N`-free df-rarity tiers) and
+        // the §9 concentration cap below. `present_dfs[i]` is the cardinality of
+        // `present_postings[i]`, so everything stays parallel to the postings; the batch-cached
         // `df_min_batch` keeps the floor `powf` out of this per-gram map.
-        let weights: Vec<u32> = present_dfs
+        let energies: Vec<f64> = present_dfs
             .iter()
-            .map(|&df| {
-                quantize_energy(
-                    energy_with_floor(df as f64, df_min_batch, n_segments as f64, kappa),
-                    delta,
-                )
-            })
+            .map(|&df| energy_with_floor(df as f64, df_min_batch, n_segments as f64, kappa))
+            .collect();
+        let weights: Vec<u32> = energies
+            .iter()
+            .map(|&e| quantize_energy(e, delta))
             .collect();
         debug_assert!(
             weights.iter().all(|&w| w <= wq_ceiling),
             "energy weight exceeds the cardinality-independent E_max ceiling ⌊E_max/Δ⌉={wq_ceiling}: \
              flatness bound violated"
         );
+        // v0.4 M2 (§3/§4/§9): per-gram floored flag (query-side `df ≤ df_min`) + gram order
+        // (codepoint count), then the §9-capped per-order count credit. The cap ranges over P's
+        // energies (floored grams included in `E_top`, §9/§12 — see `concentration_cap`); `σ` is
+        // index-level and uniform across orders query-side, so every present non-floored order maps
+        // to the same capped `μ`. The per-order bucketing is kept structural for M5's doc-side
+        // `ρ = σ(1−ε)^n`. All of this is a pure function of THIS query's grams + the shared
+        // (σ, N, ν, κ, Δ) snapshot ⇒ `batch == serial`.
+        let present_floored: Vec<bool> = present_dfs
+            .iter()
+            .map(|&df| (df as f64) <= df_min_batch)
+            .collect();
+        let present_orders: Vec<u8> = present_tokens
+            .iter()
+            .map(|t| t.chars().count() as u8)
+            .collect();
+        let mu_capped = match concentration_cap(&energies) {
+            Some(cap) => mu.min(cap),
+            None => mu,
+        };
+        let mut mu_by_order: FxHashMap<u8, f64> = FxHashMap::default();
+        for (&order, &floored) in present_orders.iter().zip(&present_floored) {
+            if !floored {
+                mu_by_order.insert(order, mu_capped);
+            }
+        }
         // Perf note (M1): unlike v0.3's `N`-free tiers, these are *absolute* energies, so a selected
         // rare gram does not quantize to 1 — the engine's all-weight-1 fast path (overlap = score,
         // no posting retention, no per-candidate `contains`) therefore stops firing for mixed/uniform
@@ -395,6 +532,10 @@ fn prepare<T: Tokenizer>(
             present_tokens,
             present_postings,
             present_dfs,
+            present_floored,
+            present_orders,
+            mu_by_order,
+            delta,
             selected_strings,
             n_segments,
             avgdl,
@@ -540,9 +681,79 @@ fn hydrate_matches<T: Tokenizer>(
         .collect())
 }
 
+/// Eager top-`limit` on the **M2 float credit key** (`E_acc·Δ + Σ_n μ_n·popcount_n`, §7/§12).
+///
+/// Because the float key adds a non-negative count credit, float order differs from the engine's
+/// integer best-first order *across* score buckets, so a correct float top-k cannot simply re-sort
+/// the integer top-k (a candidate with a lower integer energy but more non-floored matches can
+/// belong in the top-k). Under the engine's retained `≥ 1` weight clamp every match contributes to
+/// the bit-sliced sum, so the walk's candidate set *is* the full popcount ∪ bit-sliced union; M2
+/// drains it whole (bounded by `Σdf ≤ (1+#classes)·C`, derivation §7 — "cheap enough to run over
+/// the full candidate set first"), keeps the **max-float** candidate per key, then sorts by the
+/// float key and truncates.
+///
+/// **M2/M3 boundary.** This is the *eager* path only. The bounded-over-sample early-stop (which
+/// would avoid full-draining a shallow top-k) and unifying the lazy [`CandidateStream`] onto this
+/// same float key are M3's G2 reshape; until then the stream still ranks by the integer score (see
+/// its docs). The per-key dedup keeps the highest-**float** segment; the sort tiebreak (integer
+/// score desc, then seg id asc) is deterministic so `batch == serial` and the thrash oracle stay
+/// reproducible.
+fn drain_top_k(prov: &Provenance<'_>, plan: &QueryPlan, limit: usize) -> Result<Vec<Candidate>> {
+    let mut walk = plan.counter.walk();
+    // Max-float candidate per key, accumulated over the whole bounded union.
+    let mut best: FxHashMap<Key, (Candidate, f64)> = FxHashMap::default();
+    loop {
+        let mut scored = Vec::with_capacity(CHUNK);
+        let mut done = false;
+        while scored.len() < CHUNK {
+            match plan.counter.advance(&mut walk) {
+                Some(s) => scored.push(s),
+                None => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if !scored.is_empty() {
+            let seg_ids: Vec<u32> = scored.iter().map(|s| s.id).collect();
+            let found = prov.lookup(&seg_ids)?;
+            for s in &scored {
+                if let Some((key, label)) = found.get(&s.id) {
+                    let f = plan.float_score(s);
+                    let cand = Candidate {
+                        key: key.clone(),
+                        label: label.clone(),
+                        seg_id: s.id,
+                        score: s.score,
+                        overlap: s.overlap,
+                    };
+                    best.entry(key.clone())
+                        .and_modify(|slot| {
+                            if f > slot.1 {
+                                *slot = (cand.clone(), f);
+                            }
+                        })
+                        .or_insert((cand, f));
+                }
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    let mut ranked: Vec<(Candidate, f64)> = best.into_values().collect();
+    ranked.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| b.0.score.cmp(&a.0.score))
+            .then_with(|| a.0.seg_id.cmp(&b.0.seg_id))
+    });
+    ranked.truncate(limit);
+    Ok(ranked.into_iter().map(|(c, _)| c).collect())
+}
+
 /// Eager: top-`limit` matches per query, all queries sharing one snapshot. The safe default
-/// front door (`matches`/`matches_batch`). Drains each plan's walk only as deep as the top-`limit`
-/// needs, then hydrates exactly those rows.
+/// front door (`matches`/`matches_batch`). Drains each plan's bounded candidate union, ranks by
+/// the M2 float credit key (see [`drain_top_k`]), then hydrates exactly the kept rows.
 pub(crate) fn matches_batch<T: Tokenizer>(
     index: &Index<T>,
     queries: &[&str],
@@ -567,21 +778,7 @@ pub(crate) fn matches_batch<T: Tokenizer>(
 
     let mut out = Vec::with_capacity(queries.len());
     for plan in &plans {
-        let mut walk = plan.counter.walk();
-        let mut seen: FxHashSet<Key> = FxHashSet::default();
-        let mut ready: VecDeque<Candidate> = VecDeque::new();
-        let mut kept: Vec<Candidate> = Vec::with_capacity(limit);
-        let mut done = false;
-        while kept.len() < limit {
-            if let Some(c) = ready.pop_front() {
-                kept.push(c);
-                continue;
-            }
-            if done {
-                break;
-            }
-            done = pull_chunk(&prov, &plan.counter, &mut walk, &mut seen, &mut ready)?;
-        }
+        let kept = drain_top_k(&prov, plan, limit)?;
         out.push(hydrate_matches(
             &tx,
             ns,
@@ -635,6 +832,16 @@ pub(crate) fn candidates<'a, T: Tokenizer>(
 /// bit-sliced walk, batch-hydrates provenance (+ applies the [`SqlFilter`](crate::SqlFilter)) per
 /// chunk, dedups to one candidate per key, best-first. **Fuses on the first error** (a caller
 /// never gets a deceptively-complete prefix after a transient `Busy`).
+///
+/// **M2 interim — ranking asymmetry.** This stream orders candidates by the engine's **integer**
+/// bit-sliced energy score (best-first), *not* by the M2 float count-credit key that
+/// [`matches`](crate::Reader::matches)/[`matches_batch`](crate::Reader::matches_batch) now rank by
+/// (`E_acc·Δ + Σ_n μ_n·popcount_n`, §7/§12). So [`collect_matches`](Self::collect_matches), which
+/// takes a best-first prefix, can order a tie-band differently from the eager `matches`. M3's G2
+/// reshape unifies them — the stream will accumulate the bounded union and rank by the float key
+/// plus the §6 length null. Until then, the candidate's [`score`](Candidate::score) is the integer
+/// energy; compose your own float rerank over [`matched_terms`](Self::matched_terms) if you need
+/// the credit key from the stream.
 ///
 /// A live stream pins its WAL snapshot — keep it short-lived; do not park it. Drop releases the
 /// snapshot.
@@ -941,5 +1148,138 @@ mod energy_tests {
             let e = energy(1.0, n, NU, KAPPA);
             let _ = quantize_energy(e, DELTA);
         }
+    }
+}
+
+#[cfg(test)]
+mod credit_tests {
+    //! Numerical fixtures for the v0.4 count credit `μ` and the §9 concentration cap (derivation
+    //! §3/§7/§9/§12): `μ = max(0, logit σ)`; the floor↔μ crossover near `df ≈ 9000`; the cap's
+    //! all-common pass-through, its concentrated cap, and its hard floor at 0; the floored-energy
+    //! `E_top` interpretation; and the per-order non-floored popcount credit.
+    use super::{concentration_cap, count_credit, e_floored, e_max, energy, popcount_credit};
+    use crate::DEFAULT_SIGMA;
+    use crate::hash::FxHashMap;
+    use croaring::Bitmap;
+
+    const NU: f64 = 2.0;
+    const KAPPA: f64 = 0.5;
+
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-6, "expected ≈ {b}, got {a}");
+    }
+
+    #[test]
+    fn mu_is_logit_sigma_clamped_at_zero() {
+        approx(count_credit(0.9), 9.0_f64.ln()); // logit 0.9 = ln 9 ≈ 2.1972
+        approx(count_credit(0.5), 0.0); // logit ½ = 0
+        assert_eq!(count_credit(0.3), 0.0); // σ < ½ ⇒ negative logit ⇒ clamped to 0 (recall-safe)
+        assert!(count_credit(DEFAULT_SIGMA) > 2.0);
+    }
+
+    #[test]
+    fn floor_mu_crossover_is_near_df_9000() {
+        // N=1e6, σ=0.9, ν=2: a single floored junk gram (E_max ≈ E_floored, NO credit) crosses a
+        // single non-floored real gram (energy(df) + μ) near df ≈ 9000 (derivation §9). Asserted on
+        // raw energies; bit-sliced quantization shifts the realized crossover by ≤ one Δ-bucket.
+        let n = 1_000_000.0_f64;
+        let mu = count_credit(0.9);
+        let junk = e_floored(n, NU, KAPPA); // the junk gram's no-credit energy (≈ E_max)
+        approx(e_max(n, NU), 0.5 * n.ln());
+        let real = |df: f64| energy(df, n, NU, KAPPA) + mu;
+        assert!(
+            real(5_000.0) > junk,
+            "a df=5000 real gram (E+μ) out-scores floored junk (E_max)"
+        );
+        assert!(
+            real(15_000.0) < junk,
+            "a df=15000 real gram loses to floored junk"
+        );
+        assert!(
+            (real(9_000.0) - junk).abs() < 0.1,
+            "the ordering flips near df ≈ 9000"
+        );
+    }
+
+    #[test]
+    fn junk_only_does_not_outrank_a_real_gram() {
+        // The §9 policy at the score level: one non-floored real gram (df below the crossover) + μ
+        // beats one floored junk gram (E_max, no credit). The floor alone would invert this.
+        let n = 1_000_000.0_f64;
+        let mu = count_credit(0.9);
+        let junk = e_floored(n, NU, KAPPA);
+        let real = energy(2_000.0, n, NU, KAPPA) + mu; // df=2000 > df_min=1000 ⇒ non-floored
+        assert!(real > junk, "real-gram match out-scores junk-only");
+    }
+
+    #[test]
+    fn cap_passes_through_an_all_common_set() {
+        // All energies ≤ 0 (no dominant rare gram) ⇒ not concentrated ⇒ μ survives uncapped.
+        assert_eq!(concentration_cap(&[-1.0, -0.5, -2.0]), None);
+        // Comparable positive energies with no member below ½·E_top ⇒ no commons ⇒ uncapped.
+        assert_eq!(concentration_cap(&[2.0, 2.0, 2.0]), None);
+        // Degenerate inputs never panic / never spuriously cap.
+        assert_eq!(concentration_cap(&[]), None);
+        assert_eq!(
+            concentration_cap(&[f64::NEG_INFINITY, f64::NEG_INFINITY]),
+            None
+        );
+    }
+
+    #[test]
+    fn cap_limits_a_concentrated_set() {
+        // One dominant gram (E_top=5) amid 2 commons (0.5, 0.3 < 2.5): cap = (5 − 0.8)/(2−1) = 4.2.
+        let cap = concentration_cap(&[5.0, 0.5, 0.3]).expect("concentrated");
+        approx(cap, 4.2);
+        // Only 1 common (3.0 ≥ ½·5) ⇒ no dominant-amid-commons ⇒ not concentrated.
+        assert_eq!(concentration_cap(&[5.0, 0.5, 3.0]), None);
+    }
+
+    #[test]
+    fn cap_floors_at_zero_when_commons_outweigh() {
+        // The commons collectively outweigh the dominant gram ⇒ the hard floor discards the credit.
+        let cap = concentration_cap(&[1.0, 0.4, 0.4, 0.4]).expect("concentrated");
+        approx(cap, 0.0); // (1.0 − 1.2)/3 < 0 ⇒ max(0, ·) = 0
+    }
+
+    #[test]
+    fn cap_includes_floored_energy_in_e_top() {
+        // Interpretation guard (§9/§12): a floored gram's E_max-level energy IS eligible to be the
+        // dominant E_top — it is not excluded from the cap. E_top=6.9 with 2 commons at 0 ⇒
+        // cap = (6.9 − 0)/(2−1) = 6.9, so the high floored energy drove the cap (it was not skipped).
+        let cap = concentration_cap(&[6.9, 0.0, 0.0]).expect("floored gram is a valid dominant");
+        approx(cap, 6.9);
+        // With 3 commons the divisor grows: cap = 6.9/(3−1) = 3.45.
+        approx(
+            concentration_cap(&[6.9, 0.0, 0.0, 0.0]).expect("concentrated"),
+            3.45,
+        );
+    }
+
+    #[test]
+    fn popcount_credit_sums_non_floored_matched_by_order() {
+        // Three present grams: a non-floored order-3 (μ=2.0), a FLOORED order-3 (no credit), and a
+        // non-floored order-2 (μ=1.5).
+        let postings = vec![Bitmap::of(&[7]), Bitmap::of(&[7]), Bitmap::of(&[7, 9])];
+        let floored = vec![false, true, false];
+        let orders = vec![3u8, 3u8, 2u8];
+        let mut mu_by_order = FxHashMap::default();
+        mu_by_order.insert(3u8, 2.0);
+        mu_by_order.insert(2u8, 1.5);
+        // id 7 is in all three, but the floored one earns nothing: 2.0 + 1.5 = 3.5.
+        approx(
+            popcount_credit(7, &postings, &floored, &orders, &mu_by_order),
+            3.5,
+        );
+        // id 9 is only in the order-2 posting: 1.5.
+        approx(
+            popcount_credit(9, &postings, &floored, &orders, &mu_by_order),
+            1.5,
+        );
+        // id 1 is in nothing: 0.
+        approx(
+            popcount_credit(1, &postings, &floored, &orders, &mu_by_order),
+            0.0,
+        );
     }
 }

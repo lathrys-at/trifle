@@ -129,11 +129,10 @@ pub(crate) const DEFAULT_SIGMA: f64 = 0.9;
 #[expect(dead_code)]
 pub(crate) const DEFAULT_EPSILON: f64 = 0.0;
 /// Default `k` — the stop's target candidate-pool size; the stop aims for `ln(N/k)` nats
-/// (derivation §5).
-#[expect(dead_code)]
+/// (derivation §5). Wired into the M4 Cantelli stop (`search::prepare` → `select`).
 pub(crate) const DEFAULT_K_TARGET: u64 = 128;
-/// Default `c` — the Cantelli stopping margin (derivation §5).
-#[expect(dead_code)]
+/// Default `c` — the Cantelli stopping margin (derivation §5). Wired into the M4 Cantelli stop
+/// (`search::prepare` → `select`).
 pub(crate) const DEFAULT_C_MARGIN: f64 = 2.0;
 /// Buckets in the per-query band-spread histogram (the [`Stats`] weight-step hint). 33 × 0.5 =
 /// 16.5 df-doublings of range (a df ratio up to ~92 000:1).
@@ -710,12 +709,21 @@ impl<T: Tokenizer> Index<T> {
         Ok(())
     }
 
-    /// The distinct tokens of `text`, deduplicated via the token type. Returns the tokens
-    /// themselves (the read path resolves and selects in term-space, stringifying only the
-    /// tokens that reach the result).
-    pub(crate) fn distinct_tokens(&self, text: &str) -> Vec<T::Token> {
-        let distinct: FxHashSet<T::Token> = self.tokenizer.tokenize(text).collect();
-        distinct.into_iter().collect()
+    /// The distinct **query** tokens of `text`, each tagged with its **word id** — the §5
+    /// comonotone stopping-block id the Cantelli stop groups co-failing grams into (derivation §5).
+    /// A gram occurring in more than one query word is kept once, with its **first-occurrence** word
+    /// id (a shared gram → one block; cross-word coupling is the §5 "accepted residual", and a
+    /// shared gram is usually a common one that is floored out of the stop anyway). Deduplicated via
+    /// the token type; the read path resolves and selects in term-space, stringifying only the
+    /// tokens that reach the result. Query-side only; indexing tokenizes with
+    /// [`Tokenizer::tokenize`] directly (no word tags needed — the grams agree because both sides
+    /// apply the same whitespace-breaking windowing).
+    pub(crate) fn distinct_tokens_tagged(&self, text: &str) -> Vec<(T::Token, u32)> {
+        let mut seen: FxHashMap<T::Token, u32> = FxHashMap::default();
+        for (tok, word) in self.tokenizer.tokenize_words(text) {
+            seen.entry(tok).or_insert(word);
+        }
+        seen.into_iter().collect()
     }
 
     /// Read the stored `fwd` term-id sets for a set of segment ids.

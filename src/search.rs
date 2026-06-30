@@ -33,13 +33,14 @@ use crate::filter::SqlFilter;
 use crate::hash::{FxHashMap, FxHashSet};
 use crate::instrument::trace_debug;
 use crate::model::{Key, KeyShape, Match};
-use crate::select::{SelectParams, select};
+use crate::select::{GramRow, SelectParams, select};
 use crate::store::{Namespace, ReadConn};
 use crate::term::Term;
 use crate::tokenize::Tokenizer;
 use crate::{
-    DEFAULT_DELTA, DEFAULT_KAPPA, DEFAULT_MIN_SHARED, DEFAULT_NU, DEFAULT_T_MAX, Error, Index,
-    IntoTerm, Result, SearchOpts, TYPO_DAMAGE, postings, schema,
+    DEFAULT_C_MARGIN, DEFAULT_DELTA, DEFAULT_K_TARGET, DEFAULT_KAPPA, DEFAULT_MIN_SHARED,
+    DEFAULT_NU, DEFAULT_T_MAX, Error, Index, IntoTerm, Result, SearchOpts, TYPO_DAMAGE, postings,
+    schema,
 };
 
 /// How many engine candidates to pull per provenance/filter round-trip.
@@ -117,18 +118,19 @@ impl Candidate {
     }
 }
 
-/// The distinct tokens per query and the batch-wide distinct **term** set (the resolution
-/// input). The read path stays in term-space: it resolves from each token's
+/// The distinct **word-tagged** tokens per query and the batch-wide distinct **term** set (the
+/// resolution input). Each token carries its §5 word id (the comonotone stopping-block id the
+/// Cantelli stop needs). The read path stays in term-space: it resolves from each token's
 /// [`term()`](crate::IntoTerm::term) (no `Token → String → re-encode`). A token wider than the
 /// encoding ceiling has no term and rides along as an absent token (df 0).
 fn query_terms<Tk: IntoTerm>(
     queries: &[&str],
-    tokenize: impl Fn(&str) -> Vec<Tk>,
-) -> (Vec<Vec<Tk>>, Vec<Term>) {
-    let query_tokens: Vec<Vec<Tk>> = queries.iter().map(|q| tokenize(q)).collect();
+    tokenize: impl Fn(&str) -> Vec<(Tk, u32)>,
+) -> (Vec<Vec<(Tk, u32)>>, Vec<Term>) {
+    let query_tokens: Vec<Vec<(Tk, u32)>> = queries.iter().map(|q| tokenize(q)).collect();
     let all_terms: Vec<Term> = query_tokens
         .iter()
-        .flat_map(|q| q.iter().filter_map(|t| t.term()))
+        .flat_map(|q| q.iter().filter_map(|(t, _)| t.term()))
         .collect::<BTreeSet<Term>>()
         .into_iter()
         .collect();
@@ -431,7 +433,7 @@ fn prepare<T: Tokenizer>(
     queries: &[&str],
     opts: &SearchOpts<'_>,
 ) -> Result<Vec<QueryPlan>> {
-    let (query_tokens, all_terms) = query_terms(queries, |q| index.distinct_tokens(q));
+    let (query_tokens, all_terms) = query_terms(queries, |q| index.distinct_tokens_tagged(q));
 
     // Resolve terms in memory + capture the dict generation atomically, then read the snapshot's
     // stored generation (the tx pins the WAL snapshot) to compare. A skew means a concurrent
@@ -476,11 +478,45 @@ fn prepare<T: Tokenizer>(
             DEFAULT_DELTA
         }
     };
+    // v0.4 M4 §5 Cantelli-stop knobs, resolved once for the batch (batch == serial). `c ≥ 0`
+    // (a Cantelli margin), `k ≥ 1` (the stop target `ln(N/k)`), both falling back on a degenerate
+    // value (recall-safe). `σ` is the index-level corpus constant, sanitized at open.
+    let c_margin = {
+        let c = opts.c_margin.unwrap_or(DEFAULT_C_MARGIN);
+        if c.is_finite() && c >= 0.0 {
+            c
+        } else {
+            DEFAULT_C_MARGIN
+        }
+    };
+    let k_target = opts.k_target.unwrap_or(DEFAULT_K_TARGET).max(1);
+
+    // Snapshot-wide corpus stats (N, L̄) for the N-anchored scoring path (energy/floor/stop/null).
+    // Read once for the whole batch from this snapshot's rolling counters, so every query sees the
+    // same N/avgdl (batch == serial). Hoisted ABOVE selection because the M4 stop's energy/floored
+    // inputs (per gram, fed to `select`) are N-anchored. `matches_batch` ignores avgdl;
+    // `CandidateStream` exposes it.
+    let (seg_count, seg_len_sum) = schema::read_seg_stats(conn, ns)?;
+    let n_segments = seg_count.max(0) as u64;
+    let avgdl = if seg_count > 0 {
+        seg_len_sum as f64 / seg_count as f64
+    } else {
+        0.0
+    };
+    // The contamination floor `df_min` is `N`/`ν`-constant, so compute it once for the whole batch
+    // and thread it into the per-gram energy/floored flag (no `powf` per gram); reinforces
+    // `batch == serial`.
+    let df_min_batch = df_min(n_segments as f64, nu);
+
     let sel_params = SelectParams {
         min_shared,
         typo_damage: TYPO_DAMAGE,
         t_max: opts.t_max.unwrap_or(DEFAULT_T_MAX),
         df_budget: opts.df_budget,
+        c_margin,
+        k_target,
+        n_segments,
+        sigma: index.sigma,
     };
 
     // One batched df read over every resolved term-id in the batch.
@@ -498,20 +534,35 @@ fn prepare<T: Tokenizer>(
         Some((id, dfs.get(&id).copied().unwrap_or(0)))
     };
 
-    // Per-query selection (class-normalized rarest-first; token tie-break). Multi-script
-    // awareness lives here, via the per-class stats snapshot.
+    // Per-query selection (class-normalized rarest-first + the §5 Cantelli stop + per-class floor +
+    // skip-and-continue budget). Each gram carries its df, `(script, order)` class, comonotone-block
+    // (word) id, logit-idf energy, and floored flag — all derived from THIS query's grams + the
+    // shared per-batch snapshot (df map, class stats, N, σ, ν, κ), so `batch == serial` (the stop is
+    // a pure function of this query, never a batch aggregate). Multi-script awareness lives here.
     let selected_per: Vec<Vec<T::Token>> = query_tokens
         .iter()
         .map(|q| {
-            let triples: Vec<(T::Token, i64, u8)> = q
+            let rows: Vec<GramRow<T::Token>> = q
                 .iter()
-                .map(|tok| {
+                .map(|(tok, word)| {
                     let class = tok.term().map(|t| t.class()).unwrap_or(0);
                     let df = resolve(tok).map_or(0, |(_, df)| df);
-                    (tok.clone(), df, class)
+                    let order = tok.borrow().chars().count() as u8;
+                    let energy =
+                        energy_with_floor(df.max(0) as f64, df_min_batch, n_segments as f64, kappa);
+                    let floored = (df.max(0) as f64) <= df_min_batch;
+                    GramRow {
+                        token: tok.clone(),
+                        df,
+                        class,
+                        order,
+                        word: *word,
+                        energy,
+                        floored,
+                    }
                 })
                 .collect();
-            select(&triples, sel_params, &class_snap)
+            select(&rows, sel_params, &class_snap)
         })
         .collect();
 
@@ -524,17 +575,6 @@ fn prepare<T: Tokenizer>(
         .into_iter()
         .collect();
     let postings_map = postings::effective_postings(conn, ns, &sel_ids)?;
-
-    // Snapshot-wide corpus stats (N, L̄) for the N-anchored scoring path (energy/floor/stop/null).
-    // Read once for the whole batch from this snapshot's rolling counters, so every query sees the
-    // same N/avgdl (batch == serial). `matches_batch` ignores these; `CandidateStream` exposes them.
-    let (seg_count, seg_len_sum) = schema::read_seg_stats(conn, ns)?;
-    let n_segments = seg_count.max(0) as u64;
-    let avgdl = if seg_count > 0 {
-        seg_len_sum as f64 / seg_count as f64
-    } else {
-        0.0
-    };
 
     // §7/§12 quantization guard: `Δ < 2·E_floored` keeps `round(E_floored/Δ) ≥ 1`, so a floored
     // gram never quantizes to `0` and drops out of the bit-sliced union. It is satisfiable only
@@ -559,9 +599,6 @@ fn prepare<T: Tokenizer>(
     // `~log log N` planes — and never on the posting cardinalities, so the engine's op count stays
     // cardinality-independent (the flatness property). Asserted per query below.
     let wq_ceiling = quantize_energy(e_max(n_segments as f64, nu), delta);
-    // The contamination floor is `N`/`ν`-constant, so compute it once for the whole batch and
-    // thread it into the per-gram energy (no `powf` per gram); reinforces `batch == serial`.
-    let df_min_batch = df_min(n_segments as f64, nu);
     // The count credit `μ = max(0, logit σ)` (derivation §3/§9). `σ` is the index-level corpus
     // constant (sanitized at open), so this is one value for the whole batch — read once, never a
     // per-batch aggregate (batch == serial). The per-query §9 concentration cap is applied below.

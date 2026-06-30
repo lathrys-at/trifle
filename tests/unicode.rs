@@ -89,3 +89,34 @@ fn emoji_and_wide_chars_do_not_break_indexing() {
     h.put(1, "f", "deploy 🚀 to production 🎉 now");
     assert!(hit(&h.search("production", 5).unwrap(), 1));
 }
+
+#[test]
+fn mixed_script_representation_survives_a_tight_budget() {
+    // v0.4/M4 §5/§8 per-class floor, end-to-end: a mixed Latin+CJK query under a tight work budget
+    // still finds a CJK document. The df≈N Latin "common" grams are over budget and dropped, but the
+    // minority Han class is still represented (its rare grams seated), so the CJK doc is walked and
+    // found — per-script representation is not starved by a majority script monopolizing the budget.
+    let h = Harness::new();
+    {
+        let mut w = h.index.writer().unwrap();
+        for d in 1..=50i64 {
+            let body = format!("common latin filler{d}");
+            w.upsert(d, &[("f", body.as_str())]).unwrap();
+        }
+        // One doc carries the (rare) CJK content alongside the common Latin word.
+        w.upsert(99, &[("f", "common 東京日本")]).unwrap();
+        w.commit().unwrap();
+    }
+    // Budget 8 < df("common")=51, so the common Latin grams are skipped; the Han grams (df=1) fit.
+    let opts = SearchOpts::new().df_budget(8).min_shared(1);
+    let hits = h
+        .index
+        .reader()
+        .unwrap()
+        .matches("common 東京日本", &opts, 10)
+        .unwrap();
+    assert!(
+        hit(&hits, 99),
+        "the minority Han class is represented under the budget, so its doc is found"
+    );
+}

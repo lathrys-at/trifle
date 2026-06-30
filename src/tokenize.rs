@@ -58,6 +58,24 @@ pub trait Tokenizer: Send + Sync {
     /// required.
     fn tokenize<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Self::Token> + 'a;
 
+    /// Query-side word tagging: like [`tokenize`](Tokenizer::tokenize), but each gram is paired
+    /// with its **word id** — the comonotone *stopping block* the pruner's confidence-bounded stop
+    /// groups co-failing grams into (derivation §5). Word ids increment at each word boundary;
+    /// grams within one word share an id, and (for a tokenizer that breaks its windows on those
+    /// boundaries) no gram straddles two words.
+    ///
+    /// The default assigns every gram to block `0` (one block) — always recall-safe, because
+    /// merging blocks only *raises* the stop's variance (§5), never lowers it. A tokenizer that
+    /// knows its word boundaries (e.g. [`DefaultTokenizer`], which breaks on whitespace) overrides
+    /// this to report them, tightening the bound. Used only on the **query** side; indexing uses
+    /// [`tokenize`](Tokenizer::tokenize) (the grams agree because both apply the same windowing).
+    fn tokenize_words<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = (Self::Token, u32)> + 'a {
+        self.tokenize(text).map(|t| (t, 0))
+    }
+
     /// A stable hash of this tokenizer's *behavior* (window policy, normalization,
     /// casefolding). It is stamped into the index and compared on open; a change forces a
     /// [`rebuild`](crate::Index::rebuild), because the postings are keyed by whatever this
@@ -713,7 +731,23 @@ impl Tokenizer for DefaultTokenizer {
             win_len: 0,
             class: None,
             n: 0,
+            word: 0,
         }
+    }
+
+    fn tokenize_words<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = (Self::Token, u32)> + 'a {
+        GramWords(GramTokens {
+            chars: self.norm.prepared(text),
+            sizes: self.policy.sizes,
+            win: ['\0'; 3],
+            win_len: 0,
+            class: None,
+            n: 0,
+            word: 0,
+        })
     }
 
     fn fingerprint(&self) -> u64 {
@@ -724,7 +758,12 @@ impl Tokenizer for DefaultTokenizer {
         bytes.extend_from_slice(b"scr");
         bytes.extend_from_slice(&self.norm.fingerprint_bytes());
         bytes.extend_from_slice(&self.policy.sizes);
-        bytes.push(1); // encoding/layout version
+        // Layout version. Bumped 1 → 2 in v0.4/M4: whitespace now breaks gram windows (no gram
+        // straddles a word boundary), on both index and query. A pre-M4 cache therefore drift-
+        // resets (drop + rebuild) on open — the expected "drop, never migrate" path, not a
+        // migration. The change is in `is_break`/`GramTokens`, not a config byte, so it must be
+        // stamped here explicitly.
+        bytes.push(2);
         fnv1a_64(&bytes)
     }
 
@@ -739,6 +778,14 @@ impl Tokenizer for DefaultTokenizer {
         let mut class: Option<u8> = None;
         let mut n = 0usize;
         self.norm.for_each_normalized_char(text, |ch, cs, ce| {
+            if is_break(ch) {
+                // Mirror `GramTokens`: whitespace breaks the window (no gram straddles it) and
+                // resets the class, so span re-derivation tracks the same grams the tokenizer emits.
+                class = None;
+                n = 0;
+                win_len = 0;
+                return;
+            }
             let class_c = script_class_of(ch, class);
             if Some(class_c) != class {
                 class = Some(class_c);
@@ -774,6 +821,26 @@ impl Tokenizer for DefaultTokenizer {
     }
 }
 
+/// A code point that **breaks** a gram window — and, on the query side, marks a word boundary (the
+/// §5 comonotone *stopping-block* boundary). v0.4/M4 breaks on Unicode whitespace only.
+///
+/// Whitespace-only is the recall-safe subset of the derivation's "whitespace + delimiter
+/// punctuation" (§5/§8). The asymmetry is decisive: *under*-splitting (merging two query words into
+/// one block) only **raises** the stop's variance, so it is conservative, whereas *over*-splitting
+/// a real word (the apostrophe in `don't`, the dots in `U.S.A`) under-counts the variance and fires
+/// the stop early — a recall loss. So inter-word delimiter-*punctuation* breaking is a deferred
+/// §5/§8 precision refinement; intra-word punctuation is word-internal regardless (§11). Digits and
+/// combining marks stay transparent (they inherit the current run), unchanged from v0.3.
+///
+/// Applied identically on the index side ([`tokenize`](Tokenizer::tokenize)) and the query side
+/// ([`tokenize_words`](Tokenizer::tokenize_words)) so the stored and queried grams agree (the
+/// single-tokenizer invariant). A break resets the window — so no gram spans it — and the dropped
+/// whitespace is not itself part of any gram.
+#[inline]
+fn is_break(c: char) -> bool {
+    c.is_whitespace()
+}
+
 /// The script class of `ch` for run segmentation: its strong script as `Script as u8`, or —
 /// for transparent `Common`/`Inherited` code points — the current run's class (or `Common`
 /// when no run has started yet).
@@ -799,14 +866,31 @@ struct GramTokens<'a> {
     class: Option<u8>,
     /// The current run's window width (`1..=3`), `0` before the first code point.
     n: usize,
+    /// The current word id (the §5 comonotone *stopping-block* id), incremented at each
+    /// [`is_break`] boundary. Surfaced only through [`next_tagged`](GramTokens::next_tagged) /
+    /// [`tokenize_words`](DefaultTokenizer::tokenize_words); the bare [`Iterator`] drops it. Starts
+    /// at `0`; leading/consecutive breaks may leave gaps, which is fine — only the *partition* of
+    /// grams into words matters to the stop.
+    word: u32,
 }
 
-impl Iterator for GramTokens<'_> {
-    type Item = Gram;
-
-    fn next(&mut self) -> Option<Gram> {
+impl GramTokens<'_> {
+    /// The next gram paired with its word id (the §5 stopping-block id). Whitespace (and any other
+    /// [`is_break`] code point) resets the window — so no gram straddles it — and bumps the word id.
+    /// A break also resets the script class to `None`, so the text after a break starts a fresh run
+    /// exactly like the start of the string (the leading-`Common` rule reapplies).
+    fn next_tagged(&mut self) -> Option<(Gram, u32)> {
         loop {
             let c = self.chars.next()?;
+            if is_break(c) {
+                // Word/window boundary: drop the break char, reset the window + class, advance the
+                // word id. `saturating_add` so a pathologically long query cannot wrap the counter.
+                self.class = None;
+                self.n = 0;
+                self.win_len = 0;
+                self.word = self.word.saturating_add(1);
+                continue;
+            }
             let class_c = script_class_of(c, self.class);
             if Some(class_c) != self.class {
                 // Run break: start a fresh window of the new class's width.
@@ -826,10 +910,31 @@ impl Iterator for GramTokens<'_> {
             }
             if self.win_len == self.n {
                 if let Some(g) = Gram::from_chars(&self.win[..self.n]) {
-                    return Some(g);
+                    return Some((g, self.word));
                 }
             }
         }
+    }
+}
+
+impl Iterator for GramTokens<'_> {
+    type Item = Gram;
+
+    fn next(&mut self) -> Option<Gram> {
+        self.next_tagged().map(|(g, _)| g)
+    }
+}
+
+/// The query-side word-tagged adaptor over [`GramTokens`] — yields each gram with its §5
+/// stopping-block (word) id. Indexing uses the bare [`GramTokens`] iterator (the word id is dropped
+/// but the *windowing* — whitespace breaking — is identical, so stored grams agree with queried).
+struct GramWords<'a>(GramTokens<'a>);
+
+impl Iterator for GramWords<'_> {
+    type Item = (Gram, u32);
+
+    fn next(&mut self) -> Option<(Gram, u32)> {
+        self.0.next_tagged()
     }
 }
 
@@ -1091,6 +1196,100 @@ mod tests {
     fn uses_bigrams_for_cjk() {
         let tok = DefaultTokenizer::new();
         assert_eq!(grams(&tok, "漢字漢"), ["漢字", "字漢"]);
+    }
+
+    // ----- v0.4/M4: whitespace breaks gram windows + word tagging -----------------
+
+    #[test]
+    fn whitespace_breaks_gram_windows_no_gram_straddles_a_word() {
+        let tok = DefaultTokenizer::new();
+        // "quick brown" used to be one run yielding cross-word grams ("k b", " br", …). Now the
+        // space breaks the window: per-word trigrams only, and no gram contains whitespace.
+        let g = grams(&tok, "quick brown");
+        assert_eq!(g, ["qui", "uic", "ick", "bro", "row", "own"]);
+        assert!(
+            g.iter().all(|t| !t.contains(' ')),
+            "no gram straddles the space: {g:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_and_leading_whitespace_just_break() {
+        let tok = DefaultTokenizer::new();
+        // Runs of whitespace, tabs/newlines, and leading space all break without manufacturing grams.
+        assert_eq!(grams(&tok, "  abc\tdef\n"), ["abc", "def"]);
+    }
+
+    #[test]
+    fn break_resets_class_like_string_start() {
+        let tok = DefaultTokenizer::new();
+        // After a break the next run starts fresh: "ab 123" → "ab" too short (no gram), then "123"
+        // is a leading-Common run → the Common trigram "123" (the digit does not inherit a stale
+        // Latin run across the break).
+        assert_eq!(grams(&tok, "ab 123"), ["123"]);
+        // Within a word an interior digit still inherits the run (unchanged from v0.3).
+        assert_eq!(grams(&tok, "a1b cd"), ["a1b"]);
+    }
+
+    #[test]
+    fn tokenize_words_tags_one_id_per_query_word() {
+        let tok = DefaultTokenizer::new();
+        let tagged: Vec<(String, u32)> = tok
+            .tokenize_words("quick brown")
+            .map(|(g, w)| (g.to_string(), w))
+            .collect();
+        // Word 0 = "quick" grams; the space bumps to word 1 = "brown" grams. Grams within a word
+        // share an id; no gram crosses the boundary.
+        assert_eq!(
+            tagged,
+            [
+                ("qui".to_string(), 0),
+                ("uic".to_string(), 0),
+                ("ick".to_string(), 0),
+                ("bro".to_string(), 1),
+                ("row".to_string(), 1),
+                ("own".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_words_default_is_one_block_for_plain_ngram() {
+        // The plain n-gram tokenizer keeps the trait default: every gram in block 0 (recall-safe),
+        // and it does NOT break on whitespace (its deliberate straddling is unchanged).
+        let tok = TrigramTokenizer::new();
+        let tagged: Vec<(String, u32)> = tok
+            .tokenize_words("a b")
+            .map(|(g, w)| (g.to_string(), w))
+            .collect();
+        assert_eq!(tagged, [("a b".to_string(), 0)]);
+    }
+
+    #[test]
+    fn tokenize_words_grams_match_tokenize_grams() {
+        // The tagged query path and the index path must emit the SAME grams (the single-tokenizer
+        // invariant) — only the word tags differ.
+        let tok = DefaultTokenizer::new();
+        for text in ["quick brown fox", "café 漢字 test", "  a1b  c2d "] {
+            let bare = grams(&tok, text);
+            let tagged: Vec<String> = tok
+                .tokenize_words(text)
+                .map(|(g, _)| g.to_string())
+                .collect();
+            assert_eq!(bare, tagged, "index vs query grams diverge for {text:?}");
+        }
+    }
+
+    #[test]
+    fn span_brackets_across_whitespace_break() {
+        // Span re-derivation must apply the same break, so it locates per-word grams and never a
+        // space-straddling gram.
+        let tok = DefaultTokenizer::new();
+        // "uic" occurs in "quick"; its span is inside the first word.
+        let span = tok.span("quick brown", &["uic"]).expect("span for uic");
+        assert_eq!(&"quick brown"[span.0..span.1], "uic");
+        // A would-be cross-word gram never matches.
+        assert_eq!(tok.span("quick brown", &["k b"]), None);
     }
 
     // ----- span -------------------------------------------------------------------

@@ -126,6 +126,37 @@ fn changing_the_tokenizer_empties_the_cache() {
 }
 
 #[test]
+fn a_stale_tokenizer_fingerprint_resets_the_cache() {
+    // v0.4/M4 bumped the DefaultTokenizer fingerprint (whitespace now breaks gram windows), so a
+    // pre-M4 cache must drop+rebuild on open — never migrate. Forge a stale stored fingerprint and
+    // confirm the reset path (the same mechanism the layout-byte bump triggers in production).
+    let h = Harness::new();
+    load_fixture(&h);
+    let path = h.db_path();
+    drop(h.index);
+
+    let raw = trifle::rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE meta SET value = '424242' WHERE key = 'tokenizer_fingerprint'",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+
+    let reopened = open_default(&path, 0);
+    assert!(
+        is_empty(&reopened, "quick brown fox"),
+        "a tokenizer-fingerprint mismatch drops the cache (reset, never migrate)"
+    );
+    assert_eq!(reopened.stats().unwrap().segments, 0);
+    // The reset re-stamps the live fingerprint, so a second reopen is warm after a rebuild.
+    reopened.rebuild(fixture_docs()).unwrap();
+    assert!(finds(&reopened, "quick brown fox"));
+    drop(open_default(&path, 0));
+    drop(h.dir);
+}
+
+#[test]
 fn schema_version_is_stamped_and_observable() {
     let h = Harness::new();
     let s = h.index.stats().unwrap();

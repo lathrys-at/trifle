@@ -91,32 +91,33 @@ fn emoji_and_wide_chars_do_not_break_indexing() {
 }
 
 #[test]
-fn mixed_script_representation_survives_a_tight_budget() {
-    // v0.4/M4 §5/§8 per-class floor, end-to-end: a mixed Latin+CJK query under a tight work budget
-    // still finds a CJK document. The df≈N Latin "common" grams are over budget and dropped, but the
-    // minority Han class is still represented (its rare grams seated), so the CJK doc is walked and
-    // found — per-script representation is not starved by a majority script monopolizing the budget.
+fn majority_script_cannot_bury_the_minority_under_stop_and_budget() {
+    // v0.4/M4 §5/§8 per-class floor, end-to-end: a Latin-majority corpus where the Latin query grams
+    // are themselves rare enough to satisfy the stop, plus one CJK doc. The per-class floor must
+    // still seat the minority Han class so its doc is found — representation is an invariant, not a
+    // tendency, even when the majority would clear the stop on its own.
     let h = Harness::new();
     {
         let mut w = h.index.writer().unwrap();
-        for d in 1..=50i64 {
-            let body = format!("common latin filler{d}");
+        for d in 1..=40i64 {
+            // distinctive-ish Latin so the query's Latin grams aren't all df≈N
+            let body = format!("alphagamma betadelta epsilonzeta token{d}");
             w.upsert(d, &[("f", body.as_str())]).unwrap();
         }
-        // One doc carries the (rare) CJK content alongside the common Latin word.
-        w.upsert(99, &[("f", "common 東京日本")]).unwrap();
+        w.upsert(99, &[("f", "alphagamma 東京日本語")]).unwrap();
         w.commit().unwrap();
     }
-    // Budget 8 < df("common")=51, so the common Latin grams are skipped; the Han grams (df=1) fit.
-    let opts = SearchOpts::new().df_budget(8).min_shared(1);
+    // Tight budget + a small k (earlier stop). The Han grams (df=1) are the rarest in their class.
+    let opts = SearchOpts::new().df_budget(12).min_shared(1).k_target(64);
     let hits = h
         .index
         .reader()
         .unwrap()
-        .matches("common 東京日本", &opts, 10)
+        .matches("alphagamma 東京日本語", &opts, 10)
         .unwrap();
     assert!(
         hit(&hits, 99),
-        "the minority Han class is represented under the budget, so its doc is found"
+        "the minority Han class is seated by the per-class floor; doc 99 found: {:?}",
+        ids(&hits)
     );
 }

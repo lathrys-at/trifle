@@ -13,6 +13,24 @@ fn exact_query_finds_the_document() {
 }
 
 #[test]
+fn whitespace_only_and_empty_queries_are_graceful() {
+    // v0.4/M4: whitespace breaks the gram window, so an all-whitespace or empty query produces no
+    // grams — it must return no matches (and never panic), while real queries still work.
+    let h = Harness::new();
+    load_fixture(&h);
+    for q in ["", " ", "   \t\n", "\u{00A0}"] {
+        assert!(
+            h.search(q, 10).unwrap().is_empty(),
+            "empty/whitespace query {q:?} yields no matches, no panic"
+        );
+    }
+    assert!(
+        !h.search("quick", 10).unwrap().is_empty(),
+        "a real query still works"
+    );
+}
+
+#[test]
 fn match_carries_provenance_and_text() {
     let h = Harness::new();
     h.put(42, "page-3.png", "the treaty was signed in vienna");

@@ -6,7 +6,10 @@
 //! Through M3 the bug was that the budget *didn't work even when set*: the unconditional typo-floor
 //! prefix kept the `F` rarest grams regardless of df, so when a query had fewer than `F` rare grams
 //! the floor reached into the `df≈N` common grams and `Σdf` scaled with `N`. M4 makes the floor
-//! df≤C-aware, so "set `C` ⟹ work bounded by `C`" is now true.
+//! df≤C-aware, so "set `C` ⟹ work bounded by `C`" is now true — *except* the §7/§12 rescue, which
+//! may walk one over-budget posting when **every** present gram is `df > C` (a pure-common query);
+//! `Σdf` is then O(N), the recall-floor that beats an empty result (see
+//! `rescue_walks_one_over_budget_posting`).
 
 mod common;
 use common::*;
@@ -103,6 +106,64 @@ fn the_candidate_union_is_bounded_under_a_budget() {
         n_cands <= 3,
         "the candidate union is bounded by the budget, not O(N) (got {n_cands} of 300)"
     );
+}
+
+#[test]
+fn rescue_walks_one_over_budget_posting_the_oc_exception() {
+    // The documented O(C) carve-out: a PURE-common query (every present gram is df>C) triggers the
+    // §7/§12 rescue, which keeps the single rarest gram regardless of the budget — so Σdf is O(N)
+    // here, the recall-floor that beats returning empty. (CODE IS CORRECT; this pins the exception.)
+    let h = corpus(200, 0); // all docs are common-only; query "common" has only df≈200 grams
+    let opts = SearchOpts::new().df_budget(5).min_shared(1);
+    let sigma_df = selected_sigma_df(&h, "common", &opts);
+    assert!(
+        sigma_df > 5,
+        "the rescue admits one over-budget posting; Σdf={sigma_df} exceeds the budget C=5"
+    );
+    // Recall is preserved — the query is not starved to empty.
+    let hits = h.search_opts("common", &opts, 5).unwrap();
+    assert!(!hits.is_empty(), "the rescue keeps the query non-empty");
+}
+
+#[test]
+fn batch_equals_serial_with_the_stop_active_and_under_a_budget() {
+    // batch == serial must hold WITH the §5 stop active and under a budget — the stop is a pure
+    // function of each query's grams + the shared snapshot, never a batch aggregate.
+    let h = Harness::new();
+    {
+        let mut w = h.index.writer().unwrap();
+        for d in 1..=300i64 {
+            let body = if d <= 5 {
+                format!("zqxwvy plingorf wibblethorpe common filler{d}")
+            } else {
+                format!("common filler{d}")
+            };
+            w.upsert(d, &[("f", body.as_str())]).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    let queries = [
+        "zqxwvy plingorf wibblethorpe", // rare, multi-word -> stop fires
+        "common",                       // common-only
+        "zqxwvy common plingorf",       // mix
+        "wibblethorpe filler3",         // rare + a filler
+    ];
+    for opts in [
+        SearchOpts::new(),                             // stop on at default k/c
+        SearchOpts::new().df_budget(30).min_shared(2), // tight budget
+        SearchOpts::new().k_target(8).c_margin(2.0),   // small k -> larger target -> later stop
+    ] {
+        let reader = h.index.reader().unwrap();
+        let batched = reader.matches_batch(&queries, &opts, 20).unwrap();
+        for (i, q) in queries.iter().enumerate() {
+            let serial = h.index.reader().unwrap().matches(q, &opts, 20).unwrap();
+            assert_eq!(
+                ids(&serial),
+                ids(&batched[i]),
+                "batch == serial must hold with the stop active for {q:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -35,7 +35,10 @@
 //! Because the unconditional minimum is now `df ≤ C`-bounded and the budget cutoff skips rather
 //! than breaks, `Σdf` over the selected set is bounded by `≈ (F + #classes + 1)·C` — O(C) for a
 //! fixed, small number of script classes — so the candidate union the engine walks is finally
-//! bounded by the work budget even for short / common queries (which were O(N) through M3).
+//! bounded by the work budget even for short / common queries (which were O(N) through M3) —
+//! *except* the §7/§12 rescue (step 3 below), which may walk one over-budget posting when **every**
+//! present gram is `df > C` (a pure-common query); `Σdf` is then O(N), the recall-floor that beats
+//! returning an empty result.
 //!
 //! Selection derives only from this query's own per-gram inputs and the shared snapshot it is
 //! handed (the per-class stats, `N`, `σ`, the energy/floor — all read once per batch) — never a
@@ -166,7 +169,14 @@ impl StopAcc {
     /// §5/§11). The gate matters when the target is non-positive (a tiny corpus, `N < k`, where the
     /// bare inequality would fire trivially) and doc-side (low `r`); when the target is positive the
     /// gate is implied, since the inequality holding against a positive target already requires
-    /// `Σ r·e − c·σ_match > 0`, which is exactly `r > c²/(B+c²)`.
+    /// `Σ r·e − c·σ_match > 0`, which **implies** `r > c²/(B+c²)` (with equality at `B = 1`, by
+    /// Cauchy–Schwarz; for `B ≥ 2` unequal blocks `Σ r·e − c·σ_match > 0` is strictly stronger, so
+    /// it still implies the gate).
+    ///
+    /// The gate itself is §5's *equal-block* bound: for `B ≥ 2` unequal blocks against a non-positive
+    /// target (a tiny corpus, `N < k`) it can pass while `Σ r·e − c·σ_match` is still negative — a
+    /// bounded, recall-safe residual (§5/§11), since the always-kept unconditional minimum is never
+    /// reduced and a sub-`k`-segment corpus has a tiny union anyway.
     fn fired(&self, c: f64, target: f64, r: f64) -> bool {
         let b = self.block_sum.len() as f64;
         if b <= 0.0 {
@@ -772,6 +782,124 @@ mod tests {
         assert!(
             kept.contains(&"minority".to_string()),
             "the per-class floor seats the minority script's gram even under a tight stop/budget"
+        );
+    }
+
+    #[test]
+    fn stopacc_b_zero_never_fires() {
+        // Non-floored grams whose clamped energy is 0 (common grams) form no positive-energy block,
+        // so B stays 0 and the stop CANNOT fire — even against a wildly negative target. (Distinct
+        // from the all-floored path, which excludes via the floored flag.)
+        let mut acc = StopAcc::new();
+        for _ in 0..5 {
+            acc.admit(3, -1.0, false, 0, 0.9); // E < 0 -> clamps to 0 -> excluded
+        }
+        assert_eq!(acc.block_sum.len(), 0, "no positive-energy block formed");
+        assert!(
+            !acc.fired(2.0, -100.0, 0.9),
+            "B=0 must never fire even against a wildly negative target"
+        );
+    }
+
+    #[test]
+    fn gate_boundary_is_inclusive_at_b_one() {
+        // The recall-safety gate r ≥ c²/(B+c²). At c=2, B=1 the threshold is exactly 0.8. One block,
+        // energy 10: against a zero target the stop fires iff r ≥ 0.8 (the gate is inclusive).
+        let mk = |r: f64| {
+            let mut acc = StopAcc::new();
+            acc.admit(3, 10.0, false, 0, r);
+            acc
+        };
+        assert!(
+            !mk(0.79).fired(2.0, 0.0, 0.79),
+            "r below the 0.8 gate cannot fire"
+        );
+        assert!(
+            mk(0.80).fired(2.0, 0.0, 0.80),
+            "r exactly at the 0.8 gate clears a zero target (inclusive)"
+        );
+        assert!(mk(0.81).fired(2.0, 0.0, 0.81), "r above the gate fires");
+    }
+
+    #[test]
+    fn floored_and_zero_energy_keep_count_but_form_no_block() {
+        // The two exclusion paths (floored, and clamped-energy 0) are independent and both keep B at
+        // 0 while still charging the work budget (sum_df).
+        let mut acc = StopAcc::new();
+        acc.admit(7, 6.9, true, 0, 0.9); // floored -> excluded from mean/var, sum_df += 7
+        acc.admit(4, 0.0, false, 1, 0.9); // e == 0 -> excluded, sum_df += 4
+        assert_eq!(acc.sum_df, 11, "both still cost their postings");
+        assert_eq!(acc.block_sum.len(), 0, "neither forms an evidence block");
+        assert_eq!(acc.sum_e, 0.0);
+        assert_eq!(acc.sum_var, 0.0);
+    }
+
+    #[test]
+    fn single_gram_query_keeps_the_one_gram() {
+        let t = energy_rows(&[("only", 4, 6.0)]);
+        let p = SelectParams {
+            min_shared: 1,
+            typo_damage: 0,
+            n_segments: 1000,
+            k_target: 128,
+            ..params(1, 64)
+        };
+        assert_eq!(select(&t, p, &snap()), ["only"], "the lone gram is kept");
+    }
+
+    #[test]
+    fn greedy_skipped_when_minimum_already_clears_target() {
+        // F=2 high-energy grams clear a small target, so the remaining 4 must NOT be collected.
+        let t = energy_rows(&[
+            ("a", 3, 9.0),
+            ("b", 3, 9.0),
+            ("c", 3, 9.0),
+            ("d", 3, 9.0),
+            ("e", 3, 9.0),
+            ("f", 3, 9.0),
+        ]);
+        let p = SelectParams {
+            min_shared: 1,
+            typo_damage: 1, // F = 2
+            n_segments: 1000,
+            k_target: 128,
+            ..params(1, 64)
+        };
+        let kept = select(&t, p, &snap());
+        assert_eq!(
+            kept.len(),
+            2,
+            "greedy is skipped once the floor already fired the stop ({kept:?})"
+        );
+    }
+
+    #[test]
+    fn per_class_floor_drops_an_over_budget_only_class() {
+        // A class whose only present gram is df>C is excluded by the work budget — NOT rescued into a
+        // floor seat (the bounded recall cost of §5), while an in-budget class is seated.
+        let mut t = energy_rows(&[("maj", 3, 5.0)]); // class 0, df=3, in budget
+        t.push(GramRow {
+            token: "expensive".to_string(),
+            df: 1000, // > C
+            class: 2,
+            order: 3,
+            word: 1,
+            energy: 6.0,
+            floored: false,
+        });
+        let p = SelectParams {
+            min_shared: 1,
+            typo_damage: 0,
+            df_budget: Some(50),
+            n_segments: 1000,
+            k_target: 128,
+            ..params(1, 64)
+        };
+        let kept = select(&t, p, &snap());
+        assert!(kept.contains(&"maj".to_string()), "in-budget class seated");
+        assert!(
+            !kept.contains(&"expensive".to_string()),
+            "a class whose only gram is df>C is dropped, not rescued into a floor seat"
         );
     }
 }

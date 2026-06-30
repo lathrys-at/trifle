@@ -100,6 +100,23 @@ fn wider_t_max_never_loses_a_narrow_hit() {
 }
 
 #[test]
+fn two_char_words_index_nothing_and_are_consistent() {
+    // M4/M5 boundary: with whitespace breaking the window, a doc whose every word is < 3 chars now
+    // indexes ZERO grams (a Latin trigram needs 3). Index and query agree, so this is a *consistent*
+    // (if unsearchable) state — same as v0.3's "too short for a trigram", not a divergence. The
+    // structural bigram fallback for such short queries is M5 (the dual-order secondary view).
+    let h = Harness::new();
+    h.put(1, "f", "ab cd ef");
+    assert!(
+        !hit(&h.search("ab cd ef", 10).unwrap(), 1),
+        "all-short-word doc indexes no grams (consistent zero-recall, not a divergence)"
+    );
+    // A normal doc in the same index is unaffected.
+    h.put(2, "f", "quick brown");
+    assert!(hit(&h.search("quick brown", 10).unwrap(), 2));
+}
+
+#[test]
 fn ranking_prefers_the_higher_overlap_document() {
     let h = Harness::new();
     h.put(1, "f", "quick brown fox"); // many shared trigrams

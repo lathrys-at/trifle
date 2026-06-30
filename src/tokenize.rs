@@ -1266,30 +1266,87 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_words_grams_match_tokenize_grams() {
-        // The tagged query path and the index path must emit the SAME grams (the single-tokenizer
-        // invariant) — only the word tags differ.
+    fn index_equals_query_grams_under_adversarial_whitespace() {
+        // The single-tokenizer invariant: the index path (`tokenize`) and the query path
+        // (`tokenize_words`) MUST emit the same grams — only the word tags differ — across the full
+        // zoo of whitespace (NBSP, em-space, VT/FF/NEL, CR/LF, tabs, runs, leading/trailing), short
+        // words, mixed script, and intra-word punctuation. And no emitted gram may contain a break.
         let tok = DefaultTokenizer::new();
-        for text in ["quick brown fox", "café 漢字 test", "  a1b  c2d "] {
+        let cases = [
+            "",
+            " ",
+            "   ",
+            "\t\n\r",
+            "\u{00A0}",                         // NBSP only
+            "a",                                // 1-char Latin
+            "ab",                               // 2-char Latin (no trigram)
+            "abc",                              // exactly one trigram
+            "  abc\tdef\n",                     // leading + tab + trailing
+            "quick\u{00A0}brown",               // NBSP between words
+            "a\u{2003}b\u{2003}ccc",            // em-space separated, short/long mix
+            "café 漢字 test",                   // mixed script with spaces + combining-capable
+            "漢字\t漢",                         // CJK split by tab
+            "a1b cd2",                          // interior digits + a 2-char word
+            "\u{000B}\u{000C}word\u{0085}next", // VT, FF, NEL
+            "don't stop",                       // apostrophe is NOT whitespace -> intra-word
+        ];
+        for text in cases {
             let bare = grams(&tok, text);
             let tagged: Vec<String> = tok
                 .tokenize_words(text)
                 .map(|(g, _)| g.to_string())
                 .collect();
-            assert_eq!(bare, tagged, "index vs query grams diverge for {text:?}");
+            assert_eq!(
+                bare, tagged,
+                "index vs query grams must agree (single-tokenizer invariant) for {text:?}"
+            );
+            assert!(
+                bare.iter().all(|g| !g.chars().any(|c| c.is_whitespace())),
+                "no gram may contain whitespace for {text:?}: {bare:?}"
+            );
         }
     }
 
     #[test]
-    fn span_brackets_across_whitespace_break() {
-        // Span re-derivation must apply the same break, so it locates per-word grams and never a
-        // space-straddling gram.
+    fn word_ids_partition_grams_by_word_no_cross_word_gram() {
+        // Word ids are constant within a word and non-decreasing across words; three words yield
+        // three distinct ids and no gram straddles a boundary.
         let tok = DefaultTokenizer::new();
-        // "uic" occurs in "quick"; its span is inside the first word.
+        let tagged: Vec<(String, u32)> = tok
+            .tokenize_words("quick brown foxes")
+            .map(|(g, w)| (g.to_string(), w))
+            .collect();
+        let mut last = 0u32;
+        let mut words = std::collections::BTreeSet::new();
+        for (g, w) in &tagged {
+            assert!(*w >= last, "word ids are non-decreasing: {tagged:?}");
+            last = *w;
+            words.insert(*w);
+            assert!(
+                !g.chars().any(|c| c.is_whitespace()),
+                "no cross-word gram: {g:?}"
+            );
+        }
+        assert_eq!(words.len(), 3, "three distinct words tagged: {tagged:?}");
+    }
+
+    #[test]
+    fn span_never_returns_a_cross_word_gram() {
+        // Span re-derivation applies the same break, so it locates per-word grams and never a
+        // space-straddling one.
+        let tok = DefaultTokenizer::new();
         let span = tok.span("quick brown", &["uic"]).expect("span for uic");
         assert_eq!(&"quick brown"[span.0..span.1], "uic");
-        // A would-be cross-word gram never matches.
-        assert_eq!(tok.span("quick brown", &["k b"]), None);
+        assert_eq!(
+            tok.span("quick brown", &["k b"]),
+            None,
+            "a space-straddling gram is never located"
+        );
+        assert_eq!(
+            tok.span("quick brown", &["ck "]),
+            None,
+            "a trailing-space gram is never located"
+        );
     }
 
     // ----- span -------------------------------------------------------------------

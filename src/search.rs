@@ -938,6 +938,13 @@ fn score_union(
                     Some(s) => {
                         let bound = s.score as f64 * delta + cred_max;
                         // Cheap gate first (kth_best ≤ max_float_seen): only then pay kth_largest.
+                        // PERF (deferred, derivation §7): this per-qualifying-chunk `kth_largest`
+                        // recompute is a KNOWN, BOUNDED cost — worst `O(union²/CHUNK)` on a deep-k
+                        // query where the stop never fires (the cheap gate then never opens, so the
+                        // worst case is mostly avoided), ~0 for a shallow k, cardinality-independent
+                        // (so flatness holds), and dominated by the per-chunk `O(union)` SQL. A
+                        // bounded top-k min-heap / memoized `kth_best` is a focused perf follow-up;
+                        // it is deliberately NOT done here to avoid churning the verified reshape.
                         if bound < max_float_seen {
                             let vals: Vec<f64> = best.values().map(|(_, f)| *f).collect();
                             if bound < kth_largest(&vals, lim) {

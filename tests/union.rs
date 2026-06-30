@@ -1,0 +1,465 @@
+//! v0.4 M3 candidate-set-invariance spine (the G2 reshape): the load-bearing claim is that the
+//! candidate SET is **invariant** under M3 = `{seg : raw_overlap ≥ floor}` — M3 only *rescores* and
+//! reshapes, never shrinks it — so recall is preserved by construction. These are the M3 panel's
+//! strongest regression guards, promoted from review probes to committed tests:
+//!
+//! - an **independent brute-force oracle** (`{doc : |grams(q)∩grams(doc)| ≥ floor}` via the public
+//!   `DefaultTokenizer`, never touching the walk / `U_zero`) pinning the full candidate key set,
+//!   across all four candidate kinds × queries × floors, plus floor-nesting monotonicity;
+//! - count-only filter preservation (the `SqlFilter` folds into the `U_zero` provenance read);
+//! - `eager (early-stop) == full drain` EXACTLY for every `k` with count-only candidates in the
+//!   mix — including a fixed-seed randomized stress over many corpus/query shapes;
+//! - tie determinism (identical-float count-only docs ⇒ a stable seg-id-ascending prefix);
+//! - null finiteness / degenerate edges (huge `L_d`, ubiquitous `p = 1`, `limit = 0`).
+
+mod common;
+use common::*;
+
+use std::borrow::Borrow;
+use std::collections::BTreeSet;
+
+use trifle::rusqlite::ToSql;
+use trifle::tokenize::{DefaultTokenizer, Tokenizer};
+use trifle::{SearchOpts, SqlFilter};
+
+/// Distinct gram strings the `DefaultTokenizer` produces for `text` — the same tokenizer trifle
+/// runs on index, postings, AND query, so this brute-force mirror agrees with the engine by
+/// construction.
+fn grams(text: &str) -> BTreeSet<String> {
+    let tk = DefaultTokenizer::default();
+    tk.tokenize(text)
+        .map(|g| {
+            let s: &str = g.borrow();
+            s.to_string()
+        })
+        .collect()
+}
+
+/// The INDEPENDENT brute-force candidate set: every doc whose segment shares at least `floor` grams
+/// with the query, where `floor = min(min_shared, #present query grams)` — exactly the engine's
+/// `floor = min(min_shared, ops.len())` once selection keeps every present gram (true for the small
+/// queries here, all ≤ `t_max = 12`). Computed without the walk / `U_zero`, so it is a true oracle
+/// for the M3 spine `{raw_overlap ≥ floor}`.
+fn brute_force_set(query: &str, docs: &[(i64, &str)], min_shared: usize) -> BTreeSet<i64> {
+    let q = grams(query);
+    let doc_grams: Vec<(i64, BTreeSet<String>)> =
+        docs.iter().map(|(id, t)| (*id, grams(t))).collect();
+    // Present query grams = those with df > 0 (in at least one doc); an absent gram has an empty
+    // posting and can never reach the floor, exactly as trifle's `floor` counts present postings.
+    let present_q: BTreeSet<&String> = q
+        .iter()
+        .filter(|g| doc_grams.iter().any(|(_, dg)| dg.contains(*g)))
+        .collect();
+    let floor = min_shared.min(present_q.len()).max(1);
+    doc_grams
+        .iter()
+        .filter(|(_, dg)| present_q.iter().filter(|g| dg.contains(**g)).count() >= floor)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// The full (`limit = None`) candidate key SET, via the lazy stream — before any top-k truncation.
+fn full_set(h: &Harness, query: &str, opts: &SearchOpts<'_>) -> BTreeSet<i64> {
+    full_order(h, query, opts).into_iter().collect()
+}
+
+/// The full (`limit = None`) candidate key ORDER, via the lazy stream (corrected-float best-first).
+fn full_order(h: &Harness, query: &str, opts: &SearchOpts<'_>) -> Vec<i64> {
+    let reader = h.index.reader().unwrap();
+    reader
+        .candidates(query, opts)
+        .unwrap()
+        .map(|c| c.unwrap().key().as_i64().unwrap())
+        .collect()
+}
+
+/// Load `(id, &str)` docs, one `"f"` segment each (flat schema ⇒ key == id ⇒ no per-key dedup).
+fn load(h: &Harness, docs: &[(i64, &str)]) {
+    let mut w = h.index.writer().unwrap();
+    for (id, t) in docs {
+        w.upsert(*id, &[("f", *t)]).unwrap();
+    }
+    w.commit().unwrap();
+}
+
+// --- P1: candidate-set invariance vs the brute-force oracle (the strongest spine guard) ---------
+
+#[test]
+fn candidate_set_equals_brute_force_oracle() {
+    // A corpus mixing every candidate kind the union must recover:
+    //  - "abcd"        → abc/bcd (high df ⇒ weight 0 ⇒ count-only)
+    //  - "abcx"        → abc (shared count-only) + bcx
+    //  - "zzqwx"       → a RARE token (small df ⇒ floored, positive weight ⇒ walk candidate)
+    //  - "zzqwx abcd"  → a walk gram AND count-only grams in one seg (the one-positive-plus-
+    //                    several-zero case that bites with min_shared > 1)
+    //  - "mnop"        → no query-gram overlap (control: must never appear)
+    let mut docs: Vec<(i64, &str)> = Vec::new();
+    for i in 1..=40 {
+        docs.push((i, "abcd"));
+    }
+    for i in 41..=55 {
+        docs.push((i, "abcx"));
+    }
+    for i in 56..=60 {
+        docs.push((i, "zzqwx"));
+    }
+    for i in 61..=66 {
+        docs.push((i, "zzqwx abcd"));
+    }
+    for i in 67..=100 {
+        docs.push((i, "mnop"));
+    }
+
+    let queries = ["abcd", "zzqwx abcd", "abcx", "zzqwx", "abcd mnop"];
+    for q in queries {
+        for ms in [1usize, 2, 3] {
+            let h = Harness::new();
+            load(&h, &docs);
+            let opts = SearchOpts::new().min_shared(ms as u32);
+            let actual = full_set(&h, q, &opts);
+            let expected = brute_force_set(q, &docs, ms);
+            assert_eq!(
+                actual,
+                expected,
+                "candidate set must equal {{raw_overlap ≥ floor}} for q={q:?} min_shared={ms}\n\
+                 missing (in oracle, dropped by M3): {:?}\n\
+                 extra   (in M3, not in oracle):     {:?}",
+                expected.difference(&actual).collect::<Vec<_>>(),
+                actual.difference(&expected).collect::<Vec<_>>(),
+            );
+        }
+    }
+}
+
+#[test]
+fn floor_nesting_is_monotone() {
+    // set(ms=3) ⊆ set(ms=2) ⊆ set(ms=1): raising the floor can only SHRINK the set, never add a
+    // member. A bug that wrongly INCLUDES a sub-floor seg (e.g. a `U_zero > 0` gate) breaks nesting.
+    let mut docs: Vec<(i64, &str)> = Vec::new();
+    for i in 1..=30 {
+        docs.push((i, "abcd"));
+    }
+    for i in 31..=45 {
+        docs.push((i, "abcx"));
+    }
+    for i in 46..=80 {
+        docs.push((i, "wxyz"));
+    }
+    let q = "abcd wxyz";
+    let sets: Vec<BTreeSet<i64>> = [1u32, 2, 3]
+        .iter()
+        .map(|&ms| {
+            let h = Harness::new();
+            load(&h, &docs);
+            full_set(&h, q, &SearchOpts::new().min_shared(ms))
+        })
+        .collect();
+    assert!(
+        sets[2].is_subset(&sets[1]),
+        "set(ms=3) ⊆ set(ms=2): {:?} ⊄ {:?}",
+        sets[2],
+        sets[1]
+    );
+    assert!(
+        sets[1].is_subset(&sets[0]),
+        "set(ms=2) ⊆ set(ms=1): {:?} ⊄ {:?}",
+        sets[1],
+        sets[0]
+    );
+    for (i, ms) in [1usize, 2, 3].into_iter().enumerate() {
+        assert_eq!(
+            sets[i],
+            brute_force_set(q, &docs, ms),
+            "set(ms={ms}) == oracle"
+        );
+    }
+}
+
+// --- P2: count-only filter preservation (the SqlFilter folds into the U_zero provenance read) ---
+
+#[test]
+fn filter_drops_count_only_candidates() {
+    // Every doc is "report data" ⇒ both query grams are ubiquitous ⇒ weight 0 ⇒ EVERY candidate is
+    // count-only (recovered by `U_zero`, never the walk). A `key >= 50` filter must still drop the
+    // count-only candidates below 50 — proving the filter folds into the `U_zero` provenance read,
+    // on both the lazy and the eager path (which share `score_union`).
+    let docs: Vec<(i64, &str)> = (1..=80).map(|i| (i, "report data")).collect();
+    let h = Harness::new();
+    load(&h, &docs);
+
+    let cutoff: i64 = 50;
+    let params: Vec<&dyn ToSql> = vec![&cutoff];
+    let opts = SearchOpts::new()
+        .min_shared(1)
+        .filter(SqlFilter::new("key >= ?1", &params));
+    let got = full_set(&h, "report data", &opts);
+    assert_eq!(
+        got,
+        (50..=80).collect::<BTreeSet<i64>>(),
+        "the filter must apply to count-only candidates (U_zero path): got {got:?}"
+    );
+
+    let params2: Vec<&dyn ToSql> = vec![&cutoff];
+    let opts_eager = SearchOpts::new()
+        .min_shared(1)
+        .filter(SqlFilter::new("key >= ?1", &params2));
+    let eager = ids(&h.search_opts("report data", &opts_eager, 100).unwrap());
+    assert!(
+        eager.iter().all(|k| *k >= 50),
+        "no count-only candidate below the cutoff may leak via the eager path: {eager:?}"
+    );
+    assert_eq!(eager.len(), 31, "exactly keys 50..=80 survive the filter");
+}
+
+// --- P3: eager (early-stop) == full drain EXACTLY, with count-only candidates in the mix --------
+
+#[test]
+fn eager_equals_full_drain_with_count_only_in_the_mix() {
+    // walk candidates (rare "qzj", floored, high E_acc), credited non-floored "abc" (the count
+    // credit flips ordering), AND a pile of count-only "report data" docs (E_acc 0). The early-stop
+    // SKIPS U_zero; the full drain INCLUDES it — they must still agree for every k because a
+    // count-only float ≤ cred_max < bound < kth_best whenever the stop fires.
+    let h = Harness::new();
+    let mut docs: Vec<(i64, &str)> = Vec::new();
+    for i in 1..=3 {
+        docs.push((i, "qzj"));
+    }
+    for i in 10..=40 {
+        docs.push((i, "abc"));
+    }
+    for i in 50..=120 {
+        docs.push((i, "report data"));
+    }
+    load(&h, &docs);
+
+    let reader = h.index.reader().unwrap();
+    let opts = SearchOpts::new().min_shared(1);
+    let q = "qzj abc report data";
+    let full = full_order(&h, q, &opts);
+    assert!(
+        full.len() > 20,
+        "a deep union incl. count-only: {}",
+        full.len()
+    );
+
+    for k in [1usize, 2, 3, 4, 5, 8, 13, 21, full.len(), full.len() + 5] {
+        let eager = ids(&reader.matches(q, &opts, k).unwrap());
+        assert_eq!(
+            eager,
+            full[..k.min(full.len())].to_vec(),
+            "eager matches({k}) must equal the full-drain prefix (early-stop == full drain)"
+        );
+    }
+}
+
+#[test]
+fn eager_equals_full_drain_concentrated_with_length_variation() {
+    // Concentration cap + length null + count-only, with VARYING seg lengths so the float ordering
+    // is non-trivial (the null actually moves ranks). Still exact for every k.
+    let h = Harness::new();
+    let mut docs: Vec<(i64, &str)> = Vec::new();
+    for i in 1..=8 {
+        docs.push((i, "kqxvz")); // rare, short
+    }
+    for i in 9..=16 {
+        docs.push((i, "kqxvz padding alpha beta gamma")); // rare but long ⇒ null debits
+    }
+    for i in 20..=70 {
+        docs.push((i, "report system data")); // commons ⇒ count-only, concentrated
+    }
+    load(&h, &docs);
+
+    let reader = h.index.reader().unwrap();
+    let opts = SearchOpts::new().min_shared(1);
+    let q = "kqxvz report system data";
+    let full = full_order(&h, q, &opts);
+    for k in [1usize, 2, 3, 5, 8, 16, 30, full.len()] {
+        let eager = ids(&reader.matches(q, &opts, k).unwrap());
+        assert_eq!(
+            eager,
+            full[..k.min(full.len())].to_vec(),
+            "concentrated + null eager({k}) == full-drain prefix"
+        );
+    }
+}
+
+/// A tiny deterministic `xorshift64` — a fixed seed makes the randomized stress reproducible
+/// (batch == serial / thrash-safe), so a future early-stop edit that breaks `eager == full` fails
+/// identically every run.
+struct Rng(u64);
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+    fn range(&mut self, lo: usize, hi: usize) -> usize {
+        lo + self.below(hi - lo + 1)
+    }
+}
+
+#[test]
+fn randomized_eager_equals_full_drain_stress() {
+    // 64 fixed-seed trials of a random corpus + random query (mixed short count-only tokens and
+    // multi-gram tokens, so walk / count-only / floored candidates all occur), asserting
+    // matches(q, k) == candidates().take(k) for EVERY k across the walk/count-only boundary and
+    // past |union|. Strictly stronger than any single fixed fixture against future early-stop edits.
+    const VOCAB: &[&str] = &[
+        "abc", "abd", "bcd", "xyz", "pqr", "qzj", "report", "data", "system", "value", "alpha",
+        "beta",
+    ];
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    for trial in 0..64 {
+        let n = rng.range(5, 40);
+        let docs_owned: Vec<(i64, String)> = (1..=n as i64)
+            .map(|id| {
+                let ntok = rng.range(1, 3);
+                let text = (0..ntok)
+                    .map(|_| VOCAB[rng.below(VOCAB.len())])
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (id, text)
+            })
+            .collect();
+        let nq = rng.range(1, 4);
+        let query = (0..nq)
+            .map(|_| VOCAB[rng.below(VOCAB.len())])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let min_shared = rng.range(1, 3) as u32;
+
+        let h = Harness::new();
+        {
+            let mut w = h.index.writer().unwrap();
+            for (id, t) in &docs_owned {
+                w.upsert(*id, &[("f", t.as_str())]).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let reader = h.index.reader().unwrap();
+        let opts = SearchOpts::new().min_shared(min_shared);
+        let full = full_order(&h, &query, &opts);
+        for k in 0..=full.len() + 2 {
+            let eager = ids(&reader.matches(&query, &opts, k).unwrap());
+            assert_eq!(
+                eager,
+                full[..k.min(full.len())].to_vec(),
+                "trial {trial}: eager matches(k={k}) == full-drain prefix \
+                 (n={n} q={query:?} min_shared={min_shared})"
+            );
+        }
+    }
+}
+
+#[test]
+fn identical_float_count_only_docs_have_a_deterministic_seg_id_prefix() {
+    // Many docs with IDENTICAL text ⇒ identical corrected float (all count-only, E_acc 0). The sort
+    // tiebreak (float desc → integer energy desc → seg id asc) must yield a deterministic seg-id-
+    // ascending prefix; eager matches(k) must equal that prefix for every k, and be stable across
+    // repeated runs (batch == serial / thrash-safe).
+    let h = Harness::new();
+    let docs: Vec<(i64, &str)> = (1..=40).map(|i| (i, "report data system")).collect();
+    load(&h, &docs);
+    let reader = h.index.reader().unwrap();
+    let opts = SearchOpts::new().min_shared(1);
+    let q = "report data system";
+
+    let full = full_order(&h, q, &opts);
+    // Flat schema: key == doc id, and ids are allocated monotonically in insertion order, so the
+    // all-tie order is the seg-id-ascending key sequence.
+    assert_eq!(
+        full,
+        (1..=40).collect::<Vec<i64>>(),
+        "an all-tie union orders by seg id ascending: {full:?}"
+    );
+    for k in [1usize, 5, 17, 40] {
+        let eager = ids(&reader.matches(q, &opts, k).unwrap());
+        assert_eq!(
+            eager,
+            full[..k.min(full.len())].to_vec(),
+            "eager({k}) == tie prefix"
+        );
+    }
+    for _ in 0..10 {
+        assert_eq!(
+            full_order(&h, q, &opts),
+            full,
+            "tie order stable across runs"
+        );
+    }
+}
+
+// --- P5: null / degenerate edges — huge L_d, ubiquitous p = 1, limit = 0; never NaN / panic -----
+
+#[test]
+fn huge_length_and_ubiquitous_grams_stay_finite() {
+    // p = 1 grams (df = N) plus a pathologically long off-topic-padded segment ⇒ the largest null
+    // debit the §6 form can produce. Scores must stay finite (no NaN reaching total_cmp), every
+    // matching doc must still be retrieved (recall-safe), and the huge seg must rank last.
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    for i in 1..=20 {
+        docs.push((i, "report data".to_string())); // ubiquitous ⇒ p = 1 for the query grams
+    }
+    let mut huge = String::from("report data");
+    for w in 0..400 {
+        huge.push_str(&format!(" w{w}x")); // hundreds of distinct off-topic grams ⇒ rel_len ≫ 1
+    }
+    docs.push((500, huge));
+    {
+        let mut w = h.index.writer().unwrap();
+        for (id, t) in &docs {
+            w.upsert(*id, &[("f", t.as_str())]).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    let reader = h.index.reader().unwrap();
+    let opts = SearchOpts::new().min_shared(1);
+    let cands: Vec<_> = reader
+        .candidates("report data", &opts)
+        .unwrap()
+        .map(|c| c.unwrap())
+        .collect();
+    assert!(
+        cands.iter().all(|c| c.corrected_score().is_finite()),
+        "no NaN / inf corrected score even with a huge L_d"
+    );
+    let order: Vec<i64> = cands.iter().map(|c| c.key().as_i64().unwrap()).collect();
+    assert_eq!(
+        order.len(),
+        21,
+        "every matching doc retrieved (recall-safe)"
+    );
+    assert!(
+        order.contains(&500),
+        "the huge padded seg is still retrieved"
+    );
+    assert_eq!(
+        *order.last().unwrap(),
+        500,
+        "the huge off-topic-padded seg ranks last (largest length-null debit): {order:?}"
+    );
+}
+
+#[test]
+fn limit_zero_is_empty_and_full_stream_never_early_stops() {
+    let h = Harness::new();
+    let docs: Vec<(i64, &str)> = (1..=30).map(|i| (i, "report data")).collect();
+    load(&h, &docs);
+    let opts = SearchOpts::new().min_shared(1);
+    assert!(
+        h.search_opts("report data", &opts, 0).unwrap().is_empty(),
+        "limit = 0 ⇒ empty, no work"
+    );
+    assert_eq!(
+        full_set(&h, "report data", &opts).len(),
+        30,
+        "limit = None never early-stops: every matching doc present"
+    );
+}

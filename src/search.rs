@@ -129,10 +129,18 @@ impl Candidate {
     pub fn overlap(&self) -> u32 {
         self.overlap
     }
-    /// The **ranking key**: the §6/§7 length-corrected score `E_acc·Δ + Σ_n μ_n·popcount_n − null`
-    /// (energy in nats + count credit − the saturating length null). This is what trifle sorts by;
-    /// it can be negative (the null dominates) and is `f64`. Use this — not [`score`](Self::score)
-    /// — for a custom rerank that wants trifle's own ordering value.
+    /// The **ranking key** trifle sorts by — an `f64` whose meaning depends on the query's path:
+    /// - **single-view (clean / not-starved) query:** the §6/§7 length-corrected score
+    ///   `E_acc·Δ + Σ_n μ_n·popcount_n − null` (energy in nats + count credit − the saturating
+    ///   length null); it can be negative (the null dominates).
+    /// - **fused (starved, multi-view) query:** the reciprocal-rank-fusion score
+    ///   `Σ_v w_v/(k_RRF + rank_v)` (derivation §8), a small positive value (≈ `0.01`–`0.03` at the
+    ///   default `k_RRF = 60`) on a different scale from the single-view float.
+    ///
+    /// So it is the right key to sort *this query's* candidates by, but it is **not comparable
+    /// across queries** of differing cleanliness (a fused query's scores are RRF-scale, a clean
+    /// query's are nat-scale). Use this — not [`score`](Self::score) — for a custom rerank that
+    /// wants trifle's own per-query ordering value.
     pub fn corrected_score(&self) -> f64 {
         self.corrected_score
     }
@@ -266,10 +274,15 @@ impl QueryPlan {
 
 /// One query planned into its rank-views (derivation §8) — the reciprocal-rank-fusion unit.
 ///
-/// `views` holds 1 [`QueryPlan`] (PRIMARY-only, the clean-query path that is byte-identical to
-/// M1–M4) or 2 (PRIMARY + SECONDARY, a starved query). Each view is scored independently by the full
-/// [`score_union`] pipeline; with 2 views the per-view rankings are RRF-fused (`view_weights`,
-/// `K_RRF`, `missing="omit"`). `fused_selected` is the union of every view's selected token strings,
+/// `views` holds 1 [`QueryPlan`] (PRIMARY-only, the clean-query path — the same CODE PATH as
+/// M1–M4: `score_union` with the eager early-stop, the candidate set + recall unchanged) or 2
+/// (PRIMARY + SECONDARY, a starved query). Note the single-view *code* path is unchanged, but a
+/// clean query's corrected-score *magnitude* shifts slightly vs a trigram-only (pre-M5) index:
+/// `avgdl`/`seg.len` now count dual-order grams, so the §6 length null's `L_d/L̄` re-bases — a
+/// recall-safe precision-level consequence of dual-order indexing, not a ranking-set change. Each
+/// view is scored independently by the full [`score_union`] pipeline; with 2 views the per-view
+/// rankings are RRF-fused (`view_weights`, `K_RRF`, `missing="omit"`). `fused_selected` is the union
+/// of every view's selected token strings,
 /// for span location at hydrate (a fused candidate may have matched in either view). `n_segments` /
 /// `avgdl` are the shared snapshot stats (also on each view's plan, but held here so the accessors
 /// work even when `views` is empty — a query with no in-corpus gram in any view).
@@ -779,36 +792,52 @@ fn plan_views<T: Tokenizer>(
     // narrowing of §12's literal while-loop, which would fall PRIMARY→SECONDARY on any all-absent
     // primary view). The §8 structural fallback (too-short queries) and §5 corroboration (weak but
     // present primary) are both preserved.
-    let starved = present_scripts.iter().any(|&s| {
-        let produced = produced_primary_count.get(&s).copied().unwrap_or(0);
-        let present = primary_present_count.get(&s).copied().unwrap_or(0);
-        let fe = full_primary_e.get(&s).copied().unwrap_or(0.0);
-        let ce = collected_primary_e.get(&s).copied().unwrap_or(0.0);
-        let structural = produced == 0;
-        let corroborative =
-            present >= 1 && ((present as f64) < nu || (fe > 0.0 && ce < STARVED_ENERGY_RATIO * fe));
-        structural || corroborative
-    });
+    // The PER-SCRIPT starved set (derivation §8/§12): the secondary view pools the one-shorter
+    // order of each STARVED script ONLY — "a rich script with a primary gram omits its secondary."
+    // Gating the whole query on one bool would leak a rich script's bigram coincidences into a
+    // mixed-script query (recall-safe via RRF missing=omit, but under a tight `limit` a leaked
+    // candidate could evict a genuine minority-script match), so the set is computed per script.
+    let starved_scripts: FxHashSet<u8> = present_scripts
+        .iter()
+        .copied()
+        .filter(|&s| {
+            let produced = produced_primary_count.get(&s).copied().unwrap_or(0);
+            let present = primary_present_count.get(&s).copied().unwrap_or(0);
+            let fe = full_primary_e.get(&s).copied().unwrap_or(0.0);
+            let ce = collected_primary_e.get(&s).copied().unwrap_or(0.0);
+            let structural = produced == 0;
+            let corroborative = present >= 1
+                && ((present as f64) < nu || (fe > 0.0 && ce < STARVED_ENERGY_RATIO * fe));
+            structural || corroborative
+        })
+        .collect();
     drop(sel_primary); // release the borrow of `primary_selected` before it is moved below
 
     let primary_present = primary_rows.iter().any(|r| r.df > 0);
-    let secondary_present = secondary_rows.iter().any(|r| r.df > 0);
     let mut views: Vec<Vec<T::Token>> = Vec::new();
-    if starved {
+    if starved_scripts.is_empty() {
+        views.push(primary_selected);
+    } else {
         // §12 rank_views = [PRIMARY, SECONDARY], with the PRIMARY → SECONDARY → empty fallback: a
         // view with no in-corpus gram is dropped (so a too-short query runs the secondary alone).
+        // The secondary pools ONLY the starved scripts' grams — a rich (non-starved) script's
+        // secondary order is omitted, so its bigram coincidences never enter a mixed-script query.
+        let secondary_rows: Vec<GramRow<T::Token>> = secondary_rows
+            .into_iter()
+            .filter(|r| starved_scripts.contains(&r.class))
+            .collect();
+        let secondary_present = secondary_rows.iter().any(|r| r.df > 0);
         if primary_present {
             views.push(primary_selected);
         }
         if secondary_present {
             views.push(select(&secondary_rows, sel_params, class_snap));
         }
-    } else {
-        views.push(primary_selected);
     }
 
     let weights = if views.len() == 2 {
-        view_weights_from_dh(&present_scripts, tokenizer, class_snap)
+        // ΔH over the STARVED scripts only — those are the ones contributing to the secondary view.
+        view_weights_from_dh(&starved_scripts, tokenizer, class_snap)
     } else {
         vec![1.0; views.len()]
     };
@@ -818,18 +847,19 @@ fn plan_views<T: Tokenizer>(
 /// The RRF fusion weights `[w_primary, w_secondary]` from the per-`(script, order)` vocabulary-
 /// complexity gap `ΔH` (derivation §8). `ΔH(s) = ln V_primary − ln V_secondary` with `V` the
 /// distinct-gram count of class `(s, order)` (the `ln V` max-entropy proxy), averaged over the
-/// present scripts that have both orders populated; a richer primary inventory (`ΔH > 0`, the
+/// (starved) scripts that have both orders populated; a richer primary inventory (`ΔH > 0`, the
 /// normal case) earns the primary view more weight via the fixed linear map `w_primary =
 /// clamp(0.5 + RRF_GAMMA·ΔH, 0.1, 0.9)`. Equal weights when `ΔH` is unavailable (no script has both
-/// vocabularies populated). Pure function of the present scripts + the shared snapshot.
+/// vocabularies populated). Pure function of the given scripts + the shared snapshot. Passed the
+/// **starved** scripts (those contributing the secondary view), per §8's per-script combination.
 fn view_weights_from_dh<T: Tokenizer>(
-    present_scripts: &FxHashSet<u8>,
+    scripts: &FxHashSet<u8>,
     tokenizer: &T,
     snap: &ClassSnap,
 ) -> Vec<f64> {
     let mut sum = 0.0;
     let mut n = 0u32;
-    for &s in present_scripts {
+    for &s in scripts {
         let po = tokenizer.primary_order(s);
         if po == u8::MAX || po < 1 {
             continue;

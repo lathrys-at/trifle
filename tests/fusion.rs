@@ -96,3 +96,63 @@ fn fused_stream_matched_terms_span_both_views() {
         "a secondary unigram is also among the matched terms: {matched:?}"
     );
 }
+
+// ===== per-script secondary gate + the starved-gate narrowing (panel regression guards) =========
+
+/// §8/§12 PER-SCRIPT gate: the secondary view pools ONLY the starved scripts' grams — "a rich
+/// script with a primary gram omits its secondary." Latin ("quick brown") is rich (many in-corpus
+/// trigrams ⇒ not starved); only the lone CJK 日 is starved (1-char ⇒ no bigram). So the secondary
+/// view holds ONLY the CJK unigram 日, never Latin bigrams. Doc 2 ("quack squawk") shares Latin
+/// bigrams with quick/brown but no trigram and no CJK — a whole-query gate would leak it in.
+#[test]
+fn per_script_secondary_gate_does_not_leak_a_rich_script() {
+    let h = Harness::new();
+    h.put(1, "f", "quick brown 日本語");
+    h.put(2, "f", "quack squawk");
+    let hits = h.search("quick brown 日", 10).unwrap();
+    assert!(hit(&hits, 1), "the genuine dual-script doc matches");
+    assert!(
+        !hit(&hits, 2),
+        "a rich script's bigram coincidences must NOT leak via the secondary view: {:?}",
+        ids(&hits)
+    );
+    // Dropping the lone CJK char: a clean Latin-only query is primary-only and also excludes doc 2.
+    assert!(!hit(&h.search("quick brown", 10).unwrap(), 2));
+}
+
+/// The narrowing of §12's literal while-loop: a query that PRODUCED primary grams that are all
+/// ABSENT (df = 0) stays a no-match — it does not fuzzily fall to the bigram layer. "zqj" produces
+/// the trigram "zqj" (absent), and its bigrams "zq"/"qj" both occur in doc 1, but the secondary view
+/// never forms (no present primary to corroborate), so doc 1 does not leak in.
+#[test]
+fn all_absent_primary_does_not_leak_via_incidental_bigram() {
+    let h = Harness::new();
+    h.put(1, "f", "azqb xqjy");
+    h.put(2, "f", "totally different words here");
+    let hits = h.search("zqj", 10).unwrap();
+    assert!(
+        !hit(&hits, 1),
+        "all-absent primary must not leak via bigram: {:?}",
+        ids(&hits)
+    );
+    assert!(hits.is_empty());
+}
+
+/// One surviving in-corpus primary trigram makes the query corroboratively starved (< ν present),
+/// so the bigram secondary view runs and corroborates the match. "zqb" → trigram zqb (present in
+/// "azqb xyz") ⇒ starved ⇒ bigrams zq, qb corroborate.
+#[test]
+fn one_surviving_primary_trigram_enables_bigram_corroboration() {
+    let h = Harness::new();
+    h.put(1, "f", "azqb xyz");
+    h.put(2, "f", "unrelated control text");
+    assert!(hit(&h.search("zqb", 10).unwrap(), 1));
+}
+
+/// A query too short to produce any primary gram reaches the structural bigram fallback (§8).
+#[test]
+fn too_short_query_uses_the_structural_bigram_fallback() {
+    let h = Harness::new();
+    h.put(1, "f", "go team");
+    assert!(hit(&h.search("go", 10).unwrap(), 1));
+}

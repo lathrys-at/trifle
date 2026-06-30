@@ -681,6 +681,13 @@ impl<const N: usize> NgramTokenizerBuilder<N> {
 /// dual-order grams. The shorter order doubles as the structural fallback for a run too short to
 /// produce the primary (a 2-char Latin run yields its bigram; a 1-char CJK run its unigram).
 ///
+/// Indexing both orders unconditionally grows posting volume **~2–2.5×** on small documents (the
+/// secondary must be indexed to be queryable), with the CJK unigram postings the densest; this is
+/// the §8-designed cost, kept bounded at query time by the per-script starved gate (the secondary
+/// view runs only when needed) and the usual rarity pruning. The flip side is a **new capability**:
+/// content shorter than the primary window (a 2-char Latin word, a 1-char CJK morpheme) is now
+/// indexable and queryable at all, where the trigram-only tokenizer dropped it.
+///
 /// Construct with [`new`](Self::new) for the defaults (NFC + Unicode lowercase) or
 /// [`builder`](Self::builder) to change normalization / casefolding.
 ///

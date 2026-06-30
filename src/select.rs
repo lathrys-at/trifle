@@ -38,7 +38,11 @@
 //! bounded by the work budget even for short / common queries (which were O(N) through M3) —
 //! *except* the §7/§12 rescue (step 3 below), which may walk one over-budget posting when **every**
 //! present gram is `df > C` (a pure-common query); `Σdf` is then O(N), the recall-floor that beats
-//! returning an empty result.
+//! returning an empty result. v0.4/M5 note: this single-posting rescue carve-out is per *view*, so a
+//! **starved** query that falls to the secondary (`search.rs::plan_views`) can hit it on BOTH the
+//! primary and the secondary view — at most **two** O(N) postings (and the unigram secondary's
+//! postings are the denser of the two). Still bounded (≤ 2), behind the per-script starved gate, and
+//! a ratified recall-vs-flatness tradeoff (the secondary only runs when a script is starved).
 //!
 //! Selection derives only from this query's own per-gram inputs and the shared snapshot it is
 //! handed (the per-class stats, `N`, `σ`, the energy/floor — all read once per batch) — never a

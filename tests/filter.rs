@@ -17,6 +17,63 @@ fn fixture() -> Harness {
     h
 }
 
+/// Load `(id, owned-text)` docs under label `"f"` in one writer batch.
+fn load_owned(h: &Harness, docs: &[(i64, String)]) {
+    let mut w = h.index.writer().unwrap();
+    for (id, text) in docs {
+        w.upsert(*id, &[("f", text.as_str())]).unwrap();
+    }
+    w.commit().unwrap();
+}
+
+#[test]
+fn filter_excludes_even_the_top_float_candidate() {
+    // The eager path switched from `pull_chunk` to `drain_top_k` (M2). drain_top_k still routes
+    // every chunk through `prov.lookup`, which folds in the SqlFilter — so a filter that excludes
+    // the HIGHEST-FLOAT candidate must still remove it from the eager `matches` results (the filter
+    // is not bypassed by the new full-drain + float-rank path).
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    for i in 1..=12 {
+        docs.push((i, "kqxvz report".to_string())); // rare kqxvz (high energy + credit) + common report
+    }
+    for i in 13..=60 {
+        docs.push((i, "report only".to_string())); // commons-only, lower float
+    }
+    load_owned(&h, &docs);
+
+    // Sanity: unfiltered, a kqxvz doc carries the highest float and is present.
+    let unfiltered = ids(&h
+        .search_opts("kqxvz report", &SearchOpts::new().min_shared(1), 60)
+        .unwrap());
+    assert!(
+        unfiltered.contains(&1),
+        "sanity: top-float doc present unfiltered: {unfiltered:?}"
+    );
+
+    // Filter to {13, 14} — both commons-only docs, NOT the high-float kqxvz docs.
+    let allowed: Rc<Vec<Value>> = Rc::new(vec![Value::Integer(13), Value::Integer(14)]);
+    let params: Vec<&dyn ToSql> = vec![&allowed];
+    let filter = SqlFilter::new("key IN rarray(?1)", &params);
+    let keys = ids(&h
+        .search_opts(
+            "kqxvz report",
+            &SearchOpts::new().min_shared(1).filter(filter),
+            60,
+        )
+        .unwrap());
+    assert!(
+        keys.iter().all(|k| *k == 13 || *k == 14),
+        "drain_top_k must apply the filter: got {keys:?}"
+    );
+    for excluded in [1i64, 2, 12] {
+        assert!(
+            !keys.contains(&excluded),
+            "the excluded high-float doc {excluded} must NOT appear: {keys:?}"
+        );
+    }
+}
+
 #[test]
 fn key_in_rarray_restricts_to_an_allowed_set() {
     let h = fixture();

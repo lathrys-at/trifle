@@ -258,9 +258,12 @@ fn count_credit(sigma: f64) -> f64 {
 /// The §9 **concentration cap** on the count credit. Returns `Some(cap)` when the pruned set's
 /// energies are *concentrated* — a single dominant rare gram (positive top energy `E_top`) amid
 /// **≥ 2** query-relative commons (a gram with `E < ½·E_top`) — else `None` (μ uncapped). An
-/// all-common set has `E_top ≤ 0` (no dominant gram) and is deliberately left **uncapped**, so it
-/// degrades to count-and-length ranking rather than having its credit zeroed (§7/§9); this guard
-/// is load-bearing (without it an all-common query would cap to 0).
+/// **all-common** query is deliberately left **uncapped** (it degrades to count-and-length ranking
+/// rather than having its credit zeroed, §7/§9) — by *either* guard, which together cover both
+/// all-common sub-cases: a *ubiquitous* all-common set (every `p ≥ ½` ⇒ every `E ≤ 0`) trips the
+/// `E_top ≤ 0` branch, while a *mid-rarity* all-common set (every `p < ½` ⇒ comparable positive
+/// energies, none below `½·E_top`) trips the `commons.len() < 2` guard. Both are load-bearing:
+/// without them an all-common query would spuriously cap (to 0 in the ubiquitous case).
 ///
 /// `cap = max(0, (E_top − Σ_common max(0,E)) / (#common − 1))`. The hard floor at 0 (reached when
 /// the commons collectively outweigh the dominant gram) is the M2 baseline; §9's smoother shrink
@@ -271,6 +274,16 @@ fn count_credit(sigma: f64) -> f64 {
 /// matches §9's framing of the cap as a *query-structure* property: a dominant gram (junk-suspect
 /// or not) should not be out-credited by commons. The floored *exclusion* governs only which grams
 /// earn credit (above) and the M4 stop, not the cap's `E_top`.
+///
+/// **Consequence flagged for the design owner (behavior NOT changed in M2).** When a *floored* gram
+/// is the dominant `E_top` (it sits at `E_max`) and a *real* mid-rare gram is co-present below it,
+/// that high floored `E_top` *loosens* the cap, so the cap no longer protects the real
+/// discriminating gram from commons-credit — a floored-*excluded* `E_top` would instead clamp
+/// tighter and protect it (R1's numeric: off-topic commons doc `8.09 >` on-topic rare doc `6.20`;
+/// floored-excluded would tie at `5.25`). This is the literal §12 reading, KEPT for M2 and
+/// recall-safe (§9: "a precision distortion the reranker undoes"). Whether the cap should key off
+/// only the *real* (non-floored) discriminating grams is a deferred §9/§12 **derivation-text**
+/// question for the design owner; M2 does not change the behavior either way.
 fn concentration_cap(energies: &[f64]) -> Option<f64> {
     let e_top = energies.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if e_top <= 0.0 {
@@ -1253,6 +1266,50 @@ mod credit_tests {
         approx(
             concentration_cap(&[6.9, 0.0, 0.0, 0.0]).expect("concentrated"),
             3.45,
+        );
+    }
+
+    #[test]
+    fn cap_boundary_e_equals_half_is_not_common() {
+        // §9 uses a STRICT `E < ½·E_top`: a gram exactly at half is NOT a common, so two grams at
+        // the boundary leave 0 commons ⇒ uncapped.
+        assert_eq!(concentration_cap(&[4.0, 2.0, 2.0]), None);
+        // One nudged just below half ⇒ still only 1 common ⇒ uncapped (needs ≥ 2).
+        assert_eq!(concentration_cap(&[4.0, 2.0, 1.999]), None);
+        // Two strictly below half ⇒ concentrated.
+        assert!(concentration_cap(&[4.0, 1.999, 1.999]).is_some());
+    }
+
+    #[test]
+    fn cap_neg_infinity_commons_contribute_zero_no_nan() {
+        // df = N ubiquitous grams carry −∞ energy: they count as commons (`< ½·E_top`) but
+        // contribute `max(0,−∞) = 0` to the sum, so the cap stays finite (no NaN).
+        let cap =
+            concentration_cap(&[5.0, f64::NEG_INFINITY, f64::NEG_INFINITY]).expect("2 commons");
+        approx(cap, 5.0); // (5 − 0)/(2 − 1)
+        assert!(cap.is_finite());
+        // More ubiquitous commons shrink the cap (the chance-match guard), still finite.
+        let cap =
+            concentration_cap(&[5.0, f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY])
+                .expect("3 commons");
+        approx(cap, 2.5); // 5/(3 − 1)
+        assert!(cap.is_finite());
+    }
+
+    #[test]
+    fn cap_floored_e_top_with_co_present_real_gram() {
+        // R1's interpretation pin (§9/§12): a FLOORED gram pins E_top = E_max (≈6.9) while a real
+        // mid-rare gram (4.0) is co-present above the commons (0.5, 0.5). Under the literal §12
+        // reading the real gram is NOT a common (4.0 ≥ ½·6.9 = 3.45), so only the two 0.5 commons
+        // count: cap = (6.9 − (0.5+0.5))/(2 − 1) = 5.9 — the high floored E_top loosens the cap.
+        let cap = concentration_cap(&[6.9, 4.0, 0.5, 0.5]).expect("concentrated");
+        approx(cap, 5.9);
+        // A floored-EXCLUDED reading (not what M2 does) would instead take E_top = 4.0, making the
+        // 0.5s its commons and the cap a tighter (4.0 − 1.0)/1 = 3.0 — pinned here for contrast so a
+        // future derivation-text change to exclude floored grams is a visible, deliberate edit.
+        approx(
+            concentration_cap(&[4.0, 0.5, 0.5]).expect("concentrated"),
+            3.0,
         );
     }
 

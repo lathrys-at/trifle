@@ -7,7 +7,8 @@
 
 mod common;
 use common::*;
-use trifle::SearchOpts;
+use trifle::tokenize::DefaultTokenizer;
+use trifle::{Config, Index, Schema, SearchOpts};
 
 /// Load `(id, text)` docs under label `"f"` in one writer batch (faster than per-doc commits).
 fn load(h: &Harness, docs: &[(i64, &str)]) {
@@ -248,6 +249,130 @@ fn batch_equals_serial_under_the_count_credit() {
         ids(&batch[1]),
         serial,
         "credit-bearing q ranks identically serial vs. mid-batch (batch == serial)"
+    );
+}
+
+#[test]
+fn dedup_keeps_the_max_float_segment_per_key() {
+    // drain_top_k dedups one candidate per KEY, keeping the MAX-float segment. Doc 1 has a
+    // rare-gram segment (title "kqxvz", high float) and a common-gram segment (body "report",
+    // low float); it must surface via the higher-float title segment.
+    let h = Harness::new();
+    let mut w = h.index.writer().unwrap();
+    w.upsert(1, &[("title", "kqxvz"), ("body", "report")])
+        .unwrap();
+    for i in 2..=40 {
+        w.upsert(i, &[("body", "report")]).unwrap(); // make "report" common (df high)
+    }
+    w.commit().unwrap();
+
+    let hits = h
+        .search_opts("kqxvz report", &SearchOpts::new().min_shared(1), 50)
+        .unwrap();
+    let m1 = hits
+        .iter()
+        .find(|m| m.key.as_i64() == Some(1))
+        .expect("doc 1 retrieved");
+    assert_eq!(
+        m1.label, "title",
+        "per-key dedup kept the higher-float (rare-gram) segment, not the common one"
+    );
+}
+
+#[test]
+fn drain_ordering_is_deterministic_across_runs() {
+    // The float sort's total-order tiebreak (float desc → integer score desc → seg id asc) makes
+    // the eager result order identical run to run — load-bearing for batch == serial and the
+    // thrash oracle.
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    for i in 1..=12 {
+        docs.push((i, "kqxvz report system".to_string()));
+    }
+    for i in 13..=62 {
+        docs.push((i, "report system".to_string()));
+    }
+    load_owned(&h, &docs);
+
+    let opts = SearchOpts::new().min_shared(1);
+    let first = ids(&h.search_opts("kqxvz report system", &opts, 64).unwrap());
+    for _ in 0..30 {
+        let again = ids(&h.search_opts("kqxvz report system", &opts, 64).unwrap());
+        assert_eq!(
+            again, first,
+            "the drain ordering must be identical across runs"
+        );
+    }
+}
+
+/// Open a flat index at `dir/trifle.db` with a caller-chosen `σ` (the rest default).
+fn open_with_sigma(dir: &std::path::Path, sigma: f64) -> Index<DefaultTokenizer> {
+    let cfg = Config {
+        sigma,
+        ..Config::default()
+    };
+    Index::open_at(&dir.join("trifle.db"), Schema::flat(), cfg).unwrap()
+}
+
+#[test]
+fn sigma_config_edges_do_not_panic_and_fall_back() {
+    // σ is an index-level Config field, sanitized to (0,1) at open. Every degenerate σ must open
+    // without panic and rank identically to the sanitized default 0.9 (all fall back); a σ just
+    // below 1 (huge-but-finite μ) must produce a finite, sane ranking (no overflow / NaN).
+    let docs: Vec<(i64, String)> = {
+        let mut v: Vec<(i64, String)> = (1..=12).map(|i| (i, "kqxvz report".to_string())).collect();
+        v.extend((13..=50).map(|i| (i, "report only".to_string())));
+        v
+    };
+    let load = |idx: &Index<DefaultTokenizer>| {
+        let mut w = idx.writer().unwrap();
+        for (id, t) in &docs {
+            w.upsert(*id, &[("f", t.as_str())]).unwrap();
+        }
+        w.commit().unwrap();
+    };
+    let rank = |idx: &Index<DefaultTokenizer>| {
+        ids(&idx
+            .reader()
+            .unwrap()
+            .matches("kqxvz report", &SearchOpts::new().min_shared(1), 50)
+            .unwrap())
+    };
+
+    let base_dir = tempfile::tempdir().unwrap();
+    let base = open_with_sigma(base_dir.path(), 0.9);
+    load(&base);
+    let baseline = rank(&base);
+    assert!(!baseline.is_empty(), "the probe query must hit something");
+
+    for bad in [
+        0.0,
+        1.0,
+        -0.1,
+        1.5,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = open_with_sigma(dir.path(), bad);
+        load(&idx);
+        assert_eq!(
+            rank(&idx),
+            baseline,
+            "σ={bad} must fall back to the 0.9 ranking"
+        );
+    }
+
+    // σ = 0.9999 is in-range and kept: μ ≈ ln(9999) ≈ 9.21, huge but finite — no overflow / NaN.
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open_with_sigma(dir.path(), 0.9999);
+    load(&idx);
+    let got = rank(&idx);
+    assert_eq!(got.len(), 50, "σ=0.9999 retrieves every doc, no NaN crash");
+    assert!(
+        rank_of(&got, 1) < rank_of(&got, 13),
+        "σ=0.9999: the rare-gram docs still rank above commons-only: {got:?}"
     );
 }
 

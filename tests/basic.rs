@@ -139,11 +139,23 @@ fn no_match_returns_empty_not_error() {
 }
 
 #[test]
-fn sub_trigram_query_yields_nothing_without_error() {
+fn sub_trigram_query_reaches_the_bigram_fallback() {
+    // v0.4/M5 (derivation §8): a 2-char query is too short to produce a trigram, so it falls back
+    // to the bigram (secondary) rank-view — "the shortest order doubles as the structural fallback
+    // for a query too short to produce the primary" — instead of returning empty as in v0.3/M4.
+    // "hi" now matches "sphinx" (…s-p-h-i-n-x…) via the bigram "hi". This is a deliberate,
+    // user-visible recall improvement: 2-char queries are now answerable. The empty query still
+    // yields nothing (it produces no grams of any order).
     let h = Harness::new();
     load_fixture(&h);
-    assert!(h.search("hi", 10).unwrap().is_empty());
-    assert!(h.search("", 10).unwrap().is_empty());
+    assert!(
+        !h.search("hi", 10).unwrap().is_empty(),
+        "a 2-char query now matches via the bigram structural fallback (§8)"
+    );
+    assert!(
+        h.search("", 10).unwrap().is_empty(),
+        "the empty query produces no grams"
+    );
 }
 
 #[test]

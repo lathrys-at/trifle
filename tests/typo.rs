@@ -100,16 +100,18 @@ fn wider_t_max_never_loses_a_narrow_hit() {
 }
 
 #[test]
-fn two_char_words_index_nothing_and_are_consistent() {
-    // M4/M5 boundary: with whitespace breaking the window, a doc whose every word is < 3 chars now
-    // indexes ZERO grams (a Latin trigram needs 3). Index and query agree, so this is a *consistent*
-    // (if unsearchable) state — same as v0.3's "too short for a trigram", not a divergence. The
-    // structural bigram fallback for such short queries is M5 (the dual-order secondary view).
+fn two_char_words_match_via_the_bigram_fallback() {
+    // v0.4/M5 (derivation §8): a doc whose every word is exactly 2 chars now indexes BIGRAMS (the
+    // secondary order — a 2-char Latin run is too short for a trigram), and a query of the same short
+    // words reaches the bigram (secondary) rank-view via the structural fallback, so it now MATCHES.
+    // v0.3/M4 (trigram-only) indexed nothing and returned empty here — this is a deliberate,
+    // user-visible recall improvement. Index and query still agree (both emit the same dual-order
+    // grams), so the state stays consistent.
     let h = Harness::new();
     h.put(1, "f", "ab cd ef");
     assert!(
-        !hit(&h.search("ab cd ef", 10).unwrap(), 1),
-        "all-short-word doc indexes no grams (consistent zero-recall, not a divergence)"
+        hit(&h.search("ab cd ef", 10).unwrap(), 1),
+        "all-short-word doc now matches via the bigram structural fallback (§8)"
     );
     // A normal doc in the same index is unaffected.
     h.put(2, "f", "quick brown");

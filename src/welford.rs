@@ -1,11 +1,14 @@
 //! Per-script-class document-frequency statistics for class-normalized rarity.
 //!
 //! The pruner ranks query tokens rarest-first, but raw DF is not comparable across
-//! `(script, gram-size)` classes — shorter grams and denser scripts (CJK's thousands of
+//! `(script, order)` classes — shorter grams and denser scripts (CJK's thousands of
 //! base chars vs Latin's 26) live in different frequency regimes. So rarity is ranked on
-//! `z = (ln DF − μ_class) / σ_class`, with `(μ, σ)` maintained **per script class** by
-//! [`Welford`]'s online algorithm in **log space** (where the Zipfian DF distribution is
-//! well-behaved and the variance numerically small).
+//! `z = (ln DF − μ_class) / σ_class`, with `(μ, σ)` maintained **per `(script, order)` class**
+//! by [`Welford`]'s online algorithm in **log space** (where the Zipfian DF distribution is
+//! well-behaved and the variance numerically small). v0.4/M5 splits the class key from `script`
+//! to `(script, order)` because the [`DefaultTokenizer`](crate::tokenize::DefaultTokenizer) now
+//! emits both a primary and a one-shorter secondary order per script (derivation §5/§8), and a
+//! trigram and a bigram of the same script occupy different df regimes.
 //!
 //! `z` is a Gaussian *proxy* for percentile — exact in the bulk, drifting in the heavy
 //! rare tail the pruner selects from. It is *better-comparable* than raw DF, not
@@ -68,33 +71,47 @@ impl Welford {
     }
 }
 
-/// The live per-class accumulators (one [`Welford`] per script-tag byte). Each distinct
-/// term contributes one sample `ln(df)` to its class. Recomputed from the df column on
-/// open/rebuild and maintained incrementally on writes; never persisted (the df column
-/// is the single source of truth → no drift). Untouched by `compact` (folds leave df
+/// The composite selection-class key: a `(script, order)` pair (v0.4/M5, derivation §5/§8).
+/// A Latin trigram (`order = 3`) and a Latin bigram (`order = 2`) share a script byte but live
+/// in different document-frequency regimes — the [`DefaultTokenizer`](crate::tokenize::DefaultTokenizer)
+/// now emits both — so rarity is normalized within `(script, order)`, not `script` alone.
+/// `order ∈ 1..=3`; the flat index is `class·4 + order` (length `256·4`).
+#[inline]
+fn class_index(class: u8, order: u8) -> usize {
+    (class as usize) * 4 + (order as usize).min(3)
+}
+
+/// Number of `(script, order)` accumulator slots: 256 scripts × 4 order slots (`order 0..=3`,
+/// where `0` is an unused defensive slot — a real gram has `order ≥ 1`).
+const N_CLASS_SLOTS: usize = 256 * 4;
+
+/// The live per-`(script, order)` accumulators (one [`Welford`] each). Each distinct term
+/// contributes one sample `ln(df)` to its `(script, order)` class. Recomputed from the df
+/// column on open/rebuild and maintained incrementally on writes; never persisted (the df
+/// column is the single source of truth → no drift). Untouched by `compact` (folds leave df
 /// invariant).
 pub(crate) struct ClassStats {
-    by_class: Vec<Welford>, // length 256, indexed by the script-tag byte
+    by_class: Vec<Welford>, // length 256·4, indexed by `class_index(class, order)`
 }
 
 impl ClassStats {
     pub(crate) fn new() -> Self {
         ClassStats {
-            by_class: vec![Welford::default(); 256],
+            by_class: vec![Welford::default(); N_CLASS_SLOTS],
         }
     }
 
-    /// Add a term's `ln(df)` to its class (recompute path; `df > 0`).
-    pub(crate) fn add_sample(&mut self, class: u8, df: i64) {
+    /// Add a term's `ln(df)` to its `(script, order)` class (recompute path; `df > 0`).
+    pub(crate) fn add_sample(&mut self, class: u8, order: u8, df: i64) {
         if df > 0 {
-            self.by_class[class as usize].add((df as f64).ln());
+            self.by_class[class_index(class, order)].add((df as f64).ln());
         }
     }
 
-    /// Update a class for a term whose df moved `old_df → new_df` (a write or delete).
-    /// `old_df == 0` is an intern/resurrect; `new_df == 0` is a term leaving the index.
-    pub(crate) fn update(&mut self, class: u8, old_df: i64, new_df: i64) {
-        let w = &mut self.by_class[class as usize];
+    /// Update a `(script, order)` class for a term whose df moved `old_df → new_df` (a write or
+    /// delete). `old_df == 0` is an intern/resurrect; `new_df == 0` is a term leaving the index.
+    pub(crate) fn update(&mut self, class: u8, order: u8, old_df: i64, new_df: i64) {
+        let w = &mut self.by_class[class_index(class, order)];
         if old_df > 0 {
             w.remove((old_df as f64).ln());
         }
@@ -103,21 +120,21 @@ impl ClassStats {
         }
     }
 
-    /// Snapshot the given classes' stats for one query (then lock-free).
-    pub(crate) fn snapshot_for(&self, classes: impl IntoIterator<Item = u8>) -> ClassSnap {
+    /// Snapshot the given `(script, order)` classes' stats for one query (then lock-free).
+    pub(crate) fn snapshot_for(&self, classes: impl IntoIterator<Item = (u8, u8)>) -> ClassSnap {
         let mut by_class = FxHashMap::default();
-        for c in classes {
+        for (c, o) in classes {
             by_class
-                .entry(c)
-                .or_insert_with(|| self.by_class[c as usize].snapshot());
+                .entry((c, o))
+                .or_insert_with(|| self.by_class[class_index(c, o)].snapshot());
         }
         ClassSnap { by_class }
     }
 }
 
-/// A per-query, immutable snapshot of the class stats the query's tokens touch.
+/// A per-query, immutable snapshot of the `(script, order)`-class stats the query's tokens touch.
 pub(crate) struct ClassSnap {
-    by_class: FxHashMap<u8, (u64, f64, f64)>, // class -> (n, mean, σ_eff)
+    by_class: FxHashMap<(u8, u8), (u64, f64, f64)>, // (class, order) -> (n, mean, σ_eff)
 }
 
 impl ClassSnap {
@@ -131,15 +148,25 @@ impl ClassSnap {
     }
 
     /// The class-normalized rarity of a term (lower = rarer, so the pruner sorts
-    /// ascending). Returns the `z`-score for a well-populated class, else falls back to
-    /// raw DF (`df` as `f64`) — keeping the rarest-first ordering well-defined either way.
-    pub(crate) fn rarity(&self, df: i64, class: u8) -> f64 {
-        if let Some(&(n, mean, sigma)) = self.by_class.get(&class) {
+    /// ascending). Returns the `z`-score for a well-populated `(script, order)` class, else falls
+    /// back to raw DF (`df` as `f64`) — keeping the rarest-first ordering well-defined either way.
+    pub(crate) fn rarity(&self, df: i64, class: u8, order: u8) -> f64 {
+        if let Some(&(n, mean, sigma)) = self.by_class.get(&(class, order)) {
             if n >= N_NORMALIZE_FLOOR && sigma.is_finite() {
                 return ((df.max(1) as f64).ln() - mean) / sigma;
             }
         }
         df as f64
+    }
+
+    /// The **vocabulary size** `V` (distinct in-class terms) of a `(script, order)` class — the
+    /// Welford sample count. `0` if the class is absent from this snapshot. The v0.4/M5
+    /// rank-view fusion uses `ln V` as the per-`(script, order)` vocabulary-complexity proxy for
+    /// the fusion gap `ΔH = ln V_primary − ln V_secondary` (derivation §8): a richer (larger-vocab)
+    /// primary order earns more fusion weight. `ln V` is the maximum entropy of a `V`-symbol
+    /// alphabet — a directional heuristic, not a conditional entropy (§8/§11).
+    pub(crate) fn vocab(&self, class: u8, order: u8) -> u64 {
+        self.by_class.get(&(class, order)).map_or(0, |&(n, _, _)| n)
     }
 }
 
@@ -180,11 +207,11 @@ mod tests {
     fn degenerate_class_falls_back_to_raw_df() {
         // n < 2 -> sigma infinite -> raw df.
         let mut stats = ClassStats::new();
-        stats.add_sample(1, 10); // one sample only
-        let snap = stats.snapshot_for([1u8]);
-        assert_eq!(snap.rarity(10, 1), 10.0);
+        stats.add_sample(1, 3, 10); // one sample only, class (1, order 3)
+        let snap = stats.snapshot_for([(1u8, 3u8)]);
+        assert_eq!(snap.rarity(10, 1, 3), 10.0);
         // Empty snapshot also falls back.
-        assert_eq!(ClassSnap::empty().rarity(7, 1), 7.0);
+        assert_eq!(ClassSnap::empty().rarity(7, 1, 3), 7.0);
     }
 
     #[test]
@@ -192,10 +219,31 @@ mod tests {
         // Populate a class past the floor with a spread of dfs.
         let mut stats = ClassStats::new();
         for df in 1..=100 {
-            stats.add_sample(1, df);
+            stats.add_sample(1, 3, df);
         }
-        let snap = stats.snapshot_for([1u8]);
+        let snap = stats.snapshot_for([(1u8, 3u8)]);
         // A df-1 token is rarer (lower rarity) than a df-90 token.
-        assert!(snap.rarity(1, 1) < snap.rarity(90, 1));
+        assert!(snap.rarity(1, 1, 3) < snap.rarity(90, 1, 3));
+    }
+
+    #[test]
+    fn same_script_different_order_are_distinct_classes() {
+        // v0.4/M5 (script, order) re-key: a Latin trigram (order 3) and a Latin bigram (order 2)
+        // share a script byte but accumulate into separate classes with separate df regimes.
+        let mut stats = ClassStats::new();
+        for df in 1..=80 {
+            stats.add_sample(1, 3, df); // trigrams: dfs 1..=80
+        }
+        for df in 100..=300 {
+            stats.add_sample(1, 2, df); // bigrams: dfs 100..=300 (a denser regime)
+        }
+        let snap = stats.snapshot_for([(1u8, 3u8), (1u8, 2u8)]);
+        assert_eq!(snap.vocab(1, 3), 80);
+        assert_eq!(snap.vocab(1, 2), 201);
+        // A df-150 bigram is common-for-its-order; a df-40 trigram is mid-for-its-order. Each is
+        // normalized within its own (script, order) regime, not against the other.
+        let _ = snap.rarity(150, 1, 2);
+        let _ = snap.rarity(40, 1, 3);
+        assert_eq!(snap.vocab(9, 3), 0, "an absent class has vocab 0");
     }
 }

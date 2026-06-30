@@ -206,8 +206,8 @@ pub(crate) fn select<Tk: Clone + Ord>(
     let mut present: Vec<&GramRow<Tk>> = rows.iter().filter(|r| r.df > 0).collect();
     present.sort_by(|a, b| {
         classes
-            .rarity(a.df, a.class)
-            .partial_cmp(&classes.rarity(b.df, b.class))
+            .rarity(a.df, a.class, a.order)
+            .partial_cmp(&classes.rarity(b.df, b.class, b.order))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.df.cmp(&b.df))
             .then_with(|| a.token.cmp(&b.token))
@@ -527,12 +527,12 @@ mod tests {
         // low dfs). Populate both past the normalize floor.
         let mut stats = ClassStats::new();
         for df in 50..=200 {
-            stats.add_sample(1, df);
+            stats.add_sample(1, 3, df);
         }
         for df in 1..=60 {
-            stats.add_sample(2, df);
+            stats.add_sample(2, 3, df);
         }
-        let cs = stats.snapshot_for([1u8, 2u8]);
+        let cs = stats.snapshot_for([(1u8, 3u8), (2u8, 3u8)]);
         // A df-40 gram in the dense class is rarer-for-its-kind than a df-40 gram in the sparse
         // class, so it sorts first even though raw df ties.
         let t = vec![

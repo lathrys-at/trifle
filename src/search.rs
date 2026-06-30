@@ -37,6 +37,7 @@ use crate::select::{GramRow, SelectParams, select};
 use crate::store::{Namespace, ReadConn};
 use crate::term::Term;
 use crate::tokenize::Tokenizer;
+use crate::welford::ClassSnap;
 use crate::{
     DEFAULT_C_MARGIN, DEFAULT_DELTA, DEFAULT_K_TARGET, DEFAULT_KAPPA, DEFAULT_MIN_SHARED,
     DEFAULT_NU, DEFAULT_T_MAX, Error, Index, IntoTerm, Result, SearchOpts, TYPO_DAMAGE, postings,
@@ -45,6 +46,25 @@ use crate::{
 
 /// How many engine candidates to pull per provenance/filter round-trip.
 const CHUNK: usize = 64;
+
+/// The reciprocal-rank-fusion rank constant `k_RRF` (derivation §8): `RRF(seg) = Σ_v w_v /
+/// (k_RRF + rank_v)`. The standard Cormack value — a flatter (larger) constant trusts more of
+/// each view's ranked tail; `60` balances the head against the tail. A pure shape constant, so
+/// it is an internal `const`, not a [`SearchOpts`](crate::SearchOpts) knob.
+const K_RRF: f64 = 60.0;
+
+/// The slope of the linear `ΔH → primary-view weight` map (derivation §8): `w_primary =
+/// clamp(0.5 + RRF_GAMMA·ΔH, 0.1, 0.9)`, with `ΔH = ln V_primary − ln V_secondary` the
+/// per-`(script, order)` vocabulary-complexity gap (richer primary ⇒ more primary weight). A
+/// fixed shape choice (§8 calls the map "a fixed shape choice; a linear map suffices"); equal
+/// weights when `ΔH` is unavailable.
+const RRF_GAMMA: f64 = 0.1;
+
+/// The §5/§12 starvation energy ratio `ρ`: a present script is **starved** (so the secondary
+/// rank-view is brought in) when its pruned/collected primary energy `Σ max(0,E)` falls below
+/// `ρ ·` its full primary energy — the budget cut usable signal (`collected_energy_far_below`,
+/// derivation §12). Recall-safe: the secondary view only *adds* a fused robustness layer.
+const STARVED_ENERGY_RATIO: f64 = 0.5;
 
 /// The realized floored-gram energy `E_floored` (nats) below which the §7 quantization guard
 /// `Δ < 2·E_floored` is treated as inapplicable rather than violated. On a handful-of-segments
@@ -187,7 +207,8 @@ struct QueryPlan {
     /// the bound valid — derivation §7).
     cred_max: f64,
     selected_strings: Vec<String>,
-    n_segments: u64,
+    /// Mean segment gram length `L̄` (`avgdl`) on this snapshot — the §6 length null's denominator.
+    /// (`N` lives on the wrapping [`PlannedQuery`], which the stream's accessors read.)
     avgdl: f64,
 }
 
@@ -241,6 +262,23 @@ impl QueryPlan {
     fn corrected(&self, e_acc: u32, credit: f64, rel_len: f64) -> f64 {
         e_acc as f64 * self.delta + credit - self.length_null(rel_len)
     }
+}
+
+/// One query planned into its rank-views (derivation §8) — the reciprocal-rank-fusion unit.
+///
+/// `views` holds 1 [`QueryPlan`] (PRIMARY-only, the clean-query path that is byte-identical to
+/// M1–M4) or 2 (PRIMARY + SECONDARY, a starved query). Each view is scored independently by the full
+/// [`score_union`] pipeline; with 2 views the per-view rankings are RRF-fused (`view_weights`,
+/// `K_RRF`, `missing="omit"`). `fused_selected` is the union of every view's selected token strings,
+/// for span location at hydrate (a fused candidate may have matched in either view). `n_segments` /
+/// `avgdl` are the shared snapshot stats (also on each view's plan, but held here so the accessors
+/// work even when `views` is empty — a query with no in-corpus gram in any view).
+struct PlannedQuery {
+    views: Vec<QueryPlan>,
+    view_weights: Vec<f64>,
+    fused_selected: Vec<String>,
+    n_segments: u64,
+    avgdl: f64,
 }
 
 /// The §6 saturating length null `(L_d/L̄)·K_rare + Σ_commons (1−(1−p_g)^(L_d/L̄))·weight(g)`, a free
@@ -424,15 +462,16 @@ fn popcount_credit(
 /// Resolve, select (class-aware rarest-first), load postings, and build the engine [`Counter`]
 /// for every query — all against the open snapshot `conn` (a tx must already be open). Verifies
 /// the dictionary generation against the snapshot (a concurrent id-reassigning rebuild → retryable
-/// [`Error::Busy`]). One plan per query, in order; `batch == serial` (selection/df/weights derive
-/// only from each query's own tokens + the shared snapshot).
+/// [`Error::Busy`]). One [`PlannedQuery`] (1–2 rank-views) per query, in order; `batch == serial`
+/// (selection/df/weights/rank-views/ΔH derive only from each query's own tokens + the shared
+/// snapshot).
 fn prepare<T: Tokenizer>(
     index: &Index<T>,
     conn: &Connection,
     ns: &Namespace,
     queries: &[&str],
     opts: &SearchOpts<'_>,
-) -> Result<Vec<QueryPlan>> {
+) -> Result<Vec<PlannedQuery>> {
     let (query_tokens, all_terms) = query_terms(queries, |q| index.distinct_tokens_tagged(q));
 
     // Resolve terms in memory + capture the dict generation atomically, then read the snapshot's
@@ -534,42 +573,35 @@ fn prepare<T: Tokenizer>(
         Some((id, dfs.get(&id).copied().unwrap_or(0)))
     };
 
-    // Per-query selection (class-normalized rarest-first + the §5 Cantelli stop + per-class floor +
-    // skip-and-continue budget). Each gram carries its df, `(script, order)` class, comonotone-block
-    // (word) id, logit-idf energy, and floored flag — all derived from THIS query's grams + the
-    // shared per-batch snapshot (df map, class stats, N, σ, ν, κ), so `batch == serial` (the stop is
-    // a pure function of this query, never a batch aggregate). Multi-script awareness lives here.
-    let selected_per: Vec<Vec<T::Token>> = query_tokens
+    // === v0.4/M5 rank-views (derivation §8) =======================================================
+    // Partition each query's DUAL-ORDER grams into a PRIMARY rank-view (every script's primary
+    // order — Latin trigram, CJK bigram) and a SECONDARY one (every script's one-shorter order). A
+    // query runs PRIMARY-ONLY unless a present script is STARVED — too few/too weak primary grams,
+    // or none at all (a query too short to produce the primary, the structural fallback) — in which
+    // case the secondary view also runs and the two are RRF-fused (§8/§12). The single-view path is
+    // exactly the M1–M4 pipeline, so clean queries pay nothing for §8. Selection/starvation/ΔH are
+    // pure functions of THIS query's grams + the shared per-batch snapshot ⇒ `batch == serial`.
+    let planned_sel: Vec<ViewSel<T::Token>> = query_tokens
         .iter()
         .map(|q| {
-            let rows: Vec<GramRow<T::Token>> = q
-                .iter()
-                .map(|(tok, word)| {
-                    let class = tok.term().map(|t| t.class()).unwrap_or(0);
-                    let df = resolve(tok).map_or(0, |(_, df)| df);
-                    let order = tok.borrow().chars().count() as u8;
-                    let energy =
-                        energy_with_floor(df.max(0) as f64, df_min_batch, n_segments as f64, kappa);
-                    let floored = (df.max(0) as f64) <= df_min_batch;
-                    GramRow {
-                        token: tok.clone(),
-                        df,
-                        class,
-                        order,
-                        word: *word,
-                        energy,
-                        floored,
-                    }
-                })
-                .collect();
-            select(&rows, sel_params, &class_snap)
+            plan_views(
+                q,
+                &resolve,
+                &index.tokenizer,
+                &class_snap,
+                sel_params,
+                df_min_batch,
+                n_segments,
+                kappa,
+                nu,
+            )
         })
         .collect();
 
-    // One effective-postings read over the union of all queries' selected ids.
-    let sel_ids: Vec<TermId> = selected_per
+    // One effective-postings read over the union of every query's every view's selected ids.
+    let sel_ids: Vec<TermId> = planned_sel
         .iter()
-        .flat_map(|s| s.iter())
+        .flat_map(|vs| vs.views.iter().flatten())
         .filter_map(|tok| resolve(tok).map(|(id, _)| id))
         .collect::<BTreeSet<TermId>>()
         .into_iter()
@@ -597,133 +629,357 @@ fn prepare<T: Tokenizer>(
     // at `E_floored ≤ E_max`, the rest below), so every quantized weight is `≤ ⌊E_max/Δ⌉`. This
     // bound depends on `N` only through `E_max/Δ ~ (ln N)/(ν·Δ)` — i.e. the per-gram weight needs
     // `~log log N` planes — and never on the posting cardinalities, so the engine's op count stays
-    // cardinality-independent (the flatness property). Asserted per query below.
+    // cardinality-independent (the flatness property). Asserted per view below.
     let wq_ceiling = quantize_energy(e_max(n_segments as f64, nu), delta);
     // The count credit `μ = max(0, logit σ)` (derivation §3/§9). `σ` is the index-level corpus
     // constant (sanitized at open), so this is one value for the whole batch — read once, never a
     // per-batch aggregate (batch == serial). The per-query §9 concentration cap is applied below.
     let mu = count_credit(index.sigma);
+    let batch = BatchConsts {
+        df_min_batch,
+        n_segments,
+        avgdl,
+        kappa,
+        delta,
+        mu,
+        wq_ceiling,
+        min_shared,
+    };
 
+    // Build one `QueryPlan` per rank-view, wrapped in a `PlannedQuery` (the RRF fusion unit).
     let mut plans = Vec::with_capacity(queries.len());
-    for selected in &selected_per {
-        let mut selected_strings = Vec::with_capacity(selected.len());
-        let mut present_tokens = Vec::new();
-        let mut present_postings = Vec::new();
-        let mut present_dfs = Vec::new();
-        for tok in selected {
-            let s = tok.borrow().to_string();
-            if let Some(bm) = resolve(tok).and_then(|(id, _)| postings_map.get(&id)) {
-                present_tokens.push(s.clone());
-                present_dfs.push(bm.cardinality());
-                present_postings.push(bm.clone());
+    for vs in &planned_sel {
+        let mut view_plans = Vec::with_capacity(vs.views.len());
+        let mut fused_selected: Vec<String> = Vec::new();
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        for selected in &vs.views {
+            let plan = build_view_plan(index, selected, &postings_map, &resolve, &batch);
+            for s in &plan.selected_strings {
+                if seen.insert(s.clone()) {
+                    fused_selected.push(s.clone());
+                }
             }
-            selected_strings.push(s);
+            view_plans.push(plan);
         }
-        // Telemetry for the weight-step hint (the band-spread of this query's present postings).
-        index.observe_band_spread(&present_dfs);
-        // The `Σ kept-posting cardinality` work-done probe — only evaluated under the `tracing`
-        // feature (the macro does not evaluate its args otherwise), so the hot path pays nothing
-        // by default. The benchmark profile pass reads this event.
-        trace_debug!(
-            postings = present_postings.len(),
-            sum_cardinality = present_dfs.iter().sum::<u64>(),
-            "trifle: weighted overlap candidate generation"
-        );
-        // v0.4 §2/§4/§7: raw logit-idf energies, computed here since the engine is `N`-free. Reused
-        // for both the quantized bit-sliced weights (replacing v0.3's `N`-free df-rarity tiers) and
-        // the §9 concentration cap below. `present_dfs[i]` is the cardinality of
-        // `present_postings[i]`, so everything stays parallel to the postings; the batch-cached
-        // `df_min_batch` keeps the floor `powf` out of this per-gram map.
-        let energies: Vec<f64> = present_dfs
-            .iter()
-            .map(|&df| energy_with_floor(df as f64, df_min_batch, n_segments as f64, kappa))
-            .collect();
-        let weights: Vec<u32> = energies
-            .iter()
-            .map(|&e| quantize_energy(e, delta))
-            .collect();
-        debug_assert!(
-            weights.iter().all(|&w| w <= wq_ceiling),
-            "energy weight exceeds the cardinality-independent E_max ceiling ⌊E_max/Δ⌉={wq_ceiling}: \
-             flatness bound violated"
-        );
-        // v0.4 M2 (§3/§4/§9): per-gram floored flag (query-side `df ≤ df_min`) + gram order
-        // (codepoint count), then the §9-capped per-order count credit. The cap ranges over P's
-        // energies (floored grams included in `E_top`, §9/§12 — see `concentration_cap`); `σ` is
-        // index-level and uniform across orders query-side, so every present non-floored order maps
-        // to the same capped `μ`. The per-order bucketing is kept structural for M5's doc-side
-        // `ρ = σ(1−ε)^n`. All of this is a pure function of THIS query's grams + the shared
-        // (σ, N, ν, κ, Δ) snapshot ⇒ `batch == serial`.
-        let present_floored: Vec<bool> = present_dfs
-            .iter()
-            .map(|&df| (df as f64) <= df_min_batch)
-            .collect();
-        let present_orders: Vec<u8> = present_tokens
-            .iter()
-            .map(|t| t.chars().count() as u8)
-            .collect();
-        let mu_capped = match concentration_cap(&energies) {
-            Some(cap) => mu.min(cap),
-            None => mu,
-        };
-        let mut mu_by_order: FxHashMap<u8, f64> = FxHashMap::default();
-        for (&order, &floored) in present_orders.iter().zip(&present_floored) {
-            if !floored {
-                mu_by_order.insert(order, mu_capped);
-            }
-        }
-        // v0.4 M3 (§6/§7): precompute the length-null split and the early-stop ceiling, all pure
-        // functions of THIS query's grams + the (σ, N, ν, κ, Δ) snapshot (⇒ batch == serial). The
-        // per-gram null `weight(g) = wq·Δ + (μ if non-floored)` mirrors the accumulator term for
-        // term (quantized energy, capped μ on non-floored grams only). Rare grams (p < P_LINEAR)
-        // fold into the separable `K_rare`; commons (p ≥ P_LINEAR) keep their saturating term.
-        let n_f = (n_segments as f64).max(1.0);
-        let mut k_rare = 0.0;
-        let mut null_commons: Vec<(f64, f64)> = Vec::new();
-        let mut cred_max = 0.0;
-        for i in 0..present_postings.len() {
-            let mu_g = if present_floored[i] {
-                0.0
-            } else {
-                mu_by_order.get(&present_orders[i]).copied().unwrap_or(0.0)
-            };
-            cred_max += mu_g;
-            let weight_g = weights[i] as f64 * delta + mu_g;
-            let p_g = ((present_dfs[i] as f64) / n_f).clamp(0.0, 1.0);
-            if p_g < P_LINEAR {
-                k_rare += p_g * weight_g;
-            } else {
-                null_commons.push((p_g, weight_g));
-            }
-        }
-        // `present_weights` retains the quantized energy weights (the engine takes `weights` by
-        // value): they identify the weight-0 postings whose union recovers count-only candidates
-        // (§7) and feed the null's `weight(g)` above.
-        let present_weights = weights.clone();
-        // Perf note (M1): unlike v0.3's `N`-free tiers, these are *absolute* energies, so a selected
-        // rare gram does not quantize to 1 — the engine's all-weight-1 fast path stops firing for
-        // mixed/uniform queries. The M3 post-pass already pays an `O(k)` per-candidate cost (credit
-        // + null), so this is no extra asymptotic cost; flatness holds (`O(k)`, k ≤ t_max).
-        let counter = Counter::build_weighted(&present_postings, weights, min_shared);
-        plans.push(QueryPlan {
-            counter,
-            present_tokens,
-            present_postings,
-            present_dfs,
-            present_floored,
-            present_orders,
-            present_weights,
-            mu_by_order,
-            delta,
-            k_rare,
-            null_commons,
-            cred_max,
-            selected_strings,
+        plans.push(PlannedQuery {
+            views: view_plans,
+            view_weights: vs.weights.clone(),
+            fused_selected,
             n_segments,
             avgdl,
         });
     }
     Ok(plans)
+}
+
+/// The per-batch scoring constants shared by every rank-view's [`QueryPlan`] (read once per batch
+/// from the snapshot, so they are identical for every query ⇒ `batch == serial`).
+#[derive(Clone, Copy)]
+struct BatchConsts {
+    df_min_batch: f64,
+    n_segments: u64,
+    avgdl: f64,
+    kappa: f64,
+    delta: f64,
+    mu: f64,
+    wq_ceiling: u32,
+    min_shared: u32,
+}
+
+/// One query's selected tokens per rank-view (1 = primary-only, 2 = primary + secondary), plus the
+/// parallel RRF fusion weights (derivation §8). An empty `views` is a query with no in-corpus gram
+/// in any view (it scores empty).
+struct ViewSel<Tk> {
+    views: Vec<Vec<Tk>>,
+    weights: Vec<f64>,
+}
+
+/// Partition one query's dual-order grams into rank-views and select each (derivation §8/§12).
+///
+/// Returns 1 view (primary-only) for a clean query — every present script has enough in-corpus
+/// primary grams to corroborate — or 2 (primary + secondary) when any present script is **starved**:
+/// fewer than `ν` in-corpus primary grams (a too-short/sparse query), or the budget pruned most of
+/// its primary energy (`collected_energy_far_below`, §5/§12). The §12 fallback drops a view that
+/// has no in-corpus gram (`PRIMARY → SECONDARY → empty`), so a too-short query (a 2-char Latin / a
+/// 1-char CJK run, which produce no primary gram) runs the secondary order alone. Pure function of
+/// the query's grams + the shared snapshot ⇒ `batch == serial`.
+#[allow(clippy::too_many_arguments)]
+fn plan_views<T: Tokenizer>(
+    q: &[(T::Token, u32)],
+    resolve: &impl Fn(&T::Token) -> Option<(TermId, i64)>,
+    tokenizer: &T,
+    class_snap: &ClassSnap,
+    sel_params: SelectParams,
+    df_min_batch: f64,
+    n_segments: u64,
+    kappa: f64,
+    nu: f64,
+) -> ViewSel<T::Token> {
+    let mut primary_rows: Vec<GramRow<T::Token>> = Vec::new();
+    let mut secondary_rows: Vec<GramRow<T::Token>> = Vec::new();
+    let mut present_scripts: FxHashSet<u8> = FxHashSet::default();
+    // Per-script starvation inputs over the PRIMARY order: how many primary grams the query
+    // *produced* (df irrelevant — the too-short test), how many are *in corpus* (df > 0 — the
+    // corroboration test), and their full energy (vs the collected energy after pruning, below).
+    let mut produced_primary_count: FxHashMap<u8, u32> = FxHashMap::default();
+    let mut primary_present_count: FxHashMap<u8, u32> = FxHashMap::default();
+    let mut full_primary_e: FxHashMap<u8, f64> = FxHashMap::default();
+    for (tok, word) in q {
+        let class = tok.term().map(|t| t.class()).unwrap_or(0);
+        let df = resolve(tok).map_or(0, |(_, df)| df);
+        let order = tok.borrow().chars().count() as u8;
+        let energy = energy_with_floor(df.max(0) as f64, df_min_batch, n_segments as f64, kappa);
+        let floored = (df.max(0) as f64) <= df_min_batch;
+        present_scripts.insert(class);
+        // A gram is SECONDARY iff its order is one shorter than its script's primary order (the
+        // tokenizer owns the per-script policy; a single-order tokenizer returns `u8::MAX`, so no
+        // gram is ever secondary and the secondary view never forms).
+        let po = tokenizer.primary_order(class);
+        let is_secondary = po != u8::MAX && order != 0 && order + 1 == po;
+        let row = GramRow {
+            token: tok.clone(),
+            df,
+            class,
+            order,
+            word: *word,
+            energy,
+            floored,
+        };
+        if is_secondary {
+            secondary_rows.push(row);
+        } else {
+            *produced_primary_count.entry(class).or_insert(0) += 1;
+            if df > 0 {
+                *primary_present_count.entry(class).or_insert(0) += 1;
+                *full_primary_e.entry(class).or_insert(0.0) += energy.max(0.0);
+            }
+            primary_rows.push(row);
+        }
+    }
+
+    let primary_selected = select(&primary_rows, sel_params, class_snap);
+
+    // Collected primary energy over the SELECTED present primary grams (the §12 reserve diagnostic).
+    let sel_primary: FxHashSet<&T::Token> = primary_selected.iter().collect();
+    let mut collected_primary_e: FxHashMap<u8, f64> = FxHashMap::default();
+    for r in &primary_rows {
+        if r.df > 0 && sel_primary.contains(&r.token) {
+            *collected_primary_e.entry(r.class).or_insert(0.0) += r.energy.max(0.0);
+        }
+    }
+    // starved(s): bring in the secondary view when EITHER
+    //   • STRUCTURAL — the script produced no primary gram at all (the query is too short to make
+    //     one: a 2-char Latin / 1-char CJK run), so the shorter order is the only signal; OR
+    //   • CORROBORATIVE — the script has ≥1 in-corpus primary gram but it is too thin to stand
+    //     alone (`< ν` distinct in-corpus primary grams, or the budget pruned most of the primary
+    //     energy — `collected_energy_far_below`, §5/§12), so the shorter order corroborates.
+    // It deliberately does NOT fire for a query that PRODUCED primary grams that are all absent
+    // (df = 0) — a query with no in-corpus primary overlap stays a no-match rather than fuzzily
+    // falling to the far-less-selective bigram layer (preserving the no-match precision contract; a
+    // narrowing of §12's literal while-loop, which would fall PRIMARY→SECONDARY on any all-absent
+    // primary view). The §8 structural fallback (too-short queries) and §5 corroboration (weak but
+    // present primary) are both preserved.
+    let starved = present_scripts.iter().any(|&s| {
+        let produced = produced_primary_count.get(&s).copied().unwrap_or(0);
+        let present = primary_present_count.get(&s).copied().unwrap_or(0);
+        let fe = full_primary_e.get(&s).copied().unwrap_or(0.0);
+        let ce = collected_primary_e.get(&s).copied().unwrap_or(0.0);
+        let structural = produced == 0;
+        let corroborative =
+            present >= 1 && ((present as f64) < nu || (fe > 0.0 && ce < STARVED_ENERGY_RATIO * fe));
+        structural || corroborative
+    });
+    drop(sel_primary); // release the borrow of `primary_selected` before it is moved below
+
+    let primary_present = primary_rows.iter().any(|r| r.df > 0);
+    let secondary_present = secondary_rows.iter().any(|r| r.df > 0);
+    let mut views: Vec<Vec<T::Token>> = Vec::new();
+    if starved {
+        // §12 rank_views = [PRIMARY, SECONDARY], with the PRIMARY → SECONDARY → empty fallback: a
+        // view with no in-corpus gram is dropped (so a too-short query runs the secondary alone).
+        if primary_present {
+            views.push(primary_selected);
+        }
+        if secondary_present {
+            views.push(select(&secondary_rows, sel_params, class_snap));
+        }
+    } else {
+        views.push(primary_selected);
+    }
+
+    let weights = if views.len() == 2 {
+        view_weights_from_dh(&present_scripts, tokenizer, class_snap)
+    } else {
+        vec![1.0; views.len()]
+    };
+    ViewSel { views, weights }
+}
+
+/// The RRF fusion weights `[w_primary, w_secondary]` from the per-`(script, order)` vocabulary-
+/// complexity gap `ΔH` (derivation §8). `ΔH(s) = ln V_primary − ln V_secondary` with `V` the
+/// distinct-gram count of class `(s, order)` (the `ln V` max-entropy proxy), averaged over the
+/// present scripts that have both orders populated; a richer primary inventory (`ΔH > 0`, the
+/// normal case) earns the primary view more weight via the fixed linear map `w_primary =
+/// clamp(0.5 + RRF_GAMMA·ΔH, 0.1, 0.9)`. Equal weights when `ΔH` is unavailable (no script has both
+/// vocabularies populated). Pure function of the present scripts + the shared snapshot.
+fn view_weights_from_dh<T: Tokenizer>(
+    present_scripts: &FxHashSet<u8>,
+    tokenizer: &T,
+    snap: &ClassSnap,
+) -> Vec<f64> {
+    let mut sum = 0.0;
+    let mut n = 0u32;
+    for &s in present_scripts {
+        let po = tokenizer.primary_order(s);
+        if po == u8::MAX || po < 1 {
+            continue;
+        }
+        let vp = snap.vocab(s, po);
+        let vs = snap.vocab(s, po - 1);
+        if vp > 0 && vs > 0 {
+            sum += (vp as f64).ln() - (vs as f64).ln();
+            n += 1;
+        }
+    }
+    let w_primary = if n > 0 {
+        (0.5 + RRF_GAMMA * (sum / n as f64)).clamp(0.1, 0.9)
+    } else {
+        0.5
+    };
+    vec![w_primary, 1.0 - w_primary]
+}
+
+/// Build one rank-view's [`QueryPlan`] from its `selected` tokens: load the present postings, compute
+/// the M1 logit-idf energy planes, the M2 floored flags + §9-capped per-order count credit, and the
+/// M3 length-null split — the whole M1–M4 scoring pipeline, unchanged, per view (derivation §2–§9).
+fn build_view_plan<T: Tokenizer>(
+    index: &Index<T>,
+    selected: &[T::Token],
+    postings_map: &FxHashMap<TermId, Bitmap>,
+    resolve: &impl Fn(&T::Token) -> Option<(TermId, i64)>,
+    batch: &BatchConsts,
+) -> QueryPlan {
+    let BatchConsts {
+        df_min_batch,
+        n_segments,
+        avgdl,
+        kappa,
+        delta,
+        mu,
+        wq_ceiling,
+        min_shared,
+    } = *batch;
+    let mut selected_strings = Vec::with_capacity(selected.len());
+    let mut present_tokens = Vec::new();
+    let mut present_postings = Vec::new();
+    let mut present_dfs = Vec::new();
+    for tok in selected {
+        let s = tok.borrow().to_string();
+        if let Some(bm) = resolve(tok).and_then(|(id, _)| postings_map.get(&id)) {
+            present_tokens.push(s.clone());
+            present_dfs.push(bm.cardinality());
+            present_postings.push(bm.clone());
+        }
+        selected_strings.push(s);
+    }
+    // Telemetry for the weight-step hint (the band-spread of this view's present postings).
+    index.observe_band_spread(&present_dfs);
+    // The `Σ kept-posting cardinality` work-done probe — only evaluated under the `tracing`
+    // feature (the macro does not evaluate its args otherwise), so the hot path pays nothing
+    // by default. The benchmark profile pass reads this event.
+    trace_debug!(
+        postings = present_postings.len(),
+        sum_cardinality = present_dfs.iter().sum::<u64>(),
+        "trifle: weighted overlap candidate generation"
+    );
+    // v0.4 §2/§4/§7: raw logit-idf energies, computed here since the engine is `N`-free. Reused
+    // for both the quantized bit-sliced weights (replacing v0.3's `N`-free df-rarity tiers) and
+    // the §9 concentration cap below. `present_dfs[i]` is the cardinality of
+    // `present_postings[i]`, so everything stays parallel to the postings; the batch-cached
+    // `df_min_batch` keeps the floor `powf` out of this per-gram map.
+    let energies: Vec<f64> = present_dfs
+        .iter()
+        .map(|&df| energy_with_floor(df as f64, df_min_batch, n_segments as f64, kappa))
+        .collect();
+    let weights: Vec<u32> = energies
+        .iter()
+        .map(|&e| quantize_energy(e, delta))
+        .collect();
+    debug_assert!(
+        weights.iter().all(|&w| w <= wq_ceiling),
+        "energy weight exceeds the cardinality-independent E_max ceiling ⌊E_max/Δ⌉={wq_ceiling}: \
+         flatness bound violated"
+    );
+    // v0.4 M2 (§3/§4/§9): per-gram floored flag (query-side `df ≤ df_min`) + gram order
+    // (codepoint count), then the §9-capped per-order count credit. The cap ranges over P's
+    // energies (floored grams included in `E_top`, §9/§12 — see `concentration_cap`); `σ` is
+    // index-level and uniform across orders query-side, so every present non-floored order maps
+    // to the same capped `μ`. The per-order bucketing is kept structural for a future doc-side
+    // `ρ = σ(1−ε)^n`. All of this is a pure function of THIS view's grams + the shared
+    // (σ, N, ν, κ, Δ) snapshot ⇒ `batch == serial`.
+    let present_floored: Vec<bool> = present_dfs
+        .iter()
+        .map(|&df| (df as f64) <= df_min_batch)
+        .collect();
+    let present_orders: Vec<u8> = present_tokens
+        .iter()
+        .map(|t| t.chars().count() as u8)
+        .collect();
+    let mu_capped = match concentration_cap(&energies) {
+        Some(cap) => mu.min(cap),
+        None => mu,
+    };
+    let mut mu_by_order: FxHashMap<u8, f64> = FxHashMap::default();
+    for (&order, &floored) in present_orders.iter().zip(&present_floored) {
+        if !floored {
+            mu_by_order.insert(order, mu_capped);
+        }
+    }
+    // v0.4 M3 (§6/§7): precompute the length-null split and the early-stop ceiling, all pure
+    // functions of THIS view's grams + the (σ, N, ν, κ, Δ) snapshot (⇒ batch == serial). The
+    // per-gram null `weight(g) = wq·Δ + (μ if non-floored)` mirrors the accumulator term for
+    // term (quantized energy, capped μ on non-floored grams only). Rare grams (p < P_LINEAR)
+    // fold into the separable `K_rare`; commons (p ≥ P_LINEAR) keep their saturating term.
+    let n_f = (n_segments as f64).max(1.0);
+    let mut k_rare = 0.0;
+    let mut null_commons: Vec<(f64, f64)> = Vec::new();
+    let mut cred_max = 0.0;
+    for i in 0..present_postings.len() {
+        let mu_g = if present_floored[i] {
+            0.0
+        } else {
+            mu_by_order.get(&present_orders[i]).copied().unwrap_or(0.0)
+        };
+        cred_max += mu_g;
+        let weight_g = weights[i] as f64 * delta + mu_g;
+        let p_g = ((present_dfs[i] as f64) / n_f).clamp(0.0, 1.0);
+        if p_g < P_LINEAR {
+            k_rare += p_g * weight_g;
+        } else {
+            null_commons.push((p_g, weight_g));
+        }
+    }
+    // `present_weights` retains the quantized energy weights (the engine takes `weights` by
+    // value): they identify the weight-0 postings whose union recovers count-only candidates
+    // (§7) and feed the null's `weight(g)` above.
+    let present_weights = weights.clone();
+    let counter = Counter::build_weighted(&present_postings, weights, min_shared);
+    QueryPlan {
+        counter,
+        present_tokens,
+        present_postings,
+        present_dfs,
+        present_floored,
+        present_orders,
+        present_weights,
+        mu_by_order,
+        delta,
+        k_rare,
+        null_commons,
+        cred_max,
+        selected_strings,
+        avgdl,
+    }
 }
 
 /// The fixed provenance context for a search: the snapshot connection, the namespace, the key
@@ -1046,10 +1302,86 @@ fn score_union(
     Ok(ranked.into_iter().map(|(c, _)| c).collect())
 }
 
+/// Score a [`PlannedQuery`]'s rank-views (derivation §8/§12). The **single-view** (clean / not
+/// starved) path is exactly [`score_union`] with the eager over-sample early-stop — clean queries
+/// pay nothing for §8. A **two-view** (starved) query scores each view's *full* bounded union
+/// (`limit = None`, since a rank requires the whole ordering) and RRF-fuses them ([`rrf_fuse`]).
+/// `limit = Some(k)` truncates the final fused order to `k`; `None` returns the full fused order.
+fn score_planned(
+    prov: &Provenance<'_>,
+    planned: &PlannedQuery,
+    limit: Option<usize>,
+) -> Result<Vec<Candidate>> {
+    match planned.views.as_slice() {
+        [] => Ok(Vec::new()),
+        [single] => score_union(prov, single, limit),
+        views => {
+            // Each view's full ranked union (rank = position, so the whole order is needed).
+            let mut ranked_views = Vec::with_capacity(views.len());
+            for v in views {
+                ranked_views.push(score_union(prov, v, None)?);
+            }
+            Ok(rrf_fuse(&ranked_views, &planned.view_weights, limit))
+        }
+    }
+}
+
+/// Reciprocal-rank-fuse the per-view ranked candidate lists (derivation §8). `RRF(seg) = Σ_v w_v /
+/// (k_RRF + rank_v)`, 1-based `rank_v` = the candidate's position in view `v`'s corrected-float
+/// order, with **`missing = "omit"`**: a key absent from a view contributes nothing from that view
+/// (it is *not* given a worst-rank penalty), so a seg surfaced by only one view keeps just that
+/// view's contribution. RRF reads RANKS, not summed energy, so a contiguous match that ranks well
+/// in both the trigram and bigram views is *not* additively over-credited by its sub-grams (the §8
+/// robustness pooling would break). Dedups one candidate per caller key (the best-ranked view's),
+/// reports the fused score as [`corrected_score`](Candidate::corrected_score), and sorts best-first
+/// with a deterministic tiebreak (fused desc → integer energy desc → seg id asc) ⇒ `batch == serial`.
+fn rrf_fuse(views: &[Vec<Candidate>], weights: &[f64], limit: Option<usize>) -> Vec<Candidate> {
+    // key -> (best-ranked candidate, fused RRF score, that best 1-based rank).
+    let mut acc: FxHashMap<Key, (Candidate, f64, usize)> = FxHashMap::default();
+    for (vi, view) in views.iter().enumerate() {
+        let w = weights.get(vi).copied().unwrap_or(1.0);
+        for (i, c) in view.iter().enumerate() {
+            let rank = i + 1; // 1-based
+            let contrib = w / (K_RRF + rank as f64);
+            match acc.get_mut(c.key()) {
+                Some(slot) => {
+                    slot.1 += contrib;
+                    if rank < slot.2 {
+                        slot.0 = c.clone();
+                        slot.2 = rank;
+                    }
+                }
+                None => {
+                    acc.insert(c.key().clone(), (c.clone(), contrib, rank));
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<(Candidate, f64)> = acc
+        .into_values()
+        .map(|(mut c, score, _)| {
+            // The fused path's ranking key is the RRF score; surface it as the corrected score so
+            // `corrected_score()` stays "the value trifle sorted by" (the single-view path keeps the
+            // §6/§7 float).
+            c.corrected_score = score;
+            (c, score)
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| b.0.score.cmp(&a.0.score))
+            .then_with(|| a.0.seg_id.cmp(&b.0.seg_id))
+    });
+    if let Some(l) = limit {
+        ranked.truncate(l);
+    }
+    ranked.into_iter().map(|(c, _)| c).collect()
+}
+
 /// Eager: top-`limit` matches per query, all queries sharing one snapshot. The safe default
-/// front door (`matches`/`matches_batch`). Scores each plan's bounded candidate union by the §6/§7
-/// corrected float (with the over-sample early-stop, see [`score_union`]), then hydrates exactly
-/// the kept rows.
+/// front door (`matches`/`matches_batch`). Scores each query's rank-views by the §6/§7 corrected
+/// float (single view: the over-sample early-stop; two views: RRF fusion, see [`score_planned`]),
+/// then hydrates exactly the kept rows.
 pub(crate) fn matches_batch<T: Tokenizer>(
     index: &Index<T>,
     queries: &[&str],
@@ -1073,13 +1405,13 @@ pub(crate) fn matches_batch<T: Tokenizer>(
     };
 
     let mut out = Vec::with_capacity(queries.len());
-    for plan in &plans {
-        let kept = score_union(&prov, plan, Some(limit))?;
+    for planned in &plans {
+        let kept = score_planned(&prov, planned, Some(limit))?;
         out.push(hydrate_matches(
             &tx,
             ns,
             &index.tokenizer,
-            &plan.selected_strings,
+            &planned.fused_selected,
             &kept,
         )?);
     }
@@ -1099,20 +1431,20 @@ pub(crate) fn candidates<'a, T: Tokenizer>(
     let conn = index.store.read()?;
     conn.execute_batch("BEGIN DEFERRED")?; // pin a snapshot for the stream's life
     // prepare may fail (Busy on generation skew); release the snapshot if so.
-    let plan = match prepare(index, &conn, ns, &[query], opts) {
-        Ok(mut plans) => plans.pop().expect("one plan for one query"),
+    let planned = match prepare(index, &conn, ns, &[query], opts) {
+        Ok(mut plans) => plans.pop().expect("one planned query for one query"),
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             return Err(e);
         }
     };
-    // N / avgdl live on the plan (computed once in `prepare` from this snapshot's rolling
+    // N / avgdl live on the planned query (computed once in `prepare` from this snapshot's rolling
     // counters); the accessors read them from there. A corpus-relative custom score must not
     // cross a snapshot boundary.
     Ok(CandidateStream {
         index,
         conn,
-        plan,
+        planned,
         filter: opts.filter,
         ready: VecDeque::new(),
         started: false,
@@ -1141,10 +1473,10 @@ pub(crate) fn candidates<'a, T: Tokenizer>(
 pub struct CandidateStream<'a, T: Tokenizer> {
     index: &'a Index<T>,
     conn: ReadConn<'a>,
-    plan: QueryPlan,
+    planned: PlannedQuery,
     filter: Option<SqlFilter<'a>>,
-    /// The cached full sorted union, computed on the first [`next`](Iterator::next) and drained
-    /// front-to-back thereafter.
+    /// The cached full sorted (and, for a starved query, RRF-fused) union, computed on the first
+    /// [`next`](Iterator::next) and drained front-to-back thereafter.
     ready: VecDeque<Candidate>,
     /// Whether the one-shot union scoring has run (so an exhausted stream does not re-score).
     started: bool,
@@ -1154,32 +1486,41 @@ pub struct CandidateStream<'a, T: Tokenizer> {
 impl<T: Tokenizer> CandidateStream<'_, T> {
     /// Total live segments `N`, from **this search's** snapshot (not `stats()`).
     pub fn n_segments(&self) -> u64 {
-        self.plan.n_segments
+        self.planned.n_segments
     }
     /// Mean segment gram length (`avgdl`) on this snapshot. `0.0` on an empty corpus.
     pub fn avgdl(&self) -> f64 {
-        self.plan.avgdl
+        self.planned.avgdl
     }
     /// The selected tokens that have a posting, each with its document frequency `df` (no SQL —
-    /// the postings are already in hand).
+    /// the postings are already in hand). Unions every rank-view (derivation §8); a token present
+    /// in more than one view is reported once (its first view's `df`, which is identical across
+    /// views — the same snapshot posting).
     pub fn present_terms(&self) -> impl Iterator<Item = (&str, u64)> {
-        self.plan
-            .present_tokens
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        self.planned
+            .views
             .iter()
-            .zip(&self.plan.present_dfs)
-            .map(|(t, df)| (t.as_str(), *df))
+            .flat_map(|p| p.present_tokens.iter().zip(&p.present_dfs))
+            .filter_map(move |(t, df)| seen.insert(t.as_str()).then_some((t.as_str(), *df)))
     }
     /// Which selected tokens this candidate's segment actually contains, each with its `df` (no
-    /// SQL). The inputs an IDF-sum-style custom reranker needs.
+    /// SQL). The inputs an IDF-sum-style custom reranker needs. Scans every rank-view's postings
+    /// (a fused candidate may have matched in either view), deduped per token string.
     pub fn matched_terms<'c>(&'c self, c: &Candidate) -> impl Iterator<Item = (&'c str, u64)> + 'c {
         let seg_id = c.seg_id;
-        self.plan
-            .present_tokens
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        self.planned
+            .views
             .iter()
-            .zip(&self.plan.present_postings)
-            .zip(&self.plan.present_dfs)
+            .flat_map(|p| {
+                p.present_tokens
+                    .iter()
+                    .zip(&p.present_postings)
+                    .zip(&p.present_dfs)
+            })
             .filter(move |((_, bm), _)| bm.contains(seg_id))
-            .map(|((t, _), df)| (t.as_str(), *df))
+            .filter_map(move |((t, _), df)| seen.insert(t.as_str()).then_some((t.as_str(), *df)))
     }
 
     /// Hydrate text + span for exactly `kept` in ONE batched read (the terminal step). A
@@ -1190,7 +1531,7 @@ impl<T: Tokenizer> CandidateStream<'_, T> {
             &self.conn,
             self.index.store.namespace(),
             &self.index.tokenizer,
-            &self.plan.selected_strings,
+            &self.planned.fused_selected,
             kept,
         )
     }
@@ -1221,7 +1562,8 @@ impl<T: Tokenizer> Iterator for CandidateStream<'_, T> {
         if !self.started {
             self.started = true;
             // Score the full union once (`limit = None`): count credit + §6 length null +
-            // count-only recovery, sorted best-first. Borrows of `self` end with this block.
+            // count-only recovery, sorted best-first — and, for a starved query, RRF-fused across
+            // the rank-views (derivation §8). Borrows of `self` end with this block.
             let scored = {
                 let prov = Provenance {
                     conn: &self.conn,
@@ -1229,7 +1571,7 @@ impl<T: Tokenizer> Iterator for CandidateStream<'_, T> {
                     key_shape: self.index.schema.key_shape(),
                     filter: self.filter.as_ref(),
                 };
-                score_union(&prov, &self.plan, None)
+                score_planned(&prov, &self.planned, None)
             };
             match scored {
                 Ok(v) => self.ready = VecDeque::from(v),
@@ -1695,5 +2037,134 @@ mod null_tests {
         approx(kth_largest(&v, 2), 4.0);
         approx(kth_largest(&v, 5), 1.0); // the min
         approx(kth_largest(&[7.0], 1), 7.0);
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    //! v0.4/M5 rank-view RRF fusion (derivation §8): the reciprocal-rank-fusion rank math, the
+    //! `missing="omit"` rule (a seg in only one view is not worst-rank-penalized), the "reads RANKS
+    //! not summed energy" property (a contiguous match is not additively tripled by its sub-grams),
+    //! the deterministic tiebreak, and the ΔH → view-weight map.
+    use super::{Candidate, K_RRF, rrf_fuse, view_weights_from_dh};
+    use crate::hash::FxHashSet;
+    use crate::model::Key;
+    use crate::term::encode_term;
+    use crate::tokenize::DefaultTokenizer;
+    use crate::welford::ClassStats;
+
+    fn cand(key: i64, seg: u32, corrected: f64) -> Candidate {
+        Candidate {
+            key: Key::Integer(key),
+            label: "f".to_string(),
+            seg_id: seg,
+            score: 1,
+            overlap: 2,
+            corrected_score: corrected,
+        }
+    }
+
+    #[test]
+    fn rrf_reads_ranks_not_summed_energy_and_omits_the_absent() {
+        // view_a = the trigram (primary) view's corrected-float order; view_b = the bigram
+        // (secondary) view's. Key 1 is a CONTIGUOUS match: it ranks #1 in BOTH views (its trigram
+        // tops view_a, its sub-bigrams top view_b). Keys 2 and 3 appear in ONE view each.
+        let view_a = vec![cand(1, 1, 9.0), cand(3, 3, 5.0)];
+        let view_b = vec![cand(1, 1, 8.0), cand(2, 2, 4.0)];
+        let weights = vec![0.6, 0.4];
+        let fused = rrf_fuse(&[view_a, view_b], &weights, None);
+
+        let score = |k: i64| {
+            fused
+                .iter()
+                .find(|c| c.key().as_i64() == Some(k))
+                .unwrap()
+                .corrected_score()
+        };
+        // Key 1: rank 1 in both → 0.6/(k+1) + 0.4/(k+1) = 1.0/(K_RRF+1) — exactly TWO view
+        // contributions, NOT proportional to the THREE grams (trigram + 2 sub-bigrams) that drove
+        // those ranks. Pooling would have summed the energies (9.0 + 8.0 = 17), letting one
+        // contiguous match dominate; RRF caps it at the rank contribution. This IS "fusion beats
+        // pooling: a contiguous trigram match is not additively tripled by its sub-bigrams."
+        assert!((score(1) - 1.0 / (K_RRF + 1.0)).abs() < 1e-12);
+        // Key 2: present ONLY in view_b at rank 2 → 0.4/(K_RRF+2). The absent view_a contributes
+        // NOTHING (missing="omit"), not a worst-rank penalty.
+        assert!((score(2) - 0.4 / (K_RRF + 2.0)).abs() < 1e-12);
+        // Key 3: present ONLY in view_a at rank 2 → 0.6/(K_RRF+2).
+        assert!((score(3) - 0.6 / (K_RRF + 2.0)).abs() < 1e-12);
+        // Order by fused score: 1 (1/61) > 3 (0.6/62) > 2 (0.4/62).
+        assert_eq!(
+            fused
+                .iter()
+                .map(|c| c.key().as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 3, 2]
+        );
+    }
+
+    #[test]
+    fn rrf_truncates_to_limit_after_fusing() {
+        let view_a = vec![cand(1, 1, 9.0), cand(2, 2, 5.0), cand(3, 3, 1.0)];
+        let view_b = vec![cand(2, 2, 9.0), cand(1, 1, 5.0)];
+        let fused = rrf_fuse(&[view_a, view_b], &[0.5, 0.5], Some(2));
+        assert_eq!(fused.len(), 2, "top-k applied after fusion");
+        // Keys 1 and 2 are in both views; key 3 only in view_a low → truncated out.
+        assert!(fused.iter().all(|c| c.key().as_i64() != Some(3)));
+    }
+
+    #[test]
+    fn rrf_tiebreak_is_deterministic() {
+        // Two keys with identical fused score (each rank 1 in one view, weights equal): the tiebreak
+        // (fused desc → integer energy desc → seg id asc) breaks it by seg id, deterministically.
+        let view_a = vec![cand(10, 10, 1.0)];
+        let view_b = vec![cand(20, 20, 1.0)];
+        let a = rrf_fuse(&[view_a.clone(), view_b.clone()], &[0.5, 0.5], None);
+        let b = rrf_fuse(&[view_a, view_b], &[0.5, 0.5], None);
+        assert_eq!(
+            a.iter()
+                .map(|c| c.key().as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            b.iter()
+                .map(|c| c.key().as_i64().unwrap())
+                .collect::<Vec<_>>()
+        );
+        // seg 10 < seg 20, equal scores ⇒ key 10 first.
+        assert_eq!(a[0].key().as_i64(), Some(10));
+    }
+
+    #[test]
+    fn view_weights_favor_the_richer_primary_inventory() {
+        // ΔH = ln V_primary − ln V_secondary: a richer (larger-vocab) primary order earns more
+        // fusion weight (derivation §8). Latin primary order is the trigram (3), secondary the
+        // bigram (2).
+        let latin = encode_term("abc").unwrap().class();
+        let tok = DefaultTokenizer::new();
+        let mut stats = ClassStats::new();
+        for df in 1..=1000 {
+            stats.add_sample(latin, 3, df); // V_primary = 1000 distinct trigrams
+        }
+        for df in 1..=50 {
+            stats.add_sample(latin, 2, df); // V_secondary = 50 distinct bigrams
+        }
+        let snap = stats.snapshot_for([(latin, 3u8), (latin, 2u8)]);
+        let mut scripts: FxHashSet<u8> = FxHashSet::default();
+        scripts.insert(latin);
+        let w = view_weights_from_dh(&scripts, &tok, &snap);
+        assert!(
+            w[0] > 0.5 && w[0] <= 0.9,
+            "richer primary inventory ⇒ more primary weight: {w:?}"
+        );
+        assert!((w[0] + w[1] - 1.0).abs() < 1e-12, "weights sum to 1");
+    }
+
+    #[test]
+    fn view_weights_are_equal_when_dh_is_unavailable() {
+        // An empty snapshot (no vocab populated) ⇒ ΔH unavailable ⇒ equal 0.5/0.5 weights.
+        let tok = DefaultTokenizer::new();
+        let snap = crate::welford::ClassSnap::empty();
+        let mut scripts: FxHashSet<u8> = FxHashSet::default();
+        scripts.insert(encode_term("abc").unwrap().class());
+        let w = view_weights_from_dh(&scripts, &tok, &snap);
+        assert_eq!(w, vec![0.5, 0.5]);
     }
 }

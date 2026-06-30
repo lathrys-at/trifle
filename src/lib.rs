@@ -223,15 +223,19 @@ pub struct SearchOpts<'a> {
     /// A non-finite, zero, or negative value falls back to the `0.5` default.
     pub delta: Option<f64>,
     /// `ε` — the doc-side per-character error rate; `0` selects the clean / query-side channel
-    /// (`ρ = σ(1−ε)^n`, derivation §3.2). `None` → `0.0`. *v0.4 M0 scaffolding — declared, not yet
-    /// consumed by scoring.*
+    /// (`ρ = σ(1−ε)^n`, derivation §3.2). `None` → `0.0`. **Reserved, not yet consumed.** v0.4 ships
+    /// the **query-side** channel only; the doc-side channel (no contamination floor, full idf, the
+    /// count credit on every gram) is a **deferred post-v0.4 milestone**, because it is a *per-field*
+    /// property and the contamination floor is baked into the per-posting bit-sliced energy planes —
+    /// a posting spans segments from many fields, so a per-field channel needs per-field posting
+    /// partitions (or per-candidate re-scoring), which is its own piece of work. `ε` is declared so
+    /// the surface is stable when that lands.
     pub epsilon: Option<f64>,
     /// `k` — the confidence-bounded stop's target candidate-pool size; the stop aims for `ln(N/k)`
-    /// nats (derivation §5). `None` → `128`. *v0.4 M0 scaffolding — declared, not yet consumed by
-    /// scoring.*
+    /// nats (derivation §5). `None` → `128`. Consumed by the v0.4/M4 Cantelli stop.
     pub k_target: Option<u64>,
     /// `c` — the Cantelli stopping margin (a distribution-free bound, *not* a z-score; derivation
-    /// §5). `None` → `2.0`. *v0.4 M0 scaffolding — declared, not yet consumed by scoring.*
+    /// §5). `None` → `2.0`. Consumed by the v0.4/M4 Cantelli stop.
     pub c_margin: Option<f64>,
     /// An opt-in raw-SQL [`SqlFilter`] over the caller's live data, folded into per-bucket
     /// provenance. `None` = unfiltered.

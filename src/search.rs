@@ -26,7 +26,7 @@ use std::rc::Rc;
 use croaring::Bitmap;
 use rusqlite::Connection;
 use rusqlite::types::Value;
-use trifle_overlap::{Counter, Scored, Walk};
+use trifle_overlap::{Counter, Scored};
 
 use crate::dict::TermId;
 use crate::filter::SqlFilter;
@@ -48,22 +48,43 @@ const CHUNK: usize = 64;
 /// The realized floored-gram energy `E_floored` (nats) below which the §7 quantization guard
 /// `Δ < 2·E_floored` is treated as inapplicable rather than violated. On a handful-of-segments
 /// corpus `E_floored` shrinks below this and the guard cannot hold; that regime is recall-safe via
-/// the engine's `≥ 1` weight clamp, so the debug-time guard is skipped there to avoid tripping on
-/// legitimately tiny corpora. The guard still fires for a genuinely too-coarse `Δ` once the corpus
-/// is large enough for `E_floored` to clear this threshold. See [`prepare`].
+/// the §7 **count-only union** ([`score_union`]) — a floored gram that quantizes to weight 0 no
+/// longer vanishes (v0.4 removed the engine's `≥ 1` clamp), it is recovered as a count-only
+/// candidate — so the debug-time guard is skipped there to avoid tripping on legitimately tiny
+/// corpora. The guard still fires for a genuinely too-coarse `Δ` once the corpus is large enough
+/// for `E_floored` to clear this threshold. See [`prepare`].
 const GUARD_MIN_E_FLOORED: f64 = 0.5;
+
+/// The marginal-probability threshold `P_LINEAR` separating the §6 length null's two regimes. A
+/// gram with `p_g = df_g/N < P_LINEAR` is **rare**: its presence rate `π_g(L) = 1−(1−p_g)^(L/L̄)`
+/// is within `(L/L̄)·p_g` to first order, so its null contribution folds into the separable,
+/// precomputed-once `K_rare = Σ p_g·weight(g)` (derivation §6/§12). A gram with `p_g ≥ P_LINEAR` is
+/// **common** and gets the exact saturating term per candidate.
+///
+/// Recall direction (derivation §6): the linear form *over*-estimates `π_g` (`(L/L̄)·p ≥ π_g`), so
+/// it over-debits — but only for rare grams, where the gap is `O((L·p/L̄)²)` and tiny (`< 0.5%` of
+/// the gram's weight at `p < 0.02`, `L/L̄ ≤ 5`, trifle's small-segment regime). The genuinely
+/// common grams — where an un-saturated linear debit would exceed `1` and wrongly bury a long
+/// relevant segment — get the **exact** saturating `π_g`, which never over-debits. So a *lower*
+/// `P_LINEAR` is strictly safer (more grams exact) at an `O(k)` per-candidate cost; `0.02` is the
+/// conservative default. It is a pure shape constant (no corpus dependence), so it is an internal
+/// `const`, not a [`SearchOpts`](crate::SearchOpts) knob.
+const P_LINEAR: f64 = 0.02;
 
 /// A scored, provenance-only candidate (no text — see [`CandidateStream::hydrate`]).
 ///
 /// `seg_id` is snapshot-specific (a [`rebuild`](crate::Index::rebuild) reassigns it), so do not
 /// carry a `Candidate` across streams/snapshots.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Eq` (the [`corrected_score`](Self::corrected_score) ranking key is `f64`).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Candidate {
     key: Key,
     label: String,
     seg_id: u32,
     score: u32,
     overlap: u32,
+    corrected_score: f64,
 }
 
 impl Candidate {
@@ -75,13 +96,24 @@ impl Candidate {
     pub fn label(&self) -> &str {
         &self.label
     }
-    /// The IDF-weighted overlap score — the value trifle ranks by.
+    /// The integer bit-sliced **energy** component `E_acc` (derivation §7) — the quantized
+    /// logit-idf overlap sum, in `Δ` units. A *component* of the score, **not** the ranking key
+    /// (see [`corrected_score`](Self::corrected_score)). Since v0.4 removed the engine's `≥ 1`
+    /// weight clamp, a candidate matching only weight-0 (common) grams has `score() == 0` while
+    /// `overlap() > 0`, so `score() ≥ overlap()` no longer holds — `score` is energy, not a count.
     pub fn score(&self) -> u32 {
         self.score
     }
     /// How many selected tokens this candidate shares (the raw, unweighted count).
     pub fn overlap(&self) -> u32 {
         self.overlap
+    }
+    /// The **ranking key**: the §6/§7 length-corrected score `E_acc·Δ + Σ_n μ_n·popcount_n − null`
+    /// (energy in nats + count credit − the saturating length null). This is what trifle sorts by;
+    /// it can be negative (the null dominates) and is `f64`. Use this — not [`score`](Self::score)
+    /// — for a custom rerank that wants trifle's own ordering value.
+    pub fn corrected_score(&self) -> f64 {
+        self.corrected_score
     }
 }
 
@@ -126,12 +158,32 @@ struct QueryPlan {
     /// the same `μ` in M2; the bucketing is kept structural so M5's per-order doc-side
     /// `ρ = σ(1−ε)^n` drops in by repopulating [`mu_by_order`](QueryPlan::mu_by_order).
     present_orders: Vec<u8>,
+    /// Per present gram (parallel to `present_postings`): its quantized bit-sliced energy weight
+    /// `wq = max(0, round(E_g/Δ))` (derivation §7). Used to identify the **weight-0** postings whose
+    /// union recovers count-only candidates (the §7 union), and as the energy term of the §6 null's
+    /// per-gram `weight(g)`.
+    present_weights: Vec<u32>,
     /// The §9-capped count credit `μ_n = min(max(0, logit σ), cap)`, keyed by the gram order `n`
     /// present among the **non-floored** grams. Looked up by `present_orders` when scoring credit.
     mu_by_order: FxHashMap<u8, f64>,
     /// The energy quantization step `Δ` (nats) this plan was built with — reconverts the integer
     /// bit-sliced energy back to nats for the float ranking key (derivation §7).
     delta: f64,
+    /// The §6 length-null slope over the **rare** grams (`p_g < P_LINEAR`): `K_rare = Σ p_g·weight(g)`
+    /// with `weight(g) = wq·Δ + (μ if non-floored)`. Precomputed once per query (the rare grams'
+    /// `π_g` is linear, hence separable), so the per-candidate null is `(L_d/L̄)·K_rare` plus the
+    /// few `null_commons` saturating terms. Pure function of this query's grams + the snapshot
+    /// (`batch == serial`).
+    k_rare: f64,
+    /// The §6 length-null's **common** grams (`p_g ≥ P_LINEAR`), each as `(p_g, weight(g))`. Each
+    /// needs the exact per-candidate saturating term `(1−(1−p_g)^(L_d/L̄))·weight(g)` (the linear
+    /// form would over-debit a long segment). Few — rarest-first selection keeps `#commons ≤ k`.
+    null_commons: Vec<(f64, f64)>,
+    /// The maximum count credit any candidate can earn — `Σ μ_order` over the **non-floored** present
+    /// grams (matching all of them). The eager over-sample early-stop's upper bound on an un-yielded
+    /// candidate's float is `c·Δ + cred_max` (the null, ≥ 0, only lowers scores, so dropping it keeps
+    /// the bound valid — derivation §7).
+    cred_max: f64,
     selected_strings: Vec<String>,
     n_segments: u64,
     avgdl: f64,
@@ -153,13 +205,61 @@ impl QueryPlan {
         )
     }
 
-    /// The M2 float ranking key: the integer bit-sliced energy reconverted to nats plus the count
-    /// credit (`E_acc·Δ + Σ_n μ_n·popcount_n`, derivation §7/§12). The §6 length null is M3, so it
-    /// is not subtracted here. Top-k truncation must use this key, never the bare integer
-    /// [`Scored::score`].
-    fn float_score(&self, scored: &Scored) -> f64 {
-        scored.score as f64 * self.delta + self.count_credit(scored.id)
+    /// Raw overlap **and** count credit for `id` in a **single** fused pass over the present
+    /// postings (one `contains` per posting, derivation §7's popcount alongside the raw count). Used
+    /// for count-only candidates (E_acc = 0), which need both the `min_shared` floor check (raw
+    /// overlap) and the credit, without a second pass. `O(k)`, `k ≤ t_max`.
+    fn overlap_and_credit(&self, id: u32) -> (u32, f64) {
+        let mut overlap = 0u32;
+        let mut credit = 0.0;
+        for (i, bm) in self.present_postings.iter().enumerate() {
+            if bm.contains(id) {
+                overlap += 1;
+                if !self.present_floored[i] {
+                    credit += self
+                        .mu_by_order
+                        .get(&self.present_orders[i])
+                        .copied()
+                        .unwrap_or(0.0);
+                }
+            }
+        }
+        (overlap, credit)
     }
+
+    /// The §6 length null for a candidate of relative length `rel_len = L_d/L̄`: the separable
+    /// rare-gram slope `rel_len·K_rare` plus the saturating common-gram terms (derivation §6/§12).
+    /// Subtracted from `E_acc·Δ + credit` to form the [`corrected_score`](Candidate::corrected_score).
+    fn length_null(&self, rel_len: f64) -> f64 {
+        length_null(rel_len, self.k_rare, &self.null_commons)
+    }
+
+    /// The §6/§7 length-corrected ranking key `E_acc·Δ + credit − null`. `e_acc` is the integer
+    /// bit-sliced energy, `credit` the §3/§9 count credit, `rel_len = L_d/L̄`.
+    fn corrected(&self, e_acc: u32, credit: f64, rel_len: f64) -> f64 {
+        e_acc as f64 * self.delta + credit - self.length_null(rel_len)
+    }
+}
+
+/// The §6 saturating length null `(L_d/L̄)·K_rare + Σ_commons (1−(1−p_g)^(L_d/L̄))·weight(g)`, a free
+/// function so it is unit-testable without a [`QueryPlan`]. `rel_len = L_d/L̄ ≥ 0`; each `(p, w)` is
+/// a common gram's marginal `p_g ∈ [0,1]` and its `weight(g)`. `p = 1` (a ubiquitous gram) gives
+/// `(1−0^rel_len) = 1`, debiting the full weight — exactly cancelling that gram's credit.
+fn length_null(rel_len: f64, k_rare: f64, commons: &[(f64, f64)]) -> f64 {
+    let mut null = rel_len * k_rare;
+    for &(p, w) in commons {
+        null += (1.0 - (1.0 - p).powf(rel_len)) * w;
+    }
+    null
+}
+
+/// Relative length `L_d/L̄` for a candidate, from its fetched distinct-gram count and `avgdl`.
+/// `0` when `avgdl ≤ 0` (an empty corpus, which has no candidates anyway) or the length is missing.
+fn rel_len(len: Option<i64>, avgdl: f64) -> f64 {
+    if avgdl <= 0.0 {
+        return 0.0;
+    }
+    (len.unwrap_or(0).max(0) as f64) / avgdl
 }
 
 // --- v0.4 logit-idf energy weighting (derivation §2, §4, §7) ------------------------------------
@@ -227,8 +327,9 @@ fn e_floored(n: f64, nu: f64, kappa: f64) -> f64 {
 }
 
 /// Quantize an energy to the bit-sliced weight `wq = max(0, round(E/Δ))` (derivation §7). A
-/// non-finite or non-positive energy maps to `0`; the engine then clamps every weight to `≥ 1`
-/// (`trifle_overlap`'s `plan`), so a `0`-energy gram still contributes count-only rather than
+/// non-finite or non-positive energy maps to `0`. A weight-0 gram adds **no** energy to the
+/// bit-sliced planes (v0.4 removed the engine's `≥ 1` clamp); a candidate matching only weight-0
+/// grams is recovered as a *count-only* candidate by the §7 union in [`score_union`] rather than
 /// vanishing. `delta` is assumed `> 0` (resolved positive in [`prepare`]).
 fn quantize_energy(e: f64, delta: f64) -> u32 {
     let q = (e / delta).round();
@@ -439,9 +540,10 @@ fn prepare<T: Tokenizer>(
     // gram never quantizes to `0` and drops out of the bit-sliced union. It is satisfiable only
     // once the corpus is large enough for `E_floored` to clear `Δ/2`; on a handful-of-segments
     // corpus `E_floored` shrinks (negative for `N ≲ 4` at the defaults) and the guard cannot hold.
-    // That regime is recall-safe regardless — the engine clamps every weight to `≥ 1`, so a
-    // floored gram still never vanishes; only its rarity ordering against other floored grams
-    // collapses, which a tiny corpus does not need. So the `debug_assert` fires only where
+    // That regime is recall-safe regardless — the §7 count-only union (`score_union`) recovers a
+    // floored gram that quantizes to weight 0 (v0.4 dropped the engine clamp), so it still never
+    // vanishes; only its rarity ordering against other floored grams collapses, which a tiny corpus
+    // does not need. So the `debug_assert` fires only where
     // `E_floored` is a meaningful positive energy (`GUARD_MIN_E_FLOORED`), catching a genuinely
     // too-coarse `Δ` on a real corpus without tripping the small-N fixtures. Compiled out of
     // release, so it never panics there.
@@ -533,12 +635,38 @@ fn prepare<T: Tokenizer>(
                 mu_by_order.insert(order, mu_capped);
             }
         }
+        // v0.4 M3 (§6/§7): precompute the length-null split and the early-stop ceiling, all pure
+        // functions of THIS query's grams + the (σ, N, ν, κ, Δ) snapshot (⇒ batch == serial). The
+        // per-gram null `weight(g) = wq·Δ + (μ if non-floored)` mirrors the accumulator term for
+        // term (quantized energy, capped μ on non-floored grams only). Rare grams (p < P_LINEAR)
+        // fold into the separable `K_rare`; commons (p ≥ P_LINEAR) keep their saturating term.
+        let n_f = (n_segments as f64).max(1.0);
+        let mut k_rare = 0.0;
+        let mut null_commons: Vec<(f64, f64)> = Vec::new();
+        let mut cred_max = 0.0;
+        for i in 0..present_postings.len() {
+            let mu_g = if present_floored[i] {
+                0.0
+            } else {
+                mu_by_order.get(&present_orders[i]).copied().unwrap_or(0.0)
+            };
+            cred_max += mu_g;
+            let weight_g = weights[i] as f64 * delta + mu_g;
+            let p_g = ((present_dfs[i] as f64) / n_f).clamp(0.0, 1.0);
+            if p_g < P_LINEAR {
+                k_rare += p_g * weight_g;
+            } else {
+                null_commons.push((p_g, weight_g));
+            }
+        }
+        // `present_weights` retains the quantized energy weights (the engine takes `weights` by
+        // value): they identify the weight-0 postings whose union recovers count-only candidates
+        // (§7) and feed the null's `weight(g)` above.
+        let present_weights = weights.clone();
         // Perf note (M1): unlike v0.3's `N`-free tiers, these are *absolute* energies, so a selected
-        // rare gram does not quantize to 1 — the engine's all-weight-1 fast path (overlap = score,
-        // no posting retention, no per-candidate `contains`) therefore stops firing for mixed/uniform
-        // queries, costing a bounded constant factor (k posting clones + k `contains` per yielded
-        // candidate, k ≤ t_max). Flatness still holds (`O(k)`, k bounded by selection); recovering
-        // the fast path is deferred to M3's walk reshape, not patched here.
+        // rare gram does not quantize to 1 — the engine's all-weight-1 fast path stops firing for
+        // mixed/uniform queries. The M3 post-pass already pays an `O(k)` per-candidate cost (credit
+        // + null), so this is no extra asymptotic cost; flatness holds (`O(k)`, k ≤ t_max).
         let counter = Counter::build_weighted(&present_postings, weights, min_shared);
         plans.push(QueryPlan {
             counter,
@@ -547,8 +675,12 @@ fn prepare<T: Tokenizer>(
             present_dfs,
             present_floored,
             present_orders,
+            present_weights,
             mu_by_order,
             delta,
+            k_rare,
+            null_commons,
+            cred_max,
             selected_strings,
             n_segments,
             avgdl,
@@ -567,10 +699,12 @@ struct Provenance<'c> {
 }
 
 impl Provenance<'_> {
-    /// One batched provenance(+filter) query over a chunk's seg ids: `(key, label)` per id that
-    /// exists and passes the filter. Fragment textually first, the candidate-scope param last
-    /// (`?{N+1}`), so the caller's `?1..?N` (numbered or anonymous) never collide with the scope.
-    fn lookup(&self, seg_ids: &[u32]) -> Result<FxHashMap<u32, (Key, String)>> {
+    /// One batched provenance(+filter) query over a chunk's seg ids: `(key, label, len)` per id
+    /// that exists and passes the filter. `len` is the segment's distinct-gram count `L_d`
+    /// (derivation §0/§6), folded into this same read so the §6 length null needs no second
+    /// round-trip. Fragment textually first, the candidate-scope param last (`?{N+1}`), so the
+    /// caller's `?1..?N` (numbered or anonymous) never collide with the scope.
+    fn lookup(&self, seg_ids: &[u32]) -> Result<FxHashMap<u32, (Key, String, i64)>> {
         let mut out = FxHashMap::with_capacity_and_hasher(seg_ids.len(), Default::default());
         if seg_ids.is_empty() {
             return Ok(out);
@@ -580,13 +714,13 @@ impl Provenance<'_> {
         let n = self.filter.map_or(0, |f| f.params.len());
         let sql = match self.filter {
             Some(f) => format!(
-                "SELECT id, key, label FROM {seg} WHERE ({frag}) AND id IN rarray(?{scope})",
+                "SELECT id, key, label, len FROM {seg} WHERE ({frag}) AND id IN rarray(?{scope})",
                 seg = self.ns.seg(),
                 frag = f.fragment,
                 scope = n + 1,
             ),
             None => format!(
-                "SELECT id, key, label FROM {seg} WHERE id IN rarray(?1)",
+                "SELECT id, key, label, len FROM {seg} WHERE id IN rarray(?1)",
                 seg = self.ns.seg()
             ),
         };
@@ -602,52 +736,60 @@ impl Provenance<'_> {
             let id: i64 = r.get(0)?;
             let kv: Value = r.get(1)?;
             let label: String = r.get(2)?;
-            out.insert(id as u32, (Key::from_value(self.key_shape, kv)?, label));
+            let len: i64 = r.get(3)?;
+            out.insert(
+                id as u32,
+                (Key::from_value(self.key_shape, kv)?, label, len),
+            );
         }
         Ok(out)
     }
 }
 
-/// Pull up to one engine chunk of best-first scored ids, run one provenance(+filter) query over
-/// them, dedup by key (first — i.e. highest-score — segment per key wins), and queue the
-/// survivors in score order. Returns `true` once the engine walk is exhausted.
-fn pull_chunk(
-    prov: &Provenance<'_>,
-    counter: &Counter,
-    walk: &mut Walk,
-    seen: &mut FxHashSet<Key>,
-    out: &mut VecDeque<Candidate>,
-) -> Result<bool> {
-    let mut scored = Vec::with_capacity(CHUNK);
-    let mut done = false;
-    while scored.len() < CHUNK {
-        match counter.advance(walk) {
-            Some(s) => scored.push(s),
-            None => {
-                done = true;
-                break;
+/// Fold one candidate into the per-key best-float map, keeping the **max-`corrected_score`**
+/// segment per caller key (derivation §7's float top-k). `corrected` is precomputed (cheap, no
+/// allocation), so the [`Candidate`] — which clones `key`/`label` — is materialized **only on an
+/// insert or a strict win**, never for a loser (the engine-review (4) cost note). Deterministic
+/// only via the later sort tiebreak; this map itself is order-free.
+#[allow(clippy::too_many_arguments)]
+fn upsert_best(
+    best: &mut FxHashMap<Key, (Candidate, f64)>,
+    key: &Key,
+    label: &str,
+    seg_id: u32,
+    score: u32,
+    overlap: u32,
+    corrected: f64,
+) {
+    let build = || Candidate {
+        key: key.clone(),
+        label: label.to_string(),
+        seg_id,
+        score,
+        overlap,
+        corrected_score: corrected,
+    };
+    match best.get_mut(key) {
+        Some(slot) => {
+            if corrected > slot.1 {
+                *slot = (build(), corrected);
             }
         }
-    }
-    if scored.is_empty() {
-        return Ok(done);
-    }
-    let seg_ids: Vec<u32> = scored.iter().map(|s| s.id).collect();
-    let found = prov.lookup(&seg_ids)?;
-    for s in scored {
-        if let Some((key, label)) = found.get(&s.id) {
-            if seen.insert(key.clone()) {
-                out.push_back(Candidate {
-                    key: key.clone(),
-                    label: label.clone(),
-                    seg_id: s.id,
-                    score: s.score,
-                    overlap: s.overlap,
-                });
-            }
+        None => {
+            best.insert(key.clone(), (build(), corrected));
         }
     }
-    Ok(done)
+}
+
+/// The `k`-th **largest** float in `vals` (1-indexed: `k = 1` is the max). `O(n)` via
+/// `select_nth_unstable`. The caller guarantees `1 ≤ k ≤ vals.len()`; used only for the eager
+/// early-stop's `kth_best_float` ceiling.
+fn kth_largest(vals: &[f64], k: usize) -> f64 {
+    debug_assert!(k >= 1 && k <= vals.len());
+    let mut v = vals.to_vec();
+    let idx = k - 1;
+    v.select_nth_unstable_by(idx, |a, b| b.total_cmp(a));
+    v[idx]
 }
 
 /// Hydrate text + span for exactly `kept` in ONE batched `WHERE id IN rarray(?1)` read.
@@ -694,79 +836,176 @@ fn hydrate_matches<T: Tokenizer>(
         .collect())
 }
 
-/// Eager top-`limit` on the **M2 float credit key** (`E_acc·Δ + Σ_n μ_n·popcount_n`, §7/§12).
+/// The §6/§7/§12 **float post-pass over the bounded candidate union** — the single scoring core
+/// behind both front doors (the G2 reshape). Walks the engine best-first by integer energy,
+/// recovers count-only candidates, subtracts the §6 length null, dedups one candidate per caller
+/// key keeping the max [`corrected_score`](Candidate::corrected_score), and returns them sorted
+/// best-first. `limit = Some(k)` is the **eager** path (over-sample early-stop, truncated to `k`);
+/// `limit = None` is the **lazy** path (the full sorted union). With the same plan, `Some(k)`
+/// yields exactly the `k`-prefix of `None` — so `collect_matches(k) == matches(k)` (derivation
+/// §7: top-k strictly *after* the floats).
 ///
-/// Because the float key adds a non-negative count credit, float order differs from the engine's
-/// integer best-first order *across* score buckets, so a correct float top-k cannot simply re-sort
-/// the integer top-k (a candidate with a lower integer energy but more non-floored matches can
-/// belong in the top-k). Under the engine's retained `≥ 1` weight clamp every match contributes to
-/// the bit-sliced sum, so the walk's candidate set *is* the full popcount ∪ bit-sliced union; M2
-/// drains it whole (bounded by `Σdf ≤ (1+#classes)·C`, derivation §7 — "cheap enough to run over
-/// the full candidate set first"), keeps the **max-float** candidate per key, then sorts by the
-/// float key and truncates.
+/// **The candidate set is invariant** (the M3 spine): it is `{seg : raw_overlap ≥ floor}`,
+/// unchanged from M2 — M3 only rescores and reshapes, never shrinks it, so recall is preserved by
+/// construction. The set is recovered in two parts (derivation §7's `keys(E_acc) ∪ keys(cred_acc)`):
+/// - **the walk** yields every seg with positive bit-sliced energy and `raw_overlap ≥ floor`
+///   (best-first by energy `c`); its `E_acc = s.score`, credit = the §3/§9 non-floored popcount.
+/// - **count-only recovery** (`U_zero`): a seg matching *only* weight-0 (common) grams has
+///   `E_acc = 0`, so the walk never surfaces it. `U_zero = ⋃ {posting : weight = 0}` minus the
+///   segs the walk already saw; each survivor with `raw_overlap ≥ floor` is a count-only candidate
+///   (`E_acc = 0`). Enumerated **only when the walk fully exhausted** (so `seen` is complete ⇒ no
+///   aliasing) — and **skipped after an early-stop** (their float `≤ cred_max ≤ bound < kth_best`,
+///   provably excluded; see below). Under `Δ < 2·E_floored` a floored gram keeps weight ≥ 1, so a
+///   weight-0 gram is always non-floored — a count-only candidate always carries some credit.
 ///
-/// **M2/M3 boundary.** This is the *eager* path only. The bounded-over-sample early-stop (which
-/// would avoid full-draining a shallow top-k) and unifying the lazy [`CandidateStream`] onto this
-/// same float key are M3's G2 reshape; until then the stream still ranks by the integer score (see
-/// its docs). The per-key dedup keeps the highest-**float** segment; the sort tiebreak (integer
-/// score desc, then seg id asc) is deterministic so `batch == serial` and the thrash oracle stay
-/// reproducible.
-fn drain_top_k(prov: &Provenance<'_>, plan: &QueryPlan, limit: usize) -> Result<Vec<Candidate>> {
-    let mut walk = plan.counter.walk();
-    // Max-float candidate per key, accumulated over the whole bounded union.
+/// **The eager over-sample early-stop** (derivation §7): after each chunk, with `≥ limit` distinct
+/// keys collected, peek the next candidate's energy `c_next`. Any un-yielded walk candidate has
+/// energy `≤ c_next`, so its float `≤ c_next·Δ + cred_max` (the null `≥ 0` is dropped from the
+/// bound — valid, it only lowers scores). Stop once that bound `< kth_best_float`. The cheap gate
+/// `bound < max_float_seen` (since `kth_best ≤ max_float_seen`) guards the `O(n)` `kth_largest`,
+/// so the **single-bucket degenerate case** (all grams one weight ⇒ every candidate shares `c` ⇒
+/// `bound ≥ max_float_seen`) never pays it and drains the bucket fully — correct, there is no sound
+/// integer within-bucket discriminator.
+///
+/// The sort tiebreak (corrected desc → integer energy desc → seg id asc) is a deterministic total
+/// order, so `batch == serial` and the thrash oracle stay reproducible.
+fn score_union(
+    prov: &Provenance<'_>,
+    plan: &QueryPlan,
+    limit: Option<usize>,
+) -> Result<Vec<Candidate>> {
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let counter = &plan.counter;
+    let floor = counter.floor();
+    let delta = plan.delta;
+    let cred_max = plan.cred_max;
+    let avgdl = plan.avgdl;
+
+    let mut walk = counter.walk();
+    // Max-corrected candidate per caller key, accumulated over the union.
     let mut best: FxHashMap<Key, (Candidate, f64)> = FxHashMap::default();
+    // Seg ids the walk yielded — completes only when the walk exhausts; gates the U_zero pass so a
+    // seg matching both weight-0 and positive grams is not double-recovered.
+    let mut seen_segs: FxHashSet<u32> = FxHashSet::default();
+    // Upper bound on `kth_best` (kth_best ≤ max distinct float ≤ max float seen); cheap stop gate.
+    let mut max_float_seen = f64::NEG_INFINITY;
+    // One-item lookahead carried across chunks: the peeked next candidate, kept for the next chunk
+    // when the early-stop did not fire.
+    let mut pending: Option<Scored> = None;
+    let mut walk_done = false;
+    let mut early_stopped = false;
+
     loop {
         let mut scored = Vec::with_capacity(CHUNK);
-        let mut done = false;
+        if let Some(s) = pending.take() {
+            scored.push(s);
+        }
         while scored.len() < CHUNK {
-            match plan.counter.advance(&mut walk) {
+            match counter.advance(&mut walk) {
                 Some(s) => scored.push(s),
                 None => {
-                    done = true;
+                    walk_done = true;
                     break;
                 }
             }
         }
         if !scored.is_empty() {
+            for s in &scored {
+                seen_segs.insert(s.id);
+            }
             let seg_ids: Vec<u32> = scored.iter().map(|s| s.id).collect();
             let found = prov.lookup(&seg_ids)?;
             for s in &scored {
-                if let Some((key, label)) = found.get(&s.id) {
-                    let f = plan.float_score(s);
-                    let cand = Candidate {
-                        key: key.clone(),
-                        label: label.clone(),
-                        seg_id: s.id,
-                        score: s.score,
-                        overlap: s.overlap,
-                    };
-                    best.entry(key.clone())
-                        .and_modify(|slot| {
-                            if f > slot.1 {
-                                *slot = (cand.clone(), f);
-                            }
-                        })
-                        .or_insert((cand, f));
+                if let Some((key, label, len)) = found.get(&s.id) {
+                    let credit = plan.count_credit(s.id);
+                    let corrected = plan.corrected(s.score, credit, rel_len(Some(*len), avgdl));
+                    if corrected > max_float_seen {
+                        max_float_seen = corrected;
+                    }
+                    upsert_best(&mut best, key, label, s.id, s.score, s.overlap, corrected);
                 }
             }
         }
-        if done {
+        if walk_done {
             break;
         }
+        // Eager over-sample early-stop: peek one candidate and test the ceiling.
+        if let Some(lim) = limit {
+            if best.len() >= lim {
+                match counter.advance(&mut walk) {
+                    Some(s) => {
+                        let bound = s.score as f64 * delta + cred_max;
+                        // Cheap gate first (kth_best ≤ max_float_seen): only then pay kth_largest.
+                        if bound < max_float_seen {
+                            let vals: Vec<f64> = best.values().map(|(_, f)| *f).collect();
+                            if bound < kth_largest(&vals, lim) {
+                                early_stopped = true;
+                                break;
+                            }
+                        }
+                        pending = Some(s);
+                    }
+                    None => {
+                        walk_done = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
+
+    // Count-only recovery (derivation §7) — only on a full drain, never after an early-stop.
+    if walk_done && !early_stopped {
+        let mut u_zero = Bitmap::new();
+        for (i, &w) in plan.present_weights.iter().enumerate() {
+            if w == 0 {
+                u_zero.or_inplace(&plan.present_postings[i]);
+            }
+        }
+        let cand_ids: Vec<u32> = u_zero.iter().filter(|id| !seen_segs.contains(id)).collect();
+        for chunk in cand_ids.chunks(CHUNK) {
+            // raw_overlap + credit in one fused pass; gate on the floor before any SQL.
+            let keep: Vec<(u32, u32, f64)> = chunk
+                .iter()
+                .map(|&id| {
+                    let (overlap, credit) = plan.overlap_and_credit(id);
+                    (id, overlap, credit)
+                })
+                .filter(|&(_, overlap, _)| overlap >= floor)
+                .collect();
+            if keep.is_empty() {
+                continue;
+            }
+            let seg_ids: Vec<u32> = keep.iter().map(|&(id, _, _)| id).collect();
+            let found = prov.lookup(&seg_ids)?;
+            for (id, overlap, credit) in keep {
+                if let Some((key, label, len)) = found.get(&id) {
+                    // E_acc = 0 (matched only weight-0 grams).
+                    let corrected = plan.corrected(0, credit, rel_len(Some(*len), avgdl));
+                    upsert_best(&mut best, key, label, id, 0, overlap, corrected);
+                }
+            }
+        }
+    }
+
     let mut ranked: Vec<(Candidate, f64)> = best.into_values().collect();
     ranked.sort_by(|a, b| {
         b.1.total_cmp(&a.1)
             .then_with(|| b.0.score.cmp(&a.0.score))
             .then_with(|| a.0.seg_id.cmp(&b.0.seg_id))
     });
-    ranked.truncate(limit);
+    if let Some(lim) = limit {
+        ranked.truncate(lim);
+    }
     Ok(ranked.into_iter().map(|(c, _)| c).collect())
 }
 
 /// Eager: top-`limit` matches per query, all queries sharing one snapshot. The safe default
-/// front door (`matches`/`matches_batch`). Drains each plan's bounded candidate union, ranks by
-/// the M2 float credit key (see [`drain_top_k`]), then hydrates exactly the kept rows.
+/// front door (`matches`/`matches_batch`). Scores each plan's bounded candidate union by the §6/§7
+/// corrected float (with the over-sample early-stop, see [`score_union`]), then hydrates exactly
+/// the kept rows.
 pub(crate) fn matches_batch<T: Tokenizer>(
     index: &Index<T>,
     queries: &[&str],
@@ -791,7 +1030,7 @@ pub(crate) fn matches_batch<T: Tokenizer>(
 
     let mut out = Vec::with_capacity(queries.len());
     for plan in &plans {
-        let kept = drain_top_k(&prov, plan, limit)?;
+        let kept = score_union(&prov, plan, Some(limit))?;
         out.push(hydrate_matches(
             &tx,
             ns,
@@ -823,7 +1062,6 @@ pub(crate) fn candidates<'a, T: Tokenizer>(
             return Err(e);
         }
     };
-    let walk = plan.counter.walk();
     // N / avgdl live on the plan (computed once in `prepare` from this snapshot's rolling
     // counters); the accessors read them from there. A corpus-relative custom score must not
     // cross a snapshot boundary.
@@ -831,30 +1069,28 @@ pub(crate) fn candidates<'a, T: Tokenizer>(
         index,
         conn,
         plan,
-        walk,
         filter: opts.filter,
         ready: VecDeque::new(),
-        seen: FxHashSet::default(),
-        done: false,
+        started: false,
         errored: false,
     })
 }
 
-/// A lazy, snapshot-pinned, best-first candidate cursor (the architectural spine). Owns a pooled
-/// connection with a pinned read transaction **and** the engine [`Counter`]; drives the
-/// bit-sliced walk, batch-hydrates provenance (+ applies the [`SqlFilter`](crate::SqlFilter)) per
-/// chunk, dedups to one candidate per key, best-first. **Fuses on the first error** (a caller
-/// never gets a deceptively-complete prefix after a transient `Busy`).
+/// A lazy, snapshot-pinned candidate cursor (the architectural spine). Owns a pooled connection
+/// with a pinned read transaction **and** the engine [`Counter`]. **Fuses on the first error** (a
+/// caller never gets a deceptively-complete prefix after a transient `Busy`).
 ///
-/// **M2 interim — ranking asymmetry.** This stream orders candidates by the engine's **integer**
-/// bit-sliced energy score (best-first), *not* by the M2 float count-credit key that
-/// [`matches`](crate::Reader::matches)/[`matches_batch`](crate::Reader::matches_batch) now rank by
-/// (`E_acc·Δ + Σ_n μ_n·popcount_n`, §7/§12). So [`collect_matches`](Self::collect_matches), which
-/// takes a best-first prefix, can order a tie-band differently from the eager `matches`. M3's G2
-/// reshape unifies them — the stream will accumulate the bounded union and rank by the float key
-/// plus the §6 length null. Until then, the candidate's [`score`](Candidate::score) is the integer
-/// energy; compose your own float rerank over [`matched_terms`](Self::matched_terms) if you need
-/// the credit key from the stream.
+/// **Ordering (the M3 G2 unification).** The stream ranks by the §6/§7 corrected float
+/// ([`corrected_score`](Candidate::corrected_score)), *identically* to the eager
+/// [`matches`](crate::Reader::matches)/[`matches_batch`](crate::Reader::matches_batch) front door —
+/// so [`collect_matches(k)`](Self::collect_matches) returns exactly the same matches as
+/// `matches(k)`. Because the corrected score is a post-pass float over the **whole** bounded
+/// candidate union (count credit + length null + count-only recovery), the cursor is *not*
+/// incrementally best-first: the first [`next`](Iterator::next) scores and sorts the full union
+/// (caching it), then each call pops the next best. This drops v0.3's incremental best-first lazy
+/// contract (per the G2 reshape) — the union is `O(C)`-bounded by selection, so a single pass is
+/// affordable, and top-k-after-the-floats (derivation §7) is not expressible incrementally on the
+/// integer buckets.
 ///
 /// A live stream pins its WAL snapshot — keep it short-lived; do not park it. Drop releases the
 /// snapshot.
@@ -862,11 +1098,12 @@ pub struct CandidateStream<'a, T: Tokenizer> {
     index: &'a Index<T>,
     conn: ReadConn<'a>,
     plan: QueryPlan,
-    walk: Walk,
     filter: Option<SqlFilter<'a>>,
+    /// The cached full sorted union, computed on the first [`next`](Iterator::next) and drained
+    /// front-to-back thereafter.
     ready: VecDeque<Candidate>,
-    seen: FxHashSet<Key>,
-    done: bool,
+    /// Whether the one-shot union scoring has run (so an exhausted stream does not re-score).
+    started: bool,
     errored: bool,
 }
 
@@ -931,35 +1168,34 @@ impl<T: Tokenizer> CandidateStream<'_, T> {
 
 impl<T: Tokenizer> Iterator for CandidateStream<'_, T> {
     type Item = Result<Candidate>;
-    /// Best-first, deduped-per-key, filtered. Fuses on the first `Err`.
+    /// Corrected-float order, deduped-per-key, filtered. The first call scores and sorts the whole
+    /// bounded union (caching it); each call then pops the next best. Fuses on the first `Err`.
     fn next(&mut self) -> Option<Result<Candidate>> {
-        loop {
-            if let Some(c) = self.ready.pop_front() {
-                return Some(Ok(c));
-            }
-            if self.done || self.errored {
-                return None;
-            }
-            let prov = Provenance {
-                conn: &self.conn,
-                ns: self.index.store.namespace(),
-                key_shape: self.index.schema.key_shape(),
-                filter: self.filter.as_ref(),
+        if self.errored {
+            return None;
+        }
+        if !self.started {
+            self.started = true;
+            // Score the full union once (`limit = None`): count credit + §6 length null +
+            // count-only recovery, sorted best-first. Borrows of `self` end with this block.
+            let scored = {
+                let prov = Provenance {
+                    conn: &self.conn,
+                    ns: self.index.store.namespace(),
+                    key_shape: self.index.schema.key_shape(),
+                    filter: self.filter.as_ref(),
+                };
+                score_union(&prov, &self.plan, None)
             };
-            match pull_chunk(
-                &prov,
-                &self.plan.counter,
-                &mut self.walk,
-                &mut self.seen,
-                &mut self.ready,
-            ) {
-                Ok(done) => self.done = done,
+            match scored {
+                Ok(v) => self.ready = VecDeque::from(v),
                 Err(e) => {
                     self.errored = true;
                     return Some(Err(e));
                 }
             }
         }
+        self.ready.pop_front().map(Ok)
     }
 }
 
@@ -1137,7 +1373,7 @@ mod energy_tests {
     fn quantization_guard_degrades_safely_on_a_tiny_corpus() {
         // On N = 4 the floored energy is negative, so the guard cannot hold and is intentionally
         // skipped (E_floored < GUARD_MIN_E_FLOORED). The floored weight quantizes to 0; recall is
-        // preserved not here but by the engine's ≥ 1 weight clamp.
+        // preserved not here but by the §7 count-only union (`score_union`) recovering the seg.
         let n = 4.0;
         let ef = e_floored(n, NU, KAPPA);
         assert!(ef < 0.0, "E_floored negative at N=4: {ef}");
@@ -1338,5 +1574,82 @@ mod credit_tests {
             popcount_credit(1, &postings, &floored, &orders, &mu_by_order),
             0.0,
         );
+    }
+}
+
+#[cfg(test)]
+mod null_tests {
+    //! Numerical fixtures for the v0.4 M3 §6 saturating length null and the eager early-stop's
+    //! `kth_largest` ceiling: the `rel_len = 0` no-op, the separable rare-gram slope, the commons'
+    //! saturating `π_g` (incl. `p = 1` full debit), the rare linear over-debit direction, length
+    //! monotonicity, and k-th-largest selection.
+    use super::{kth_largest, length_null};
+
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-6, "expected ≈ {b}, got {a}");
+    }
+
+    #[test]
+    fn null_is_zero_at_zero_relative_length() {
+        // rel_len = 0 ⇒ a zero-length draw is present nowhere: π_g(0) = 1−(1−p)^0 = 0 for every
+        // gram and the rare slope rel_len·K_rare vanishes ⇒ no debit, even for a ubiquitous p = 1.
+        approx(length_null(0.0, 5.0, &[(0.5, 2.0), (1.0, 3.0)]), 0.0);
+    }
+
+    #[test]
+    fn rare_grams_are_a_separable_linear_slope() {
+        // No commons ⇒ the null is exactly rel_len·K_rare (the precomputed-once rare slope, §6/§12).
+        approx(length_null(1.0, 3.0, &[]), 3.0);
+        approx(length_null(2.5, 3.0, &[]), 7.5);
+    }
+
+    #[test]
+    fn commons_saturate_and_p_one_debits_the_full_weight() {
+        // A ubiquitous gram (p = 1) is present in every draw: π = 1−0^rel = 1 (rel > 0), full weight.
+        approx(length_null(2.0, 0.0, &[(1.0, 4.0)]), 4.0);
+        // p = 0.5, rel = 2: π = 1 − 0.5² = 0.75 ⇒ 0.75·4 = 3.0 (saturating; the linear 2·0.5·4 = 4
+        // would over-debit and exceed the weight — exactly what the saturating form prevents).
+        approx(length_null(2.0, 0.0, &[(0.5, 4.0)]), 3.0);
+        // p = 0.5, rel = 0.5: π = 1 − √0.5 ⇒ ·4.
+        approx(
+            length_null(0.5, 0.0, &[(0.5, 4.0)]),
+            (1.0 - 0.5_f64.sqrt()) * 4.0,
+        );
+    }
+
+    #[test]
+    fn rare_linear_overdebits_but_only_negligibly() {
+        // §6 recall direction: the linear rare form (rel·p)·w ≥ the exact saturating π·w, so K_rare
+        // OVER-debits — but the gap is O((rel·p)²), < 0.5% of the weight at p < P_LINEAR = 0.02.
+        let (p, w, rel) = (0.01_f64, 3.0_f64, 5.0_f64);
+        let linear = rel * p * w; // the K_rare contribution
+        let exact = (1.0 - (1.0 - p).powf(rel)) * w; // if treated as a saturating common
+        assert!(linear >= exact, "linear over-estimates π (over-debits)");
+        assert!(
+            linear - exact < 0.005 * w,
+            "the over-debit is < 0.5% of the weight in the rare regime"
+        );
+    }
+
+    #[test]
+    fn null_is_monotone_increasing_in_length() {
+        // Longer segments have more chance matches ⇒ a strictly larger debit (both the rare slope
+        // and the saturating commons grow with rel_len).
+        let commons = [(0.3, 1.0), (0.6, 2.0)];
+        let mut prev = f64::NEG_INFINITY;
+        for &rel in &[0.0, 0.5, 1.0, 2.0, 4.0, 8.0] {
+            let null = length_null(rel, 1.5, &commons);
+            assert!(null > prev, "null grows with length: {null} > {prev}");
+            prev = null;
+        }
+    }
+
+    #[test]
+    fn kth_largest_selects_the_descending_position() {
+        let v = [3.0, 1.0, 5.0, 2.0, 4.0];
+        approx(kth_largest(&v, 1), 5.0); // the max
+        approx(kth_largest(&v, 2), 4.0);
+        approx(kth_largest(&v, 5), 1.0); // the min
+        approx(kth_largest(&[7.0], 1), 7.0);
     }
 }

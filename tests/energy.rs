@@ -1,7 +1,7 @@
 //! End-to-end guards for the v0.4 logit-idf energy weighting (derivation §2/§4/§7), exercised
 //! through the public `matches`/`matches_batch` API. These are the panel's adversarial cases
 //! turned into regression tests: `batch == serial`, the no-vanish recall floor (a `df = N` gram and
-//! all-zero-weight tiny corpora still retrieve every match via the engine's `≥ 1` clamp), the
+//! all-zero-weight tiny corpora still retrieve every match via the §7 count-only union), the
 //! all-common count-only degradation, end-to-end rarity ranking, and the degenerate-knob fallback /
 //! coarse-`Δ` guard reachable from `SearchOpts`.
 
@@ -40,8 +40,8 @@ fn batch_equals_serial_ranking() {
 
 #[test]
 fn ubiquitous_gram_does_not_drop_documents() {
-    // "alpha" trigrams sit in every segment (df = N) → energy −∞ → weight 0 → the engine's ≥ 1
-    // clamp keeps them count-only, so no document vanishes.
+    // "alpha" trigrams sit in every segment (df = N) → energy −∞ → weight 0 → the bit-sliced walk
+    // yields nothing, so the §7 count-only union (`score_union`) recovers them; no document vanishes.
     let h = Harness::new();
     load(
         &h,
@@ -61,8 +61,9 @@ fn ubiquitous_gram_does_not_drop_documents() {
 
 #[test]
 fn tiny_corpora_retrieve_every_match() {
-    // For N = 1..=4 every energy is ≤ 0 (floor near corpus size) → all weights quantize to 0 →
-    // engine ≥ 1 clamp → overlap-only ranking. Every matching doc must still come back.
+    // For N = 1..=4 every energy is ≤ 0 (floor near corpus size) → all weights quantize to 0 → the
+    // bit-sliced walk yields nothing, so every doc is recovered by the §7 count-only union
+    // (`score_union`). Every matching doc must still come back.
     for n in 1..=4i64 {
         let h = Harness::new();
         let docs: Vec<(i64, &str)> = (1..=n).map(|i| (i, "quick brown fox")).collect();
@@ -254,7 +255,7 @@ fn batch_equals_serial_under_the_count_credit() {
 
 #[test]
 fn dedup_keeps_the_max_float_segment_per_key() {
-    // drain_top_k dedups one candidate per KEY, keeping the MAX-float segment. Doc 1 has a
+    // score_union dedups one candidate per KEY, keeping the MAX-float segment. Doc 1 has a
     // rare-gram segment (title "kqxvz", high float) and a common-gram segment (body "report",
     // low float); it must surface via the higher-float title segment.
     let h = Harness::new();
@@ -391,4 +392,237 @@ fn coarse_delta_trips_the_quantization_guard_in_debug() {
         let _ = h.search_opts("assorted filler", &SearchOpts::new().delta(100.0), 10);
     }));
     assert!(res.is_err(), "coarse Δ = 100 trips the §7 guard at N = 40");
+}
+
+// --- v0.4 M3: length null, the count-only / floored-only union, top-k after the floats ----------
+//
+// End-to-end guards for the §6 saturating length null and the §7 float post-pass over the bounded
+// candidate union (the G2 reshape): the candidate SET is invariant (= raw_overlap ≥ floor), only
+// rescored. All exercised through the public `matches` / `candidates` API.
+
+#[test]
+fn length_null_keeps_a_short_on_topic_seg_above_a_long_padded_one() {
+    // Two segments match the SAME common query grams ⇒ identical count credit, energy ≈ 0; the ONLY
+    // discriminator is the §6 length null. The short on-topic segment must outrank the long one
+    // padded with off-topic text (more distinct grams ⇒ larger null debit) — the length-bias
+    // correction (derivation §6).
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    // Make "report data" ubiquitous so both query grams are weight-0 (count-and-length regime).
+    for i in 1..=40 {
+        docs.push((i, "report data".to_string()));
+    }
+    docs.push((100, "report data".to_string())); // short, on-topic
+    docs.push((
+        200,
+        "report data zephyr quokka vortex jangle mizzen frolic kludge wobble".to_string(),
+    )); // same query match, padded with unique off-topic words ⇒ high L_d
+    load_owned(&h, &docs);
+
+    let hits = ids(&h
+        .search_opts("report data", &SearchOpts::new().min_shared(1), 64)
+        .unwrap());
+    let p100 = hits.iter().position(|&k| k == 100);
+    let p200 = hits.iter().position(|&k| k == 200);
+    assert!(
+        p100.is_some() && p200.is_some(),
+        "both segments retrieved: {hits:?}"
+    );
+    assert!(
+        p100 < p200,
+        "the short on-topic seg outranks the long padded one (length null): {hits:?}"
+    );
+}
+
+#[test]
+fn union_recovers_both_walk_and_count_only_candidates() {
+    // The candidate union (§7) = the bit-sliced walk ∪ count-only recovery. With both kinds present
+    // BOTH must be retrieved: a rare gram (positive energy ⇒ surfaced by the walk) and a common
+    // gram (high df ⇒ weight 0 ⇒ invisible to the walk, recovered as count-only via U_zero). The
+    // rare-energy docs then rank above the commons-only count docs.
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    for i in 1..=3 {
+        docs.push((i, "kqxvz".to_string())); // rare gram ⇒ walk candidates
+    }
+    for i in 10..=40 {
+        docs.push((i, "report".to_string())); // common gram ⇒ weight 0 ⇒ count-only
+    }
+    load_owned(&h, &docs);
+
+    let hits = ids(&h
+        .search_opts("kqxvz report", &SearchOpts::new().min_shared(1), 64)
+        .unwrap());
+    assert!(
+        (1..=3).any(|k| hits.contains(&k)),
+        "a walk (rare-gram) candidate is recovered: {hits:?}"
+    );
+    assert!(
+        (10..=40).any(|k| hits.contains(&k)),
+        "a count-only (common-gram) candidate is recovered: {hits:?}"
+    );
+    let worst_rare = (1..=3)
+        .filter_map(|k| hits.iter().position(|&h| h == k))
+        .max()
+        .unwrap();
+    let best_common = (10..=40)
+        .filter_map(|k| hits.iter().position(|&h| h == k))
+        .min()
+        .unwrap();
+    assert!(
+        worst_rare < best_common,
+        "rare-gram energy outranks commons-only count: {hits:?}"
+    );
+}
+
+#[test]
+fn a_floored_only_segment_is_recovered_via_the_bit_sliced_union() {
+    // A segment matching ONLY a floored gram (rare, df ≤ df_min — typo-suspect, NO count credit) is
+    // recovered through the bit-sliced walk: under Δ < 2·E_floored a floored gram keeps weight ≥ 1
+    // (E_floored ≤ E_max), so it never quantizes to 0 and drops out of the union (§7).
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    for i in 1..=200 {
+        docs.push((i, "common filler text".to_string())); // df_min ≈ √201 ≈ 14, so the guard holds
+    }
+    docs.push((900, "zzqwxj".to_string())); // a unique rare token: df = 1 ≤ df_min ⇒ floored
+    load_owned(&h, &docs);
+
+    let hits = ids(&h
+        .search_opts("zzqwxj", &SearchOpts::new().min_shared(1), 10)
+        .unwrap());
+    assert!(
+        hits.contains(&900),
+        "the floored-only segment is recovered: {hits:?}"
+    );
+}
+
+#[test]
+fn top_k_is_applied_after_the_floats_and_eager_equals_full_drain() {
+    // The eager top-k ranks by the corrected FLOAT over the bounded union, not by the engine's
+    // integer best-first buckets (derivation §7). The count credit reorders the buckets: a
+    // NON-floored gram with modest energy (lower integer `E_acc`) but a count credit `μ` outscores
+    // a FLOORED gram with higher energy (higher `E_acc`) but no credit. The two probe docs have the
+    // same single-gram length, so the §6 null cancels and the credit is the sole flip. Then:
+    //  (1) the lazy stream's score() sequence is NOT integer-monotone (the float reordered it,
+    //      so a lower-`E_acc` candidate precedes a higher-`E_acc` one), and
+    //  (2) eager matches(k) == the float-sorted lazy prefix EXACTLY, for every k — the over-sample
+    //      early-stop equals a full drain, and top-k is strictly after the floats.
+    //
+    // N ≈ 100 ⇒ df_min ≈ 10: the 3-char token "qzj" (df = 2 ≤ df_min) is FLOORED with higher
+    // energy `E_acc = 4`; the 3-char token "abc" (df = 30 > df_min) is NON-floored, lower energy
+    // `E_acc = 2`, and earns the credit `μ` — so an "abc" doc (low integer, high float) tops a
+    // "qzj" doc (high integer, low float).
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    for i in 1..=2 {
+        docs.push((i, "qzj".to_string())); // floored (df = 2): high E_acc, NO credit
+    }
+    for i in 10..=39 {
+        docs.push((i, "abc".to_string())); // non-floored (df = 30): low E_acc, earns credit μ
+    }
+    for i in 100..=167 {
+        docs.push((i, "filler text here".to_string())); // pad N ≈ 100 (no query grams)
+    }
+    load_owned(&h, &docs);
+
+    let reader = h.index.reader().unwrap();
+    let opts = SearchOpts::new().min_shared(1);
+    let q = "qzj abc";
+
+    let full: Vec<_> = reader
+        .candidates(q, &opts)
+        .unwrap()
+        .map(|c| c.unwrap())
+        .collect();
+    assert!(full.len() > 5, "a deep candidate union: {}", full.len());
+
+    // (1) the float reordered the integer buckets: the top-float candidate is NOT the max-`E_acc`.
+    let max_score = full.iter().map(|c| c.score()).max().unwrap();
+    assert!(
+        full[0].score() < max_score,
+        "the top-float candidate ({}) has below-max integer energy ({} < {max_score}) — \
+         the float reordered the buckets",
+        full[0].key().as_i64().unwrap(),
+        full[0].score(),
+    );
+    let int_monotone = full.windows(2).all(|w| w[0].score() >= w[1].score());
+    assert!(
+        !int_monotone,
+        "a lower-E_acc candidate precedes a higher-E_acc one (top-k after the floats)"
+    );
+
+    // (2) eager matches(k) == the float-sorted lazy prefix, exactly, for every k (early-stop ==
+    //     full drain).
+    let full_keys: Vec<i64> = full.iter().map(|c| c.key().as_i64().unwrap()).collect();
+    for k in [1usize, 2, 3, 5, 10] {
+        let eager = ids(&reader.matches(q, &opts, k).unwrap());
+        let want = full_keys[..k.min(full_keys.len())].to_vec();
+        assert_eq!(
+            eager, want,
+            "eager matches({k}) == float-sorted lazy prefix (early-stop == full drain)"
+        );
+    }
+}
+
+#[test]
+fn single_bucket_all_common_query_is_bounded_and_drops_no_member() {
+    // An all-common query: every gram quantizes to weight 0 (the degenerate single "bucket":
+    // max_score 0, the walk yields nothing). The §7 count-only union must still return EVERY
+    // matching doc — never empty, never dropping a member — bounded by the union, not the walk.
+    // (No O(C) claim here: the selection, not M3, bounds this regime.)
+    let h = Harness::new();
+    let n: i64 = 50;
+    let docs: Vec<(i64, String)> = (1..=n).map(|i| (i, "report data".to_string())).collect();
+    load_owned(&h, &docs);
+
+    let hits = ids(&h
+        .search_opts("report data", &SearchOpts::new().min_shared(1), n as usize)
+        .unwrap());
+    assert_eq!(
+        hits.len(),
+        n as usize,
+        "every matching doc is returned (no member dropped): {} of {n}",
+        hits.len()
+    );
+    let mut sorted = hits.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        (1..=n).collect::<Vec<_>>(),
+        "exactly the matching set, no extras"
+    );
+}
+
+#[test]
+fn batch_equals_serial_with_count_only_and_length_null() {
+    // A count-only query (all-common grams ⇒ E_acc 0, ranked purely by credit − the §6 null) ranks
+    // identically alone vs mid-batch: the null / K_rare / credit are pure functions of THIS query's
+    // grams + the shared (σ, N, ν, κ, Δ, L̄) snapshot (batch == serial).
+    let h = Harness::new();
+    let mut docs: Vec<(i64, String)> = Vec::new();
+    for i in 1..=30 {
+        docs.push((i, "report data".to_string()));
+    }
+    docs.push((100, "report data extra padding words here".to_string()));
+    load_owned(&h, &docs);
+
+    let q = "report data";
+    let opts = SearchOpts::new().min_shared(1);
+    let serial = ids(&h.search_opts(q, &opts, 40).unwrap());
+    assert!(
+        !serial.is_empty(),
+        "the count-only probe must hit something"
+    );
+    let batch = h
+        .index
+        .reader()
+        .unwrap()
+        .matches_batch(&["unrelated query", q, "data report"], &opts, 40)
+        .unwrap();
+    assert_eq!(
+        ids(&batch[1]),
+        serial,
+        "count-only q ranks identically serial vs. mid-batch"
+    );
 }

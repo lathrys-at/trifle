@@ -28,10 +28,11 @@ fn load_owned(h: &Harness, docs: &[(i64, String)]) {
 
 #[test]
 fn filter_excludes_even_the_top_float_candidate() {
-    // The eager path switched from `pull_chunk` to `drain_top_k` (M2). drain_top_k still routes
-    // every chunk through `prov.lookup`, which folds in the SqlFilter — so a filter that excludes
-    // the HIGHEST-FLOAT candidate must still remove it from the eager `matches` results (the filter
-    // is not bypassed by the new full-drain + float-rank path).
+    // The eager path scores the candidate union via `score_union` (M3), which routes every chunk —
+    // both the walk and the §7 count-only recovery (these commons-only docs are count-only
+    // candidates) — through `prov.lookup`, folding in the SqlFilter. So a filter that excludes the
+    // HIGHEST-FLOAT candidate must still remove it from the eager `matches` results (the filter is
+    // not bypassed by the full-drain + float-rank path, nor by count-only recovery).
     let h = Harness::new();
     let mut docs: Vec<(i64, String)> = Vec::new();
     for i in 1..=12 {
@@ -64,7 +65,7 @@ fn filter_excludes_even_the_top_float_candidate() {
         .unwrap());
     assert!(
         keys.iter().all(|k| *k == 13 || *k == 14),
-        "drain_top_k must apply the filter: got {keys:?}"
+        "score_union must apply the filter: got {keys:?}"
     );
     for excluded in [1i64, 2, 12] {
         assert!(

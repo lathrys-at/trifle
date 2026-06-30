@@ -38,12 +38,20 @@ use crate::store::{Namespace, ReadConn};
 use crate::term::Term;
 use crate::tokenize::Tokenizer;
 use crate::{
-    DEFAULT_MIN_SHARED, DEFAULT_T_MAX, Error, Index, IntoTerm, Result, SearchOpts, TYPO_DAMAGE,
-    postings, schema,
+    DEFAULT_DELTA, DEFAULT_KAPPA, DEFAULT_MIN_SHARED, DEFAULT_NU, DEFAULT_T_MAX, Error, Index,
+    IntoTerm, Result, SearchOpts, TYPO_DAMAGE, postings, schema,
 };
 
 /// How many engine candidates to pull per provenance/filter round-trip.
 const CHUNK: usize = 64;
+
+/// The realized floored-gram energy `E_floored` (nats) below which the §7 quantization guard
+/// `Δ < 2·E_floored` is treated as inapplicable rather than violated. On a handful-of-segments
+/// corpus `E_floored` shrinks below this and the guard cannot hold; that regime is recall-safe via
+/// the engine's `≥ 1` weight clamp, so the debug-time guard is skipped there to avoid tripping on
+/// legitimately tiny corpora. The guard still fires for a genuinely too-coarse `Δ` once the corpus
+/// is large enough for `E_floored` to clear this threshold. See [`prepare`].
+const GUARD_MIN_E_FLOORED: f64 = 0.5;
 
 /// A scored, provenance-only candidate (no text — see [`CandidateStream::hydrate`]).
 ///
@@ -111,6 +119,72 @@ struct QueryPlan {
     avgdl: f64,
 }
 
+// --- v0.4 logit-idf energy weighting (derivation §2, §4, §7) ------------------------------------
+//
+// Replaces v0.3's `N`-free 4-tier df-rarity weight with the Robertson–Spärck-Jones log-odds
+// (logit-idf) of each gram's Jeffreys-smoothed, contamination-floored segment-frequency, quantized
+// to a small non-negative integer for the bit-sliced counter. All quantities are `N`-anchored, so
+// they are computed here (the [`trifle_overlap`] engine is `N`-free) and fed to the engine as
+// explicit per-posting weights. M1 is the **query-side** channel only — the contamination floor
+// `df_min` always applies; the doc-side channel (`ε > 0`, no floor) and the count credit `μ` are
+// later milestones, so the M1 score stays an integer bit-sliced energy sum.
+
+/// Contamination floor `df_min = N^((ν−1)/ν)` (derivation §4): the query-side segment-frequency
+/// below which a gram is treated as a possible substitution artifact, capping its energy at
+/// `E_max`. A degenerate `ν ≤ 0` yields no floor (`df_min = 0`, so `df_eff = df`).
+fn df_min(n: f64, nu: f64) -> f64 {
+    if nu <= 0.0 {
+        return 0.0;
+    }
+    n.powf((nu - 1.0) / nu)
+}
+
+/// Single-gram energy ceiling `E_max = (1/ν)·ln N` (derivation §4): no single gram can identify a
+/// segment alone, so at least `ν` matched grams must agree. Used as the plane-count bound
+/// (`⌈log2(E_max/Δ + 1)⌉`, §7) and as the upper bound on a floored gram's realized energy
+/// (`E_floored ≤ E_max`). `0` for `N ≤ 1` (no discrimination possible).
+fn e_max(n: f64, nu: f64) -> f64 {
+    if n <= 1.0 || nu <= 0.0 {
+        return 0.0;
+    }
+    n.ln() / nu
+}
+
+/// Per-gram query-side energy `E_g = ln((N − df_eff − κ)/(df_eff + κ))` — the RSJ logit-idf of the
+/// Jeffreys-smoothed, contamination-floored estimate (derivation §2/§4), with
+/// `df_eff = max(df, df_min)`. Negative for `p_eff > 0.5` (clamped to `0` at quantization); returns
+/// `−∞` for a gram present in (nearly) every segment, which [`quantize_energy`] maps to weight `0`.
+fn energy(df: f64, n: f64, nu: f64, kappa: f64) -> f64 {
+    let df_eff = df.max(df_min(n, nu));
+    let num = n - df_eff - kappa;
+    let den = df_eff + kappa;
+    if num <= 0.0 || den <= 0.0 {
+        return f64::NEG_INFINITY; // p_eff ≈ 1; logit → −∞, clamped to weight 0 at use
+    }
+    (num / den).ln()
+}
+
+/// Realized floored-gram energy `E_floored = ln((N − df_min − κ)/(df_min + κ)) ≤ E_max` — the
+/// energy every floored (`df ≤ df_min`) gram carries (derivation §4/§7). The §7 quantization guard
+/// `Δ < 2·E_floored` keeps `round(E_floored/Δ) ≥ 1`, so a floored gram never quantizes to `0`. For
+/// a tiny corpus this is small or negative — see [`prepare`]'s guard.
+fn e_floored(n: f64, nu: f64, kappa: f64) -> f64 {
+    energy(df_min(n, nu), n, nu, kappa)
+}
+
+/// Quantize an energy to the bit-sliced weight `wq = max(0, round(E/Δ))` (derivation §7). A
+/// non-finite or non-positive energy maps to `0`; the engine then clamps every weight to `≥ 1`
+/// (`trifle_overlap`'s `plan`), so a `0`-energy gram still contributes count-only rather than
+/// vanishing. `delta` is assumed `> 0` (resolved positive in [`prepare`]).
+fn quantize_energy(e: f64, delta: f64) -> u32 {
+    let q = (e / delta).round();
+    if q.is_finite() && q > 0.0 {
+        q as u32
+    } else {
+        0
+    }
+}
+
 /// Resolve, select (class-aware rarest-first), load postings, and build the engine [`Counter`]
 /// for every query — all against the open snapshot `conn` (a tx must already be open). Verifies
 /// the dictionary generation against the snapshot (a concurrent id-reassigning rebuild → retryable
@@ -139,6 +213,15 @@ fn prepare<T: Tokenizer>(
     }
 
     let min_shared = opts.min_shared.unwrap_or(DEFAULT_MIN_SHARED).max(1);
+    // v0.4 energy-weighting knobs (derivation §4/§7), resolved once for the whole batch so every
+    // query sees the same `ν/κ/Δ` (batch == serial). `Δ` is forced positive (it divides the
+    // energy at quantization).
+    let nu = opts.nu.unwrap_or(DEFAULT_NU);
+    let kappa = opts.kappa.unwrap_or(DEFAULT_KAPPA);
+    let delta = {
+        let d = opts.delta.unwrap_or(DEFAULT_DELTA);
+        if d > 0.0 { d } else { DEFAULT_DELTA }
+    };
     let sel_params = SelectParams {
         min_shared,
         typo_damage: TYPO_DAMAGE,
@@ -199,6 +282,28 @@ fn prepare<T: Tokenizer>(
         0.0
     };
 
+    // §7/§12 quantization guard: `Δ < 2·E_floored` keeps `round(E_floored/Δ) ≥ 1`, so a floored
+    // gram never quantizes to `0` and drops out of the bit-sliced union. It is satisfiable only
+    // once the corpus is large enough for `E_floored` to clear `Δ/2`; on a handful-of-segments
+    // corpus `E_floored` shrinks (negative for `N ≲ 4` at the defaults) and the guard cannot hold.
+    // That regime is recall-safe regardless — the engine clamps every weight to `≥ 1`, so a
+    // floored gram still never vanishes; only its rarity ordering against other floored grams
+    // collapses, which a tiny corpus does not need. So the `debug_assert` fires only where
+    // `E_floored` is a meaningful positive energy (`GUARD_MIN_E_FLOORED`), catching a genuinely
+    // too-coarse `Δ` on a real corpus without tripping the small-N fixtures. Compiled out of
+    // release, so it never panics there.
+    let e_floored_nats = e_floored(n_segments as f64, nu, kappa);
+    debug_assert!(
+        e_floored_nats < GUARD_MIN_E_FLOORED || delta < 2.0 * e_floored_nats,
+        "Δ ({delta}) too coarse vs realized floored energy E_floored ({e_floored_nats}): floored \
+         grams quantize below 1 (N={n_segments}, ν={nu}, κ={kappa})"
+    );
+    // Flatness ceiling (derivation §4/§7): every gram's energy is `≤ E_max` (the floored grams sit
+    // at `E_floored ≤ E_max`, the rest below), so every quantized weight is `≤ ⌊E_max/Δ⌉`. This
+    // bound depends only on the weight range (`E_max/Δ`), never on `N` — the plane count the engine
+    // builds is therefore cardinality-independent. Asserted per query below.
+    let wq_ceiling = quantize_energy(e_max(n_segments as f64, nu), delta);
+
     let mut plans = Vec::with_capacity(queries.len());
     for selected in &selected_per {
         let mut selected_strings = Vec::with_capacity(selected.len());
@@ -224,7 +329,20 @@ fn prepare<T: Tokenizer>(
             sum_cardinality = present_dfs.iter().sum::<u64>(),
             "trifle: weighted overlap candidate generation"
         );
-        let counter = Counter::build(&present_postings, opts.weight_step, min_shared);
+        // v0.4 §2/§4/§7: quantized logit-idf energy weights (`N`-anchored, computed here since the
+        // engine is `N`-free), fed as explicit per-posting weights — replacing v0.3's `N`-free
+        // df-rarity tiers (`opts.weight_step`). `present_dfs[i]` is the cardinality of
+        // `present_postings[i]`, so the weights stay parallel to the postings.
+        let weights: Vec<u32> = present_dfs
+            .iter()
+            .map(|&df| quantize_energy(energy(df as f64, n_segments as f64, nu, kappa), delta))
+            .collect();
+        debug_assert!(
+            weights.iter().all(|&w| w <= wq_ceiling),
+            "energy weight exceeds the N-independent E_max ceiling ⌊E_max/Δ⌉={wq_ceiling}: \
+             flatness bound violated"
+        );
+        let counter = Counter::build_weighted(&present_postings, weights, min_shared);
         plans.push(QueryPlan {
             counter,
             present_tokens,
@@ -583,5 +701,146 @@ impl<T: Tokenizer> Drop for CandidateStream<'_, T> {
         // Release the pinned snapshot. Best-effort; the pool also rolls back any open tx on
         // check-in, so a missed ROLLBACK here cannot leak a snapshot to the next checkout.
         let _ = self.conn.execute_batch("ROLLBACK");
+    }
+}
+
+#[cfg(test)]
+mod energy_tests {
+    //! Numerical fixtures for the v0.4 logit-idf energy weighting (derivation §2, §4, §7): the
+    //! energy/floor/ceiling values by hand, the `E_floored ≤ E_max` relation, the plane-count
+    //! bound, and the `Δ < 2·E_floored` guard including its small-N edge.
+    use super::{
+        DEFAULT_DELTA, DEFAULT_KAPPA, DEFAULT_NU, GUARD_MIN_E_FLOORED, df_min, e_floored, e_max,
+        energy, quantize_energy,
+    };
+
+    const NU: f64 = DEFAULT_NU; // 2.0
+    const KAPPA: f64 = DEFAULT_KAPPA; // 0.5
+    const DELTA: f64 = DEFAULT_DELTA; // 0.5
+
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-6, "expected ≈ {b}, got {a}");
+    }
+
+    #[test]
+    fn df_min_and_e_max_match_derivation() {
+        // ν = 2 ⇒ df_min = √N, E_max = ½·ln N.
+        approx(df_min(10_000.0, 2.0), 100.0);
+        approx(e_max(10_000.0, 2.0), 10_000f64.ln() / 2.0); // ≈ 4.60517
+        approx(df_min(1_000.0, 2.0), 1_000f64.sqrt()); // ≈ 31.6228
+        approx(e_max(1_000.0, 2.0), 1_000f64.ln() / 2.0); // ≈ 3.45388
+        // A degenerate ν disables the floor; E_max collapses on a trivial corpus.
+        approx(df_min(1_000.0, 0.0), 0.0);
+        approx(e_max(1.0, 2.0), 0.0);
+    }
+
+    #[test]
+    fn energy_matches_logit_idf_by_hand() {
+        let n = 10_000.0_f64;
+        // df = 1000 (> df_min = 100): E = ln((N − df − κ)/(df + κ)).
+        approx(
+            energy(1_000.0, n, NU, KAPPA),
+            ((n - 1_000.0 - 0.5) / (1_000.0 + 0.5)).ln(),
+        );
+        // A gram at or below df_min is floored to df_min, so it carries E_floored exactly.
+        approx(energy(100.0, n, NU, KAPPA), e_floored(n, NU, KAPPA)); // df == df_min boundary
+        approx(energy(10.0, n, NU, KAPPA), e_floored(n, NU, KAPPA)); // df < df_min
+    }
+
+    #[test]
+    fn energy_is_nonpositive_for_common_grams() {
+        let n = 1_000.0;
+        assert!(energy(500.0, n, NU, KAPPA) <= 1e-9); // p ≈ 0.5 ⇒ logit ≈ 0
+        assert!(energy(900.0, n, NU, KAPPA) < 0.0); // p > 0.5 ⇒ negative
+        assert_eq!(energy(1_000.0, n, NU, KAPPA), f64::NEG_INFINITY); // in every segment ⇒ −∞
+    }
+
+    #[test]
+    fn e_floored_is_positive_and_at_or_below_e_max_on_a_real_corpus() {
+        for &n in &[100.0, 1_000.0, 10_000.0, 1_000_000.0] {
+            let ef = e_floored(n, NU, KAPPA);
+            let em = e_max(n, NU);
+            assert!(
+                ef > 0.0,
+                "E_floored positive on a real corpus (N={n}): {ef}"
+            );
+            assert!(ef <= em + 1e-9, "E_floored {ef} ≤ E_max {em} at N={n}");
+        }
+    }
+
+    #[test]
+    fn quantize_clamps_and_rounds() {
+        // wq = max(0, round(E/Δ)).
+        assert_eq!(quantize_energy(2.1917, 0.5), 4); // round(4.3834)
+        assert_eq!(quantize_energy(0.24, 0.5), 0); // round(0.48) → 0
+        assert_eq!(quantize_energy(0.25, 0.5), 1); // round(0.5) → 1
+        assert_eq!(quantize_energy(0.0, 0.5), 0);
+        assert_eq!(quantize_energy(-3.0, 0.5), 0); // negative ⇒ 0
+        assert_eq!(quantize_energy(f64::NEG_INFINITY, 0.5), 0);
+    }
+
+    #[test]
+    fn plane_count_bound_holds() {
+        // §7: a single gram's weight fits in ⌈log2(E_max/Δ + 1)⌉ planes, and the realized max
+        // weight is the floored-gram weight (E_floored ≤ E_max), so its bit width respects that
+        // bound — independent of N's magnitude (flatness: the plane count tracks the weight range,
+        // not the corpus size).
+        for &n in &[1_000.0, 10_000.0, 1_000_000.0] {
+            let bound = ((e_max(n, NU) / DELTA) + 1.0).log2().ceil() as u32;
+            let wq_floored = quantize_energy(e_floored(n, NU, KAPPA), DELTA);
+            let wq_max = quantize_energy(e_max(n, NU), DELTA);
+            assert!(
+                wq_floored <= wq_max,
+                "E_floored ≤ E_max ⇒ weight ≤ ceiling (N={n})"
+            );
+            let bits = 32 - wq_floored.leading_zeros();
+            assert!(
+                bits <= bound,
+                "floored weight {wq_floored} ({bits} bits) ≤ bound {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantization_guard_holds_on_a_real_corpus() {
+        // §7 guard Δ < 2·E_floored at the defaults, and the floored gram keeps a weight ≥ 1.
+        let n = 1_000.0;
+        let ef = e_floored(n, NU, KAPPA);
+        assert!(ef >= GUARD_MIN_E_FLOORED, "guard is active on this corpus");
+        assert!(DELTA < 2.0 * ef, "Δ < 2·E_floored");
+        assert!(
+            quantize_energy(ef, DELTA) >= 1,
+            "floored gram never quantizes to 0"
+        );
+    }
+
+    #[test]
+    fn quantization_guard_degrades_safely_on_a_tiny_corpus() {
+        // On N = 4 the floored energy is negative, so the guard cannot hold and is intentionally
+        // skipped (E_floored < GUARD_MIN_E_FLOORED). The floored weight quantizes to 0; recall is
+        // preserved not here but by the engine's ≥ 1 weight clamp.
+        let n = 4.0;
+        let ef = e_floored(n, NU, KAPPA);
+        assert!(ef < 0.0, "E_floored negative at N=4: {ef}");
+        assert!(
+            ef < GUARD_MIN_E_FLOORED,
+            "guard correctly skipped (tiny corpus)"
+        );
+        assert!(
+            DELTA >= 2.0 * ef,
+            "guard cannot hold here — expected, recall-safe via clamp"
+        );
+        assert_eq!(quantize_energy(ef, DELTA), 0);
+    }
+
+    #[test]
+    fn energy_helpers_never_panic_on_degenerate_inputs() {
+        for &n in &[0.0, 1.0, 2.0, 3.0, 5.0] {
+            let _ = df_min(n, NU);
+            let _ = e_max(n, NU);
+            let _ = e_floored(n, NU, KAPPA);
+            let e = energy(1.0, n, NU, KAPPA);
+            let _ = quantize_energy(e, DELTA);
+        }
     }
 }

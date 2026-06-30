@@ -108,20 +108,18 @@ pub(crate) const DEFAULT_T_MAX: usize = 12;
 /// Default `D` — df-doublings per IDF weight step in the overlap counter.
 const DEFAULT_WEIGHT_STEP: f64 = 1.0;
 
-// v0.4 scoring-knob defaults (`docs/derivation.md`). These are scaffolding in M0: declared on
+// v0.4 scoring-knob defaults (`docs/derivation.md`). `ν`, `κ`, `Δ` are consumed by the M1
+// logit-idf energy path (`search::prepare`); the rest are still scaffolding — declared on
 // [`SearchOpts`] but not yet read by the scoring path, so each carries an `#[expect(dead_code)]`
-// that M1+ removes the moment it wires the knob in — an unfulfilled expectation then fails the
-// lint gate, forcing the cleanup. The companion `Option` fields default to `None`; a consumer
-// resolves the effective value with `unwrap_or(DEFAULT_*)`.
+// that the milestone wiring it in removes the moment it does (an unfulfilled expectation then
+// fails the lint gate, forcing the cleanup). The companion `Option` fields default to `None`; a
+// consumer resolves the effective value with `unwrap_or(DEFAULT_*)`.
 /// Default `ν` — corroboration depth; sets the contamination floor `df_min = N^((ν−1)/ν)` and
 /// the single-gram energy ceiling `E_max = (1/ν)·ln N` (derivation §4).
-#[expect(dead_code)]
 pub(crate) const DEFAULT_NU: f64 = 2.0;
 /// Default `κ` — Jeffreys smoothing pseudocount in the logit-idf energy estimate (derivation §4).
-#[expect(dead_code)]
 pub(crate) const DEFAULT_KAPPA: f64 = 0.5;
 /// Default `Δ` — energy quantization step, in nats, for the bit-sliced weights (derivation §7).
-#[expect(dead_code)]
 pub(crate) const DEFAULT_DELTA: f64 = 0.5;
 /// Default `σ` — query-side reliability / topicality (derivation §3).
 #[expect(dead_code)]
@@ -182,13 +180,13 @@ pub struct SearchOpts<'a> {
     pub weight_step: f64,
     /// `ν` — corroboration depth (derivation §4): sets the contamination floor
     /// `df_min = N^((ν−1)/ν)` and the single-gram energy ceiling `E_max = (1/ν)·ln N`. `None` →
-    /// `2.0`. *v0.4 M0 scaffolding — declared, not yet consumed by scoring.*
+    /// `2.0`. Consumed by the logit-idf energy weighting (derivation §2/§4).
     pub nu: Option<f64>,
     /// `κ` — the Jeffreys smoothing pseudocount in the logit-idf energy estimate (derivation §4).
-    /// `None` → `0.5`. *v0.4 M0 scaffolding — declared, not yet consumed by scoring.*
+    /// `None` → `0.5`. Consumed by the logit-idf energy weighting (derivation §2/§4).
     pub kappa: Option<f64>,
     /// `Δ` — the energy quantization step, in nats, for the bit-sliced energy weights (derivation
-    /// §7). `None` → `0.5`. *v0.4 M0 scaffolding — declared, not yet consumed by scoring.*
+    /// §7). `None` → `0.5`. Consumed by the logit-idf energy weighting (derivation §7).
     pub delta: Option<f64>,
     /// `σ` — query-side reliability / topicality, driving the count credit `μ = logit r`
     /// (derivation §3). `None` → `0.9`. *v0.4 M0 scaffolding — declared, not yet consumed by

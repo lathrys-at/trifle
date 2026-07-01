@@ -678,7 +678,7 @@ impl<const N: usize> NgramTokenizerBuilder<N> {
 /// `Common`/`Inherited` code points (digits, punctuation, combining marks) are transparent
 /// — they inherit the current run's script rather than breaking it, so no run boundary falls
 /// in the middle of a word; a leading run of only `Common` code points forms its own
-/// `Common`-class run. The default [`WindowPolicy`] uses bigrams for the dense CJK scripts
+/// `Common`-class run. The default window policy uses bigrams for the dense CJK scripts
 /// (Han / Hiragana / Katakana / Hangul) and trigrams elsewhere.
 ///
 /// v0.4/M5 (derivation §8): each run is windowed at **two** orders — its primary order *and* a

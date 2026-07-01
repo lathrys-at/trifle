@@ -369,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "trifle"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "croaring",
  "rusqlite",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "trifle-overlap"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "croaring",
 ]

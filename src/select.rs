@@ -11,12 +11,13 @@
 //!    - the **typo floor** `F = m + d` — the rarest `F` present grams (budget-aware: grams with
 //!      `df > C` are skipped so the floor cannot blow the work budget). This is trifle's typo /
 //!      partial-match tolerance — the corroboration reserve (§5) that survives a lost gram. (The
-//!      derivation has no count floor; it leans on the M5 bigram view for that robustness, so M5
-//!      may revisit whether `F` is still needed once the secondary view lands.)
+//!      derivation itself has no count floor — it leans on the §8 secondary rank-view for that
+//!      robustness — so `F` and its tuned `d` are tracked legacy: deviation #8 in the §12
+//!      deviations table, to be dissolved or derived once the benchmark harness gates it.)
 //!    - the **per-class floor** (§5/§8) — the rarest in-corpus (`df > 0`, `df ≤ C`) gram of every
 //!      present `(script, order)` class, so per-script representation is an invariant for every
-//!      present class with an in-budget gram. (M4 is single-order per script, so `(script, order)`
-//!      ≡ `(script)`; the `order` is threaded so M5's dual-order drops in.)
+//!      present class with an in-budget gram (dual-order: a script's primary and secondary orders
+//!      are distinct classes with distinct seats).
 //! 2. **Skip-and-continue budget + Cantelli stop** over the rest, rarest-first: a gram that would
 //!    breach the work budget `C` is **skipped** and scanning continues (the class-normalized order
 //!    is *not* df-monotone, §5), and collection **stops** once the running identification evidence
@@ -72,9 +73,8 @@ pub(crate) struct GramRow<Tk> {
     pub df: i64,
     /// The script class byte (the Welford class id) — the gram's strong script.
     pub class: u8,
-    /// The gram's order `n` (codepoint count): a CJK bigram is `2`, else `3`. Part of the
-    /// `(script, order)` per-class-floor key (§5/§8). M4 is single-order per script, so this does
-    /// not subdivide a script's class yet; threaded for M5's dual-order.
+    /// The gram's order `n` (codepoint count): a CJK bigram is `2`, else `3`, one less for a
+    /// secondary-view gram. Part of the `(script, order)` per-class-floor key (§5/§8).
     pub order: u8,
     /// The comonotone stopping-block id — this gram's query word (§5). Grams sharing a word are one
     /// Bernoulli block in the stop's variance.

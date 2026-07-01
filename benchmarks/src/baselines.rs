@@ -37,13 +37,11 @@ pub trait Engine {
     }
 }
 
-/// Search-strictness knobs for trifle (`m`, `t_max`, `weight_step`). `None` leaves the engine
+/// Search-strictness knobs for trifle (just `m` since v0.5). `None` leaves the engine
 /// default. Baselines have no analogue and ignore these.
 #[derive(Clone, Copy, Default)]
 pub struct Tuning {
     pub min_shared: Option<u32>,
-    pub t_max: Option<usize>,
-    pub weight_step: Option<f64>,
 }
 
 /// trifle itself.
@@ -87,12 +85,6 @@ impl Trifle {
         if let Some(m) = self.tuning.min_shared {
             o = o.min_shared(m);
         }
-        if let Some(t) = self.tuning.t_max {
-            o = o.t_max(t);
-        }
-        if let Some(d) = self.tuning.weight_step {
-            o = o.weight_step(d);
-        }
         o
     }
 
@@ -109,60 +101,17 @@ impl Trifle {
             .collect()
     }
 
-    /// Top-`k` doc ids with an explicit selection cap `t_max` (the rest of the tuning
-    /// unchanged) — selection is the swept variable for the selection-frontier sweep's
-    /// `t_max` arm.
-    pub fn search_tmax(&self, query: &str, k: usize, t_max: usize) -> Vec<i64> {
-        let mut o = SearchOpts::new().t_max(t_max);
-        if let Some(m) = self.tuning.min_shared {
-            o = o.min_shared(m);
-        }
-        if let Some(d) = self.tuning.weight_step {
-            o = o.weight_step(d);
-        }
-        self.run(query, &o, k)
-    }
-
     /// Top-`k` doc ids with an explicit `Σdf` budget `B` (the rest of the tuning unchanged) —
     /// the work-cap arm of the selection-frontier sweep. `B` caps the cumulative document
     /// frequency of the selected tokens (what candidate generation scans), so it bounds the
-    /// scanned-rows axis directly; mirror of [`search_tmax`](Trifle::search_tmax).
+    /// scanned-rows axis directly. The DERIVED-default marker is just [`search`](Trifle::search)
+    /// (df_budget unset → trifle derives `C` from corpus stats), scored on the same Σdf axis.
     pub fn search_df_budget(&self, query: &str, k: usize, budget: u64) -> Vec<i64> {
         let mut o = SearchOpts::new().df_budget(budget);
         if let Some(m) = self.tuning.min_shared {
             o = o.min_shared(m);
         }
-        if let Some(t) = self.tuning.t_max {
-            o = o.t_max(t);
-        }
-        if let Some(d) = self.tuning.weight_step {
-            o = o.weight_step(d);
-        }
         self.run(query, &o, k)
-    }
-
-    /// Top-`k` doc ids at an explicit IDF weight step `d` (the rest of the tuning unchanged) —
-    /// the swept variable for the `dsweep` recall-vs-`weight_step` eval.
-    pub fn search_weight_step(&self, query: &str, k: usize, d: f64) -> Vec<i64> {
-        let mut o = SearchOpts::new().weight_step(d);
-        if let Some(m) = self.tuning.min_shared {
-            o = o.min_shared(m);
-        }
-        if let Some(t) = self.tuning.t_max {
-            o = o.t_max(t);
-        }
-        self.run(query, &o, k)
-    }
-
-    /// The corpus-fitted `weight_step` suggestion accumulated from the searches run so far (the
-    /// band-spread telemetry); `None` until a search has produced an informative sample. Used by
-    /// `dsweep` to check the hint against the recall-optimal `weight_step`.
-    pub fn weight_step_hint(&self) -> Option<f64> {
-        self.index
-            .stats()
-            .ok()
-            .and_then(|s| s.weight_step_hint)
-            .map(|h| h.suggested)
     }
 }
 

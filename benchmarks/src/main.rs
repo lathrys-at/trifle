@@ -17,8 +17,10 @@
 //! - **`fuzzy`** — recall + latency on entity-name + injected-edit queries over a GeoNames
 //!   corpus, vs FTS5 trigram-MATCH (OR-bag) and the `LIKE` floor. Same single-pull-at-50
 //!   methodology; reports per edit-count.
-//! - **`selsweep`** — the selection-cost frontier: recall@k vs Σdf (and vs p99 latency) for
-//!   BOTH selection arms (`t_max` and `df_budget`), under the work-done collector. CSV/JSON.
+//! - **`selsweep`** — the selection-cost frontier: recall@k vs Σdf (and vs p99 latency) as the
+//!   `df_budget` work-cap is swept, under the work-done collector. Also marks where trifle's
+//!   DERIVED default budget `C` (df_budget unset) lands on that frontier — the Z=2 "Z-knee".
+//!   CSV/JSON.
 //!
 //! Plus two utilities:
 //!
@@ -75,7 +77,6 @@ fn main() -> ExitCode {
         "relevance" => cmd_relevance(rest),
         "fuzzy" => cmd_fuzzy(rest),
         "selsweep" => cmd_selsweep(rest),
-        "dsweep" => cmd_dsweep(rest),
         "overlap" => cmd_overlap(rest),
         "ingest" => cmd_ingest(rest),
         "profile" => cmd_profile(rest),
@@ -105,8 +106,7 @@ COMMANDS:
     latency    Search latency + throughput, trifle vs in-process baselines (speed only)
     relevance  MS MARCO real dev queries+qrels: recall/MRR/nDCG@{1,5,10,50} + latency
     fuzzy      Entity name+edit recall/MRR/nDCG@{1,5,10,50} + latency (mixed typo range)
-    selsweep   Selection-cost frontier: recall@k vs Σdf for both arms (t_max, df_budget)
-    dsweep     Recall@{1,5,10,50} vs weight_step D, and the WeightStepHint vs the optimum
+    selsweep   Selection-cost frontier: recall@k vs Σdf as df_budget is swept, + derived-C marker
     overlap    Engine microbench: trifle-overlap build/walk on synthetic bitmaps (no SQLite)
     ingest     Write throughput: incremental upsert/commit, rebuild, and compact cost
     profile    Σ(kept-posting cardinality) distribution — the work-done curve
@@ -122,8 +122,6 @@ COMMON OPTIONS:
 
 SEARCH-TUNING (trifle only; `None` leaves the engine default):
     --min-shared <M>              Match floor m (shared rare tokens) [default: 2]
-    --t-max <T>                   Selection cap t_max — rarest tokens kept [default: 12]
-    --weight-step <D>             df-doublings per IDF weight step [default: 1.0]
 
 ENGINE SELECTION (latency, relevance, fuzzy):
     --filter <engine>             Skip an engine; repeatable. Engines: trifle,
@@ -170,22 +168,14 @@ SELSWEEP (selection-cost frontier; trifle only):
                                   (e.g. 1000,5000,25000,125000,625000) [default: 100000]
     --queries <N>                 Labeled queries evaluated per N [default: 500]
     --edits <N>                   Typos per query for geonames [default: 2]
-    --max-tmax <T>                Top of the generated t_max grid (2,4,..,T) [default: 20]
-    --t-maxes <a,b,c>             t_max grid (token counts), overrides --max-tmax, e.g. 4,8,12,16
     --df-fracs <a,b,c>            df_budget grid as fractions of N (each = frac*N), e.g.
                                   0.03,0.05,0.08 [default: 0.005,0.01,0.02,0.05,0.1,0.2,0.5,1.0]
     --format <csv|json>           Output format [default: csv]
-    Columns: arm,knob,N,k,recall,sigma_df_p50,sigma_df_p99,lat_p50_us,lat_p99_us.
-    Each N rebuilds the corpus; all rows land in one CSV (the N column pivots them apart).
-    plot_selsweep.py --mode knee fits the optimal df_budget vs N relationship.
-
-DSWEEP (recall vs the weight_step D; trifle only, single depth-50 pull):
-    --corpus <msmarco-relevance|geonames-cities|geonames-all>  Labeled corpus [default:
-                                  msmarco-relevance]
-    --edits <N>                   Typos per query for geonames [default: 2]
-    --steps <a,b,c>               The D grid [default: 0.5,1.0,1.5,2.0,3.0]
-    Reports recall/MRR/nDCG@{1,5,10,50} per D, then the corpus WeightStepHint's suggested D
-    against the recall@10-optimal D in the grid.
+    Columns: arm,knob,N,k,recall,sigma_df_p50,sigma_df_p99,lat_p50_us,lat_p99_us. The `df_budget`
+    rows sweep the grid; one extra `derived` row per N marks where trifle's DERIVED default budget
+    C (df_budget unset) lands on the frontier — its knob column is the observed Σdf-p50 (the
+    Z=2 "Z-knee"). Each N rebuilds the corpus; all rows land in one CSV (the N column pivots them
+    apart). plot_selsweep.py --mode knee fits the optimal df_budget vs N relationship.
 
 OVERLAP (trifle-overlap engine microbench, synthetic bitmaps — no SQLite, no corpus):
     --postings <K>                Postings per query (selected tokens) [default: 10]
@@ -348,24 +338,15 @@ fn build_corpus(flags: &Flags) -> Result<(Corpus, u64), String> {
     Ok((corpus, seed))
 }
 
-/// The trifle search-strictness knobs for a run, from the shared `--min-shared`/`--t-max`/
-/// `--weight-step` flags. Each `None` leaves trifle's engine default.
+/// The trifle search-strictness knobs for a run, from the shared `--min-shared` flag. Each
+/// `None` leaves trifle's engine default.
 fn tuning(flags: &Flags) -> Result<Tuning, String> {
     Ok(Tuning {
         min_shared: flags.opt_u32("min-shared")?,
-        t_max: flags.opt_u64("t-max")?.map(|v| v as usize),
-        weight_step: flags.opt_f64("weight-step")?,
     })
 }
 
-const CORPUS_OPTS: &[&str] = &[
-    "corpus",
-    "docs",
-    "seed",
-    "min-shared",
-    "t-max",
-    "weight-step",
-];
+const CORPUS_OPTS: &[&str] = &["corpus", "docs", "seed", "min-shared"];
 
 /// The engine identifiers accepted by `--filter`. These must match the strings each engine
 /// returns from [`Engine::name`]. Not every command runs every engine (latency/fuzzy use the
@@ -496,7 +477,6 @@ fn cmd_latency(args: &[String]) -> Result<(), String> {
         warmup: warmup.min(qtexts.len()),
         repeat,
         min_shared: tuning.min_shared,
-        t_max: tuning.t_max,
     };
     let bench = Bench {
         qtexts: &qtexts,
@@ -800,7 +780,6 @@ struct RunMeta<'a> {
     warmup: usize,
     repeat: usize,
     min_shared: Option<u32>,
-    t_max: Option<usize>,
 }
 
 // ---- machine-readable (`--format json`) schema ------------------------------------------
@@ -864,7 +843,6 @@ struct RunJson<'a> {
     repeat: usize,
     mode: &'a str,
     min_shared: Option<u32>,
-    t_max: Option<usize>,
     conditions: Conditions,
     records: Vec<RecordJson<'a>>,
 }
@@ -895,7 +873,6 @@ fn render_run_json(meta: &RunMeta, records: &[Record]) {
         repeat: meta.repeat,
         mode: "serial",
         min_shared: meta.min_shared,
-        t_max: meta.t_max,
         conditions: conditions(),
         records,
     };
@@ -1094,8 +1071,6 @@ fn cmd_relevance(args: &[String]) -> Result<(), String> {
         "queries",
         "seed",
         "min-shared",
-        "t-max",
-        "weight-step",
         "filter",
         "warmup",
         "format",
@@ -1211,8 +1186,6 @@ fn cmd_fuzzy(args: &[String]) -> Result<(), String> {
         "edits",
         "seed",
         "min-shared",
-        "t-max",
-        "weight-step",
         "filter",
         "warmup",
         "format",
@@ -1463,18 +1436,6 @@ fn labeled_corpus(
     })
 }
 
-/// The `t_max` grid for the selection arm: `2, 4, …, max` (and `max` itself if the step misses
-/// it). Coarse enough to plot the recall/Σdf frontier without a per-query blowup.
-fn tmax_grid(max: usize) -> Vec<usize> {
-    let mut v: Vec<usize> = (2..=max).step_by(2).collect();
-    if v.is_empty() {
-        v.push(max.max(1));
-    } else if *v.last().unwrap() != max {
-        v.push(max);
-    }
-    v
-}
-
 /// The default `df_budget` grid for the work-cap arm, as fractions of `N` (each becomes a `Σdf`
 /// cap); `--df-fracs` overrides it. Dense at the low end where the recall curve bends; `1.0` is
 /// effectively uncapped.
@@ -1523,9 +1484,6 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
         "edits",
         "seed",
         "min-shared",
-        "weight-step",
-        "max-tmax",
-        "t-maxes",
         "df-fracs",
         "format",
     ])?;
@@ -1544,7 +1502,6 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
     let q = flags.usize("queries", 500)?;
     let edits = flags.usize("edits", 2)?;
     let seed = flags.u64("seed", DEFAULT_SEED)?;
-    let max_tmax = flags.usize("max-tmax", 20)?.max(2);
     // Accept the explicit `msmarco-relevance` alias alongside the geonames keys.
     let which = match flags.str("corpus", "msmarco-relevance").as_str() {
         "msmarco-relevance" | "msmarco" => "msmarco".to_string(),
@@ -1556,26 +1513,12 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
         other => return Err(format!("--format {other} (csv|json)")),
     };
 
-    // Fixed tuning: `t_max`/`df_budget` are the swept variables, so they are NOT taken from the
-    // flags here; `min-shared`/`weight-step` are the held-constant strictness dials.
+    // Fixed tuning: `df_budget` is the swept variable, so it is NOT taken from the flags here;
+    // `min-shared` is the held-constant strictness dial.
     let fixed = Tuning {
         min_shared: flags.opt_u32("min-shared")?,
-        t_max: None,
-        weight_step: flags.opt_f64("weight-step")?,
     };
 
-    // The t_max arm sweeps these token counts; a manual `--t-maxes` grid overrides the generated
-    // `2,4,..,max-tmax` (so `--max-tmax` is ignored when `--t-maxes` is given).
-    let tmaxes = match flags.last("t-maxes") {
-        Some(s) => {
-            let v = parse_usize_list("t-maxes", s)?;
-            if v.contains(&0) {
-                return Err("--t-maxes values must be >= 1".into());
-            }
-            v
-        }
-        None => tmax_grid(max_tmax),
-    };
     let mut rows: Vec<SelRow> = Vec::new();
     let mut ladder: Vec<SelLadderEntry> = Vec::new();
 
@@ -1591,19 +1534,11 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
         let trifle = Trifle::build(&corpus, fixed);
 
         eprintln!(
-            "selsweep[{which}]: N={ndocs} queries={} depth={KMAX} — t_max {tmaxes:?} + df_budget {sel_fracs:?}",
+            "selsweep[{which}]: N={ndocs} queries={} depth={KMAX} — df_budget {sel_fracs:?} + derived-C marker",
             qtexts.len()
         );
 
-        // Arm 1 — t_max: the selection-count cap.
-        for &t in &tmaxes {
-            let (results, lats, sigma) =
-                sweep_run(&qtexts, |query| trifle.search_tmax(query, KMAX, t));
-            rows.extend(sel_rows(
-                "t_max", t as u64, ndocs, &results, &relevant, &lats, sigma,
-            ));
-        }
-        // Arm 2 — df_budget: the Σdf work cap, as fractions of N.
+        // The frontier arm — df_budget: the Σdf work cap, as fractions of N.
         for &frac in &sel_fracs {
             let budget = ((frac * ndocs as f64).round() as u64).max(1);
             let (results, lats, sigma) = sweep_run(&qtexts, |query| {
@@ -1617,6 +1552,19 @@ fn cmd_selsweep(args: &[String]) -> Result<(), String> {
                 &relevant,
                 &lats,
                 sigma,
+            ));
+        }
+        // The derived-C marker — `df_budget` unset, so trifle derives the work budget
+        // C = (1/σ)·ln(N/k)·d̄/ln(N/d̄) from corpus stats (the Z=2 default). `search` runs that
+        // default (single read), and the profile collector reads its Σ(kept-posting cardinality)
+        // — the SAME Σdf axis the df_budget rows report — so the row lands on the frontier. The
+        // private `C` value isn't visible through the public API; its observed `sigma_df_p50` is
+        // the knob column, marking where the Z-knee falls on the recall-vs-Σdf curve.
+        {
+            let (results, lats, sigma) = sweep_run(&qtexts, |query| trifle.search(query, KMAX));
+            let knob = Dist::new(sigma.clone()).pct(50.0);
+            rows.extend(sel_rows(
+                "derived", knob, ndocs, &results, &relevant, &lats, sigma,
             ));
         }
 
@@ -1967,7 +1915,7 @@ fn cmd_overlap(args: &[String]) -> Result<(), String> {
         for _ in 0..trials {
             let bms = synth(k, card, universe, 4, &mut rng);
             let t = Instant::now();
-            std::hint::black_box(Counter::build(&bms, 1.0, 2));
+            std::hint::black_box(Counter::build_weighted(&bms, vec![1; bms.len()], 2));
             s.push(t.elapsed().as_nanos() as u64);
         }
         println!("{card:<8} {:<11} {}", p(s.clone(), 50.0), p(s, 99.0));
@@ -1983,7 +1931,7 @@ fn cmd_overlap(args: &[String]) -> Result<(), String> {
     for _ in 0..trials {
         let bms = synth(k, 4096, universe, 4, &mut rng);
         let t = Instant::now();
-        std::hint::black_box(Counter::build(&bms, 1.0, 2));
+        std::hint::black_box(Counter::build_weighted(&bms, vec![1; bms.len()], 2));
         uni.push(t.elapsed().as_nanos() as u64);
         let mixed: Vec<Bitmap> = (0..k)
             .map(|i| {
@@ -1996,7 +1944,7 @@ fn cmd_overlap(args: &[String]) -> Result<(), String> {
             })
             .collect();
         let t = Instant::now();
-        std::hint::black_box(Counter::build(&mixed, 1.0, 2));
+        std::hint::black_box(Counter::build_weighted(&mixed, vec![1; mixed.len()], 2));
         mix.push(t.elapsed().as_nanos() as u64);
     }
     println!("uniform (all-weight-1)    build_p50 {}", p(uni, 50.0));
@@ -2008,7 +1956,7 @@ fn cmd_overlap(args: &[String]) -> Result<(), String> {
     let (mut shallow, mut full) = (Vec::with_capacity(trials), Vec::with_capacity(trials));
     for _ in 0..trials {
         let bms = synth(k, 4096, universe, 64, &mut rng);
-        let c = Counter::build(&bms, 1.0, 2);
+        let c = Counter::build_weighted(&bms, vec![1; bms.len()], 2);
         let t = Instant::now();
         let mut w = c.walk();
         for _ in 0..10 {

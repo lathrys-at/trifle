@@ -39,6 +39,31 @@ use crate::term::IntoTerm;
 /// convention). It is `Ord` so selection can break document-frequency ties
 /// deterministically, and `Clone` (typically `Copy`) so the small inline tokens move
 /// freely on the hot path.
+///
+/// # The contract a third-party implementation must satisfy
+///
+/// These are load-bearing facts the engine assumes about every emitted token; the built-in
+/// tokenizers satisfy them by construction, and a custom tokenizer must too:
+///
+/// - **Encodability.** Every emitted token must be at most **3 codepoints** and contain no
+///   `U+0000` — the [`Term`](crate::Term) packing ceiling. Indexing *errors* on an unencodable
+///   token ([`Error::InvalidInput`](crate::Error::InvalidInput)); on the query side the token
+///   silently rides along as absent (df 0, matches nothing).
+/// - **Derived class and order.** The engine derives a token's script class as the script of its
+///   first *strong* codepoint (`Common` when none) and its **order** as its codepoint count —
+///   a tokenizer cannot declare these independently. Everything class-keyed (rarity
+///   normalization, per-class floors, rank-views) sees exactly those derived values.
+/// - **`primary_order` consistency.** For every script byte `s`,
+///   [`primary_order(s)`](Tokenizer::primary_order) must equal the *widest* order this tokenizer
+///   emits for `s`-class runs, and any shorter grams it emits for that script must be exactly one
+///   order shorter (they are classified into the secondary rank-view as
+///   `order + 1 == primary_order`). A tokenizer that emits a **single** order per script must
+///   keep the `u8::MAX` default — the sentinel that disables the secondary rank-view entirely.
+/// - **Index/query agreement.** [`tokenize`](Tokenizer::tokenize) (index side) and
+///   [`tokenize_words`](Tokenizer::tokenize_words) (query side) must emit the same gram set for
+///   the same text — the single-tokenizer invariant the whole design leans on.
+/// - **Fingerprint honesty.** [`fingerprint`](Tokenizer::fingerprint) must change on *any*
+///   behavioral change (see its docs).
 pub trait Tokenizer: Send + Sync {
     /// The token representation. [`IntoTerm`] gives it both the `Borrow<str>` needed to
     /// probe a `HashMap<Token, _>` by `&str` and the [`term`](IntoTerm::term) packing the
@@ -651,7 +676,14 @@ impl<const N: usize> NgramTokenizerBuilder<N> {
         self
     }
 
-    /// Enable or disable Unicode lowercasing (default `true`).
+    /// Enable or disable locale-independent Unicode **lowercasing** (default `true`).
+    ///
+    /// Despite the name this is `char::to_lowercase`, **not** full Unicode case folding:
+    /// notably `ß` stays `ß` rather than folding to `ss`, and locale-specific rules (the
+    /// Turkish dotless `ı`) do not apply. For fuzzy search the difference is almost always
+    /// immaterial (both sides of a match fold identically — the single-tokenizer invariant);
+    /// a caller needing true simple/full case folding can pre-fold text on both the write
+    /// and query paths and disable this. Feeds the fingerprint: toggling it drift-resets.
     pub fn casefold(mut self, casefold: bool) -> Self {
         self.inner.norm.casefold = casefold;
         self
@@ -1058,7 +1090,14 @@ impl DefaultTokenizerBuilder {
         self
     }
 
-    /// Enable or disable Unicode lowercasing (default `true`).
+    /// Enable or disable locale-independent Unicode **lowercasing** (default `true`).
+    ///
+    /// Despite the name this is `char::to_lowercase`, **not** full Unicode case folding:
+    /// notably `ß` stays `ß` rather than folding to `ss`, and locale-specific rules (the
+    /// Turkish dotless `ı`) do not apply. For fuzzy search the difference is almost always
+    /// immaterial (both sides of a match fold identically — the single-tokenizer invariant);
+    /// a caller needing true simple/full case folding can pre-fold text on both the write
+    /// and query paths and disable this. Feeds the fingerprint: toggling it drift-resets.
     pub fn casefold(mut self, casefold: bool) -> Self {
         self.inner.norm.casefold = casefold;
         self

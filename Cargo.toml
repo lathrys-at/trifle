@@ -48,7 +48,7 @@ trifle-overlap = { path = "crates/trifle-overlap", version = "0.4.0" }
 # (one base+delta posting per token) AND the engine. The croaring portable format is
 # byte-identical to the old `roaring`-crate blobs, so storage needs no migration, and an
 # effective posting feeds the engine directly with no serialize-bridge. Permissive `^2.6`
-# (MSRV 1.85; 2.7+ needs Rust 1.95). See docs/design/rev-simplify/HANDOFF-integration.md.
+# (MSRV 1.85; 2.7+ needs Rust 1.95).
 croaring = "2.6"
 # NFC/NFD normalization so canonically-equivalent forms match (configurable per
 # tokenizer; the default folds to NFC + lowercase).

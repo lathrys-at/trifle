@@ -29,7 +29,7 @@ storage and ranking schemes you provide.
 
 ```toml
 [dependencies]
-trifle = "0.1"
+trifle = "0.5"
 ```
 
 ```rust
@@ -61,13 +61,12 @@ has a **key** and one or more named **segments**:
 
 - **key** — the unit of retrieval, of a declared shape (`Integer`, `Text`, or `Blob`). A
   search returns at most one match per key — its best-matching segment — and `limit` counts
-  keys. A `Match` carries the `key`, the matched segment's `label`, its `text`, and (when
-  locatable) a byte `span`.
+  keys. A `Match` carries the `key`, the matched segment's `label`, its `text`, a byte `span`
+  (when locatable), and its `score` with the components it decomposes into.
 - **segment** — a `(label, text)` pair under a key. `label` is a free-form name returned on
   a match so you know which segment matched; a document holds each label at most once. Every
-  indexed text field is **stored** and returned on a match. The segment is the ranking unit
-  (IDF-weighted overlap over its grams); fuse across a key's segments above trifle (aggregate
-  across your keys).
+  indexed text field is **stored** and returned on a match. The segment is the ranking unit;
+  fuse across a key's segments above trifle (aggregate across your keys).
 - `Schema::flat()` is the simplest shape: an integer key and one default text field that
   accepts any label. `Schema::chunked()` / the builder declare named text fields.
 
@@ -83,22 +82,32 @@ This covers two common patterns:
 
 ## Features
 
-- **Typo / partial tolerance** via n-gram overlap; strictness (`min_shared`) and recall
-  (`t_max`, the rarest query tokens kept) dials.
+- **Typo / partial tolerance** via n-gram overlap. Strictness is `min_shared` (shared rare
+  grams required for a hit); the work/recall dial is `df_budget`, which by default is
+  **derived from your corpus** rather than tuned (see [Tuning](#tuning-the-defaults)).
 - **Mixed-script aware** — the default `DefaultTokenizer` splits text into same-script runs
-  and windows each appropriately (CJK bigrams, else trigrams), so no gram straddles a script
-  boundary. `NgramTokenizer<N>` (`TrigramTokenizer` / `BigramTokenizer`) is the plain
-  fixed-width tokenizer for single-script corpora.
+  and windows each at a script-appropriate order (CJK bigrams, else trigrams) plus a
+  one-shorter secondary order, so no gram straddles a script boundary and short or corrupted
+  queries keep a robustness layer. Gram rarity is **class-normalized per `(script, order)`**,
+  so a rare CJK bigram and a rare Latin trigram compete fairly for selection.
+  `NgramTokenizer<N>` (`TrigramTokenizer` / `BigramTokenizer`) is the plain fixed-width
+  tokenizer for single-script corpora.
 - **Configurable normalization** — NFC (default), NFD, accent-insensitive
-  (`NfdStripMarks`), or none. Unicode casefolding is on by default.
-- **Ranking** — **IDF-weighted bit-sliced overlap**, computed in the counter itself: each
-  selected gram is weighted by rarity (a per-query, df-anchored 4-tier scheme, weights
-  `{1,2,3,4}`; knob `D` via `SearchOpts::weight_step`), and rarity is **class-normalized across
-  scripts** so a rare shared gram outweighs a common one even across different script regimes.
+  (`NfdStripMarks`), or none. Lowercasing is on by default.
+- **Ranking — logit-idf energy overlap.** Each matched gram is worth its RSJ log-odds
+  ("energy": rarer ⇒ more), counted bit-sliced inside the engine; a count credit rewards
+  matching more of the query and a saturating length null cancels the long-segment chance-match
+  bias. Scores are **nats** — log-odds-shaped, cross-query comparable in the clean limit — and
+  every `Match` carries its `score` and the `energy`/`count`/`length` components it decomposes
+  into. Short queries (even 2 characters) are answerable: a query too short or too damaged for
+  full-width grams falls to the shorter order and the two views are rank-fused internally.
   This is a fuzzy lexical overlap engine, **not** a relevance engine — there is no BM25 tier.
   For a domain-specific reorder, pull a candidate pool from `reader.candidates(...)`, reorder it
-  yourself (the stream exposes each candidate's score, overlap, and matched terms with their df),
-  and hydrate the winners.
+  yourself (the stream exposes each candidate's score components and matched terms with their
+  df), and hydrate the winners.
+- **Bounded work per query.** Selection prunes the query to its rarest useful grams under a
+  corpus-derived work budget with a confidence-bounded stop, so a query's posting-scan cost is
+  bounded by the budget — not by corpus size — even for short, common-word queries.
 - **Filtering** — pass a `SqlFilter` (a trusted-constant SQL predicate fragment plus bound
   params) to cut the candidate set against your **live** data — `key IN rarray(?)` with your own
   allowed-key set, or a co-located join via `ATTACH`. trifle stores no filter columns of its own
@@ -142,6 +151,23 @@ not automatic:
   index after such a change as expected and repopulate with `rebuild` from your source of
   truth.
 
+## Tuning the defaults
+
+You should rarely need to. Trifle's defaults are not tuned constants — nearly every one is
+*derived*, either from the scoring model (`docs/derivation.md`) or from your corpus's own
+statistics at query time, and each is chosen to fail in the recall-safe direction. The two
+dials worth knowing on day one:
+
+- `SearchOpts::min_shared` — strictness: how many shared rare grams a hit requires (default 2).
+- `SearchOpts::df_budget` — the work budget: how many posting rows a query may scan. The
+  default is derived from your corpus per query; override it to pin a latency ceiling.
+
+Everything else (`Config::sigma` and the `Tuning` group: `nu`, `kappa`, `delta`, `k_target`,
+`c_margin`) changes the scoring model itself, and should move only on the strength of a
+measured evaluation on your corpus. **[`docs/tuning.md`](docs/tuning.md)** covers every knob:
+what it means, exactly when and why you would change it, and which evaluation justifies each
+change.
+
 ## Comparison
 
 How Trifle compares to other fuzzy- and substring-search tools, across the axes that matter
@@ -149,7 +175,7 @@ when choosing one:
 
 | | embedded (no server)? | updates | scales to 1M+ small docs? | provenance | matching semantics | storage |
 |---|---|---|---|---|---|---|
-| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | key / label | IDF-weighted trigram overlap | disk (SQLite) |
+| **[trifle](https://github.com/lathrys-at/trifle)** | yes | incremental (base + delta) | yes | key / label | logit-idf-weighted trigram overlap | disk (SQLite) |
 | **[SQLite FTS5](https://www.sqlite.org/fts5.html#the_trigram_tokenizer)** | yes | incremental | yes | rowid | trigram substring (`MATCH` / `LIKE`) | disk (SQLite) |
 | **[pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html)** | no (server) | incremental (GIN / GiST) | yes | table rows | trigram similarity | disk (server) |
 | **[Tantivy](https://github.com/quickwit-oss/tantivy)** | yes | incremental (segments) | yes | stored fields | Levenshtein automaton (≤ 2 edits) | disk (segments) |
@@ -161,14 +187,15 @@ RAM-resident and is rebuilt each run, but they keep no durable index. pg_trgm fi
 already run Postgres; Tantivy is the fuller embedded library — field schemas, stored
 documents, edit-distance term queries — when you want Lucene-shaped search. FTS5 and Trifle
 both live in a SQLite file: FTS5 matches substrings against its trigram index through
-`MATCH`/`LIKE`, while Trifle ranks by IDF-weighted trigram overlap (rarer shared grams weigh
+`MATCH`/`LIKE`, while Trifle ranks by rarity-weighted gram overlap (rarer shared grams weigh
 more) — a fuzzy lexical engine, not a relevance engine.
 
 ## Non-goals
 
-Embeddings and semantic search; fusion (e.g. RRF) with other signals; an exact precision
-tier beyond what you compose over the candidate stream; sub-trigram (< 3-char) queries; and
-deciding when the cache is stale relative to your source of truth.
+Embeddings and semantic search; fusing trifle's results with *other engines'* signals (its
+internal rank-view fusion is not a general fusion framework — compose external fusion over the
+candidate stream); an exact precision tier beyond what you compose over the candidate stream;
+and deciding when the cache is stale relative to your source of truth.
 
 ## License
 

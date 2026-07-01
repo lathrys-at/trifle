@@ -12,7 +12,8 @@ rather than migrating it.
 
 It is *lexical* fuzzy search, deliberately **not** semantic search and **not a relevance engine**.
 It ranks by **logit-idf energy overlap**: a matched gram is worth the RSJ log-odds
-`E_g = ln((N − df_eff − κ)/(df_eff + κ))` — an `N`-anchored idf, surprisal its rare-gram limit —
+`E_g = ln((N − df_eff + κ)/(df_eff + κ))` — the exact Jeffreys posterior log-odds, an `N`-anchored
+idf with surprisal its rare-gram limit —
 which the engine counts as `Δ`-quantized, bit-sliced energy planes; a `search.rs` float post-pass
 then adds a per-gram count credit `μ` and subtracts a saturating length null, and the top-`k` come
 off that corrected float score. Rarity is **class-normalized**, but only as the per-`(script,
@@ -52,8 +53,9 @@ Notes that bite:
   a doc-comment with a broken intra-doc link fails the `doc` job.
 - The only Cargo feature is `tracing` (off by default); enable hot-path spans with
   `--features tracing`. With it off, the instrumentation macros expand to nothing.
-- `benchmarks/` is **excluded from the workspace** pending a rework against the streaming candidate
-  API; it does not build today and is not part of any gate.
+- `benchmarks/` is **excluded from the workspace** (its own Cargo workspace; `cargo check` runs
+  inside it). It is not part of any gate; its headline eval is the `selsweep` recall-vs-`Σdf`
+  frontier with a derived-`C` marker.
 
 ## Architecture
 
@@ -65,7 +67,8 @@ the module named for the stage you are touching. The query pipeline below is the
 A [`Schema`] declares a **key** (its shape — `Integer`/`Text`/`Blob`) plus named **text fields**. A
 [`Document`] is a `key` plus a set of named segments (`label → text`); a **segment** is one row of
 the `seg` table — `(id, key, label, text, len)`, where `seg.id` is the posting id. A `Match` carries
-the key, the matched segment's label, the matched byte span, and the segment text. There is no
+the key, the matched segment's label, the matched byte span, the segment text, and the §10 score +
+components (nat-scale `score = energy + count − length`, cross-query comparable). There is no
 `doc` table — the key lives directly on each segment row, so a key with no segments cannot
 materialize a ghost row, and provenance is a single-table point read.
 
@@ -92,7 +95,8 @@ A search flows through these stages, each its own module:
   query's tokens: the typo floor `F = m + d` plus a per-`(script,order)` floor, then rarest-first
   until the Cantelli stop or the work budget `C`. There is no `t_max` count cap — count is bounded
   by the query's finite gram set and work by `C`, whose default is **derived from the corpus**
-  (`C = (1/σ)·ln(N/k)·d̄/ln(N/d̄)`, the Lagrangian dual of the stop; a caller `df_budget` overrides
+  (`C = (1/σ)·ln(N/k)·d̄/ln(N/d̄)`, the Lagrangian dual of the stop, pooled per query over the
+  query's own classes; a caller `df_budget` overrides
   it). Rarity is **class-normalized**: a `z`-score within the token's script class (per-class
   mean/variance maintained in log space by `welford.rs`), falling back to raw df for a sparse class
   — so multi-script queries rank fairly. Derives only from *this query's* token document-frequencies
@@ -155,8 +159,7 @@ join is reachable via an `ATTACH` on the read connections.
 `compact()` folds deltas into bases (bounds delta growth; doesn't shrink the file).
 `rebuild(corpus)` fully reindexes via an atomic shadow swap (required after a tokenizer or
 `data_version`/schema change, all of which empty the cache on open). `stats()` reports
-`delta_backlog` — the signal for *when* to compact — plus segment/term counts and a corpus-fitted
-`weight_step` hint accumulated from the per-query band-spreads.
+`delta_backlog` — the signal for *when* to compact — plus segment/term counts.
 
 ### Cross-cutting
 

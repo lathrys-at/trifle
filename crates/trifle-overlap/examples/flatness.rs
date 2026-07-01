@@ -89,8 +89,9 @@ fn us(d: Duration) -> f64 {
 }
 
 /// Build + pull the top-`TOPN` (the engine borrows the postings, so timing has no clone).
+/// Unit weights: the unweighted-overlap case (score == raw overlap).
 fn build_top(postings: &[Bitmap], topn: usize) {
-    let counter = Counter::build(postings, 1.0, 2);
+    let counter = Counter::build_weighted(postings, vec![1; postings.len()], 2);
     let mut w = counter.walk();
     let mut n = 0;
     while n < topn && counter.advance(&mut w).is_some() {
@@ -176,21 +177,23 @@ fn main() {
     let postings = make_postings(12, 128_000, UNIVERSE, PLANTED, 0xD00D);
     let top10 = median(ITERS, || build_top(&postings, TOPN));
     let drain_all = median(ITERS, || {
-        let counter = Counter::build(&postings, 1.0, 2);
+        let counter = Counter::build_weighted(&postings, vec![1; postings.len()], 2);
         let got: Vec<Scored> = counter.stream().collect();
         std::hint::black_box(got.len());
     });
     println!("  top-{TOPN}:   {:>10.1} µs", us(top10));
     println!("  full drain: {:>10.1} µs", us(drain_all));
     println!(
-        "  (full drain is cheap because the all-weight-1 fast path takes overlap = score with no\n  \
-         per-id probing; the walk is no longer a bottleneck.)\n"
+        "  (full drain is cheap because the engine is energy-only — a pure bucket walk with no\n  \
+         per-id probing; raw-overlap gating belongs to the consumer.)\n"
     );
 
-    // Sanity smoke test.
-    let counter = Counter::build(&make_postings(6, 50_000, UNIVERSE, PLANTED, 1), 1.0, 2);
+    // Sanity smoke test. With unit weights, score == raw overlap, and the scan bound (floor 2)
+    // excludes sub-floor buckets — so every yielded id clears the consumer's gate here.
+    let postings = make_postings(6, 50_000, UNIVERSE, PLANTED, 1);
+    let counter = Counter::build_weighted(&postings, vec![1; postings.len()], 2);
     let top: Vec<Scored> = counter.stream().take(5).collect();
-    assert!(top.iter().all(|s| s.overlap >= 2));
+    assert!(top.iter().all(|s| s.score >= 2));
     assert!(top.windows(2).all(|p| p[0].score >= p[1].score));
-    println!("correctness smoke test passed (floor honored, score-descending).");
+    println!("correctness smoke test passed (scan floor honored, score-descending).");
 }

@@ -260,41 +260,23 @@ struct QueryPlan {
 }
 
 impl QueryPlan {
-    /// The derivation §3/§9 count credit for candidate `id`: `μ` times the popcount of matched
-    /// **non-floored** grams, bucketed by gram order (§7/§12 `Σ_n μ_n·popcount_n`). Floored
-    /// (junk-suspect) grams earn nothing (§9) — the policy that restores the junk-below-real
-    /// ordering the floor's `E_max` energy alone would invert. `O(k)` per candidate (`k` = the selected present grams),
-    /// so the post-pass stays bounded (flatness).
-    fn count_credit(&self, id: u32) -> f64 {
-        popcount_credit(
+    /// Raw overlap **and** the derivation §3/§9 count credit for `id` in a **single** fused pass
+    /// over the present postings (one `contains` per posting — v0.5's one per-candidate sweep,
+    /// now that the engine neither retains postings nor gates on raw overlap). The credit is `μ`
+    /// times the popcount of matched **non-floored** grams, bucketed by gram order (§7/§12
+    /// `Σ_n μ_n·popcount_n`); floored (junk-suspect) grams earn nothing (§9) — the policy that
+    /// restores the junk-below-real ordering the floor's `E_max` energy alone would invert.
+    /// `O(k)` per candidate (`k` = the selected present grams), so the post-pass stays bounded
+    /// (flatness). Used by the walk (which gates `overlap ≥ floor` before any SQL) and by the §7
+    /// count-only recovery.
+    fn overlap_and_credit(&self, id: u32) -> (u32, f64) {
+        overlap_and_credit(
             id,
             &self.present_postings,
             &self.present_floored,
             &self.present_orders,
             &self.mu_by_order,
         )
-    }
-
-    /// Raw overlap **and** count credit for `id` in a **single** fused pass over the present
-    /// postings (one `contains` per posting, derivation §7's popcount alongside the raw count). Used
-    /// for count-only candidates (E_acc = 0), which need both the `min_shared` floor check (raw
-    /// overlap) and the credit, without a second pass. `O(k)`, `k` = the selected present grams.
-    fn overlap_and_credit(&self, id: u32) -> (u32, f64) {
-        let mut overlap = 0u32;
-        let mut credit = 0.0;
-        for (i, bm) in self.present_postings.iter().enumerate() {
-            if bm.contains(id) {
-                overlap += 1;
-                if !self.present_floored[i] {
-                    credit += self
-                        .mu_by_order
-                        .get(&self.present_orders[i])
-                        .copied()
-                        .unwrap_or(0.0);
-                }
-            }
-        }
-        (overlap, credit)
     }
 
     /// The §6 length null for a candidate of relative length `rel_len = L_d/L̄`: the separable
@@ -543,7 +525,7 @@ fn derived_budget(n_segments: u64, k_target: u64, r: f64, class_snap: &ClassSnap
 /// instead *disable* the cap for exactly those queries — no non-floored dominant remains, so μ
 /// goes uncapped and the commons win. The denominator correction above is what makes the retained
 /// floored anchor actually *protect* its doc rather than merely bound the loss. The floored
-/// *exclusion* still governs which grams earn count credit (`popcount_credit`) and the M4 stop —
+/// *exclusion* still governs which grams earn count credit (`overlap_and_credit`) and the M4 stop —
 /// just not the cap's `E_top`.
 fn concentration_cap(energies: &[f64], floored: &[bool]) -> Option<f64> {
     debug_assert_eq!(energies.len(), floored.len());
@@ -569,23 +551,29 @@ fn concentration_cap(energies: &[f64], floored: &[bool]) -> Option<f64> {
     Some(cap.max(0.0))
 }
 
-/// `μ`-weighted popcount of `id`'s matched **non-floored** grams, bucketed by gram order
-/// (derivation §7/§12 `Σ_n μ_n·popcount_n`). A floored gram is skipped (no credit, §9); a
-/// non-floored gram contributes its order's capped `μ_n`. Free function so it is unit-testable
-/// without a full [`QueryPlan`]. `O(k)` over the present grams.
-fn popcount_credit(
+/// The fused per-candidate pass (v0.5): raw overlap over ALL matched grams, and the `μ`-weighted
+/// popcount credit of the matched **non-floored** grams, bucketed by gram order (derivation
+/// §7/§12 `Σ_n μ_n·popcount_n`), in one `contains` sweep. A floored gram counts toward overlap
+/// but earns no credit (§9); a non-floored gram contributes its order's capped `μ_n`. Free
+/// function so it is unit-testable without a full [`QueryPlan`]. `O(k)` over the present grams.
+fn overlap_and_credit(
     id: u32,
     postings: &[Bitmap],
     floored: &[bool],
     orders: &[u8],
     mu_by_order: &FxHashMap<u8, f64>,
-) -> f64 {
-    postings
-        .iter()
-        .enumerate()
-        .filter(|&(i, bm)| !floored[i] && bm.contains(id))
-        .map(|(i, _)| mu_by_order.get(&orders[i]).copied().unwrap_or(0.0))
-        .sum()
+) -> (u32, f64) {
+    let mut overlap = 0u32;
+    let mut credit = 0.0;
+    for (i, bm) in postings.iter().enumerate() {
+        if bm.contains(id) {
+            overlap += 1;
+            if !floored[i] {
+                credit += mu_by_order.get(&orders[i]).copied().unwrap_or(0.0);
+            }
+        }
+    }
+    (overlap, credit)
 }
 
 /// Resolve, select (class-aware rarest-first), load postings, and build the engine [`Counter`]
@@ -1469,8 +1457,10 @@ fn hydrate_matches<T: Tokenizer>(
 /// **The candidate set is invariant** (the M3 spine): it is `{seg : raw_overlap ≥ floor}`,
 /// unchanged from M2 — M3 only rescores and reshapes, never shrinks it, so recall is preserved by
 /// construction. The set is recovered in two parts (derivation §7's `keys(E_acc) ∪ keys(cred_acc)`):
-/// - **the walk** yields every seg with positive bit-sliced energy and `raw_overlap ≥ floor`
-///   (best-first by energy `c`); its `E_acc = s.score`, credit = the §3/§9 non-floored popcount.
+/// - **the walk** yields every seg with positive bit-sliced energy, best-first by energy `c`
+///   (v0.5: the engine is energy-only — this layer applies the `raw_overlap ≥ floor` gate in the
+///   same fused `contains` sweep that computes the §3/§9 credit, before any provenance SQL); its
+///   `E_acc = s.score`.
 /// - **count-only recovery** (`U_zero`): a seg matching *only* weight-0 (common) grams has
 ///   `E_acc = 0`, so the walk never surfaces it. `U_zero = ⋃ {posting : weight = 0}` minus the
 ///   segs the walk already saw; each survivor with `raw_overlap ≥ floor` is a count-only candidate
@@ -1538,18 +1528,31 @@ fn score_union(
             for s in &scored {
                 seen_segs.insert(s.id);
             }
-            let seg_ids: Vec<u32> = scored.iter().map(|s| s.id).collect();
+            // Fused per-id pass (v0.5): raw overlap + count credit in ONE `contains` sweep, and
+            // the raw-overlap floor gate — the engine yields energy-ranked ids only (it retains
+            // no postings and does not gate). Gated BEFORE the provenance SQL, so a sub-floor id
+            // never costs a round-trip. (A gated-out id stays in `seen_segs`: it has positive
+            // energy, so the count-only recovery must not resurrect it either — and its raw
+            // overlap fails the same floor there anyway.)
+            let gated: Vec<(Scored, u32, f64)> = scored
+                .iter()
+                .map(|&s| {
+                    let (overlap, credit) = plan.overlap_and_credit(s.id);
+                    (s, overlap, credit)
+                })
+                .filter(|&(_, overlap, _)| overlap >= floor)
+                .collect();
+            let seg_ids: Vec<u32> = gated.iter().map(|&(s, _, _)| s.id).collect();
             let found = prov.lookup(&seg_ids)?;
-            for s in &scored {
+            for &(s, overlap, credit) in &gated {
                 if let Some((key, label, len)) = found.get(&s.id) {
-                    let credit = plan.count_credit(s.id);
                     let (corrected, energy, count, length) =
                         plan.corrected_parts(s.score, credit, rel_len(Some(*len), avgdl));
                     if corrected > max_float_seen {
                         max_float_seen = corrected;
                     }
                     if upsert_best(
-                        &mut best, key, label, s.id, s.score, s.overlap, corrected, energy, count,
+                        &mut best, key, label, s.id, s.score, overlap, corrected, energy, count,
                         length,
                     ) {
                         if let Some(t) = topk.as_mut() {
@@ -2139,7 +2142,7 @@ mod credit_tests {
     //! §3/§7/§9/§12): `μ = max(0, logit σ)`; the floor↔μ crossover near `df ≈ 9000`; the cap's
     //! all-common pass-through, its concentrated cap, and its hard floor at 0; the literal-§12
     //! floored-included `E_top` reading; and the per-order non-floored popcount credit.
-    use super::{concentration_cap, count_credit, e_floored, e_max, energy, popcount_credit};
+    use super::{concentration_cap, count_credit, e_floored, e_max, energy, overlap_and_credit};
     use crate::DEFAULT_SIGMA;
     use crate::hash::FxHashMap;
     use croaring::Bitmap;
@@ -2300,30 +2303,28 @@ mod credit_tests {
     }
 
     #[test]
-    fn popcount_credit_sums_non_floored_matched_by_order() {
+    fn overlap_and_credit_fuses_raw_count_with_non_floored_per_order_credit() {
         // Three present grams: a non-floored order-3 (μ=2.0), a FLOORED order-3 (no credit), and a
-        // non-floored order-2 (μ=1.5).
+        // non-floored order-2 (μ=1.5). One fused pass yields BOTH the raw overlap (all matched,
+        // floored included) and the §3/§9 credit (non-floored only, per-order μ).
         let postings = vec![Bitmap::of(&[7]), Bitmap::of(&[7]), Bitmap::of(&[7, 9])];
         let floored = vec![false, true, false];
         let orders = vec![3u8, 3u8, 2u8];
         let mut mu_by_order = FxHashMap::default();
         mu_by_order.insert(3u8, 2.0);
         mu_by_order.insert(2u8, 1.5);
-        // id 7 is in all three, but the floored one earns nothing: 2.0 + 1.5 = 3.5.
-        approx(
-            popcount_credit(7, &postings, &floored, &orders, &mu_by_order),
-            3.5,
-        );
-        // id 9 is only in the order-2 posting: 1.5.
-        approx(
-            popcount_credit(9, &postings, &floored, &orders, &mu_by_order),
-            1.5,
-        );
-        // id 1 is in nothing: 0.
-        approx(
-            popcount_credit(1, &postings, &floored, &orders, &mu_by_order),
-            0.0,
-        );
+        // id 7 is in all three (overlap 3), but the floored one earns nothing: 2.0 + 1.5 = 3.5.
+        let (overlap, credit) = overlap_and_credit(7, &postings, &floored, &orders, &mu_by_order);
+        assert_eq!(overlap, 3, "raw overlap counts the floored gram too");
+        approx(credit, 3.5);
+        // id 9 is only in the order-2 posting: overlap 1, credit 1.5.
+        let (overlap, credit) = overlap_and_credit(9, &postings, &floored, &orders, &mu_by_order);
+        assert_eq!(overlap, 1);
+        approx(credit, 1.5);
+        // id 1 is in nothing.
+        let (overlap, credit) = overlap_and_credit(1, &postings, &floored, &orders, &mu_by_order);
+        assert_eq!(overlap, 0);
+        approx(credit, 0.0);
     }
 }
 

@@ -143,7 +143,9 @@ impl ClassStats {
 /// no class qualifies (`Σn < 2`). The pool is the standard parallel-Welford combination
 /// [Chan1979]: `μ = Σ nᵢμᵢ / Σ nᵢ`, and combined `M2 = Σ[(nᵢ−1)σᵢ² + nᵢ(μᵢ−μ)²]`, so
 /// `std = √(M2/(Σnᵢ−1))`.
-fn pool_entries<'a>(entries: impl Iterator<Item = &'a (u64, f64, f64)> + Clone) -> Option<(f64, f64)> {
+fn pool_entries<'a>(
+    entries: impl Iterator<Item = &'a (u64, f64, f64)> + Clone,
+) -> Option<(f64, f64)> {
     let mut n_total: u64 = 0;
     let mut mean_acc = 0.0; // Σ nᵢ·μᵢ
     for &(n, mean, sigma) in entries.clone() {
@@ -322,7 +324,10 @@ mod tests {
             "sparse-class rarity is the pooled z ({got} vs {want})"
         );
         // Scale sanity: the fallback lands in z-range, not raw-df range.
-        assert!(got.abs() < 10.0, "pooled z is z-scaled, not df-scaled: {got}");
+        assert!(
+            got.abs() < 10.0,
+            "pooled z is z-scaled, not df-scaled: {got}"
+        );
     }
 
     #[test]

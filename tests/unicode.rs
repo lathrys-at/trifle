@@ -5,7 +5,7 @@ use common::*;
 
 use trifle::store::Sidecar;
 use trifle::tokenize::{DefaultTokenizer, Normalization};
-use trifle::{Config, Index, Schema, SearchOpts};
+use trifle::{Config, Index, Schema, SearchOpts, Tuning};
 
 fn index_with(tok: DefaultTokenizer) -> (Index<DefaultTokenizer>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -108,7 +108,10 @@ fn majority_script_cannot_bury_the_minority_under_stop_and_budget() {
         w.commit().unwrap();
     }
     // Tight budget + a small k (earlier stop). The Han grams (df=1) are the rarest in their class.
-    let opts = SearchOpts::new().df_budget(12).min_shared(1).k_target(64);
+    let opts = SearchOpts::new()
+        .df_budget(12)
+        .min_shared(1)
+        .tuning(Tuning::new().k_target(64));
     let hits = h
         .index
         .reader()

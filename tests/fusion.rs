@@ -171,7 +171,10 @@ fn interior_digit_bigram_does_not_activate_the_secondary_view() {
     h.put(2, "f", "ee12ff ggcdhh"); // shares the bigrams "12" and "cd", but no trigram
     h.put(3, "f", "unrelated control text");
     let hits = h.search("ab12cd", 10).unwrap();
-    assert!(hit(&hits, 1), "the genuine doc matches via primary trigrams");
+    assert!(
+        hit(&hits, 1),
+        "the genuine doc matches via primary trigrams"
+    );
     assert!(
         !hit(&hits, 2),
         "a digit-bigram coincidence must not leak into a clean digit-bearing query: {:?}",

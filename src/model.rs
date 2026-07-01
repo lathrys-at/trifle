@@ -57,15 +57,6 @@ impl Key {
         }
     }
 
-    /// Bind this key as a SQL value.
-    pub(crate) fn to_value(&self) -> Value {
-        match self {
-            Key::Integer(i) => Value::Integer(*i),
-            Key::Text(s) => Value::Text(s.clone()),
-            Key::Blob(b) => Value::Blob(b.clone()),
-        }
-    }
-
     /// Read a key of the given shape from a SQL value.
     pub(crate) fn from_value(shape: KeyShape, v: Value) -> Result<Key> {
         match (shape, v) {
@@ -76,6 +67,19 @@ impl Key {
                 "stored key does not match the declared key shape",
             )),
         }
+    }
+}
+
+/// Bind a [`Key`] as a SQL parameter **without cloning** — `Text`/`Blob` bind borrowed
+/// (v0.5; the old `to_value` cloned the payload on every bind).
+impl rusqlite::ToSql for Key {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::{ToSqlOutput, ValueRef};
+        Ok(match self {
+            Key::Integer(i) => ToSqlOutput::Owned(Value::Integer(*i)),
+            Key::Text(s) => ToSqlOutput::Borrowed(ValueRef::Text(s.as_bytes())),
+            Key::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b)),
+        })
     }
 }
 
@@ -132,7 +136,9 @@ impl KeyShape {
 }
 
 /// A document to index: a [`Key`] plus its named segments (`label → text`). Used by
-/// [`rebuild`](crate::Index::rebuild) and the batch upsert.
+/// [`rebuild`](crate::Index::rebuild) and the batch upsert. `#[non_exhaustive]`: construct with
+/// [`Document::new`], not a struct literal.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
     /// The caller's key — the unit of retrieval and lifecycle.
@@ -151,8 +157,14 @@ impl Document {
     }
 }
 
-/// One ranked match. Rank is conveyed by position in the returned `Vec<Match>`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One ranked match. Rank is conveyed by position in the returned `Vec<Match>`; the absolute
+/// relevance magnitude and its components ride along (v0.5, the derivation-§10 contract: "the
+/// engine emits a score together with its components").
+///
+/// `#[non_exhaustive]` (fields may be added in minor releases) and not `Eq` (the score fields are
+/// floats).
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Match {
     /// The caller's document key.
     pub key: Key,
@@ -164,6 +176,20 @@ pub struct Match {
     /// The matched segment's text. Every indexed text field is stored, so this is always
     /// present.
     pub text: String,
+    /// trifle's length-corrected relevance magnitude in **nats**: `energy + count − length`
+    /// (derivation §10), from the match's governing rank-view. **Cross-query comparable** by
+    /// construction — the right input for thresholding or downstream fusion. It is *not*
+    /// necessarily the within-query sort key (a starved query's results are ordered by
+    /// reciprocal-rank fusion; rank is the `Vec` position either way), and it can be negative
+    /// (the length null dominating a weak match).
+    pub score: f64,
+    /// The §10 **energy** component (nats): the matched grams' quantized logit-idf sum.
+    pub energy: f64,
+    /// The §10 **count-credit** component (nats): `Σ μ` over the matched non-floored grams.
+    pub count: f64,
+    /// The §10 **length-null** component (nats): the saturating chance-match debit subtracted
+    /// from `energy + count`.
+    pub length: f64,
 }
 
 /// A validated, immutable index schema.

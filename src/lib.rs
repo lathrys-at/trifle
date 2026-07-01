@@ -79,7 +79,7 @@ mod welford;
 use crate::hash::{FxHashMap, FxHashSet};
 use std::borrow::Borrow;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use croaring::Bitmap;
 use rusqlite::types::Value;
@@ -103,15 +103,10 @@ use tokenize::{DefaultTokenizer, Tokenizer};
 pub(crate) const DEFAULT_MIN_SHARED: u32 = 2;
 /// Per-typo token damage `d`; the typo floor is `F = m + d`.
 pub(crate) const TYPO_DAMAGE: u32 = 4;
-/// Default `D` — df-doublings per IDF weight step in the overlap counter.
-const DEFAULT_WEIGHT_STEP: f64 = 1.0;
 
-// v0.4 scoring-knob defaults (`docs/derivation.md`). `ν`, `κ`, `Δ` are consumed by the M1
-// logit-idf energy path (`search::prepare`); the rest are still scaffolding — declared on
-// [`SearchOpts`] but not yet read by the scoring path, so each carries an `#[expect(dead_code)]`
-// that the milestone wiring it in removes the moment it does (an unfulfilled expectation then
-// fails the lint gate, forcing the cleanup). The companion `Option` fields default to `None`; a
-// consumer resolves the effective value with `unwrap_or(DEFAULT_*)`.
+// v0.4 scoring-knob defaults (`docs/derivation.md`), consumed by the logit-idf energy path and
+// the Cantelli stop (`search::prepare`). The companion [`Tuning`] `Option` fields default to
+// `None`; a consumer resolves the effective value with `unwrap_or(DEFAULT_*)`.
 /// Default `ν` — corroboration depth; sets the contamination floor `df_min = N^((ν−1)/ν)` and
 /// the single-gram energy ceiling `E_max = (1/ν)·ln N` (derivation §4).
 pub(crate) const DEFAULT_NU: f64 = 2.0;
@@ -128,13 +123,12 @@ pub(crate) const DEFAULT_K_TARGET: u64 = 128;
 /// Default `c` — the Cantelli stopping margin (derivation §5). Wired into the M4 Cantelli stop
 /// (`search::prepare` → `select`).
 pub(crate) const DEFAULT_C_MARGIN: f64 = 2.0;
-/// Buckets in the per-query band-spread histogram (the [`Stats`] weight-step hint). 33 × 0.5 =
-/// 16.5 df-doublings of range (a df ratio up to ~92 000:1).
-const HINT_BUCKETS: usize = 33;
-/// Width of each band-spread histogram bucket, in df-doublings (`log2` units).
-const HINT_BUCKET_WIDTH: f64 = 0.5;
 
-/// Index configuration.
+/// Index configuration. Construct with [`Config::default`] / [`Config::new`] and adjust with the
+/// builder setters. `#[non_exhaustive]`: fields may be added in minor releases (e.g. the planned
+/// per-field `ε` channel), so build through the constructors, not a struct literal.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
 pub struct Config {
     /// The caller's drift/epoch token. Bumping it on reopen invalidates the cache
     /// (drops it to empty), so the next [`rebuild`](Index::rebuild) repopulates.
@@ -165,6 +159,12 @@ impl Config {
             sigma: DEFAULT_SIGMA,
         }
     }
+
+    /// Set `σ`, the index-level query-side reliability (see [`sigma`](Config::sigma)).
+    pub fn with_sigma(mut self, sigma: f64) -> Self {
+        self.sigma = sigma;
+        self
+    }
 }
 
 /// Sanitize a caller `σ` to the open interval `(0,1)` the count credit `μ = max(0, logit σ)`
@@ -179,31 +179,13 @@ fn sanitized_sigma(sigma: f64) -> f64 {
     }
 }
 
-/// Per-search options. Construct with [`SearchOpts::new`] and the builder setters.
-///
-/// `limit` is **not** here — it is a terminal-op argument ([`Reader::matches`]), because the
-/// [`candidates`](Reader::candidates) stream is lazy/unbounded (the caller pulls depth via
-/// `take`). `#[non_exhaustive]`: build from [`new`](SearchOpts::new), not a struct literal.
+/// The derivation-level scoring/stop knobs (v0.5), grouped off [`SearchOpts`]'s front line: every
+/// default is derived in `docs/derivation.md` and is corpus-safe, so reach for these only with
+/// benchmark evidence (see the tuning guide in `docs/`). Construct with [`Tuning::new`] and the
+/// builder setters; `None` means "the derived default".
 #[non_exhaustive]
-pub struct SearchOpts<'a> {
-    /// `m` — the match floor (shared rare tokens for a hit). `None` → `2`.
-    pub min_shared: Option<u32>,
-    /// `C` — the work budget: a cap on the cumulative document frequency (`Σdf`) of the selected
-    /// tokens, which is what candidate generation scans — so this bounds *work* directly.
-    /// Rarest-first tokens are kept while `Σdf` stays within budget; the typo floor is always kept.
-    /// This is the derivation's work budget `C` (the cap on `Σdf` over the pruned set, derivation
-    /// §5/§7). `None` (the default) does **not** mean unbounded — it means **derive `C` from the
-    /// corpus** (`C = (1/σ)·ln(N/k)·d̄/ln(N/d̄)`, `d̄ = exp(mean_lndf + 2·std_lndf)`; the Lagrangian
-    /// dual of the §5 stop). A caller-supplied value overrides the derived one; the derivation's
-    /// recall-safe guards fall the derived budget back to unbounded on a degenerate corpus (tiny
-    /// `N`, non-finite stats). Bind an explicit huge value to force fully-unbounded selection.
-    pub df_budget: Option<u64>,
-    /// `D` — df-doublings per IDF weight step. `1.0` is the default. **As of v0.4/M1 this no longer
-    /// reaches the overlap counter** — the v0.3 4-tier df-rarity weighting it tuned was replaced by
-    /// the `N`-anchored logit-idf energy planes (knob `Δ`/[`delta`](SearchOpts::delta)). It now only
-    /// feeds the band-spread [`Stats::weight_step_hint`] telemetry, so setting it no longer affects
-    /// ranking.
-    pub weight_step: f64,
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Tuning {
     /// `ν` — corroboration depth (derivation §4): sets the contamination floor
     /// `df_min = N^((ν−1)/ν)` and the single-gram energy ceiling `E_max = (1/ν)·ln N`. `None` →
     /// `2.0`. Consumed by the logit-idf energy weighting (derivation §2/§4).
@@ -212,55 +194,23 @@ pub struct SearchOpts<'a> {
     /// `None` → `0.5`. Consumed by the logit-idf energy weighting (derivation §2/§4).
     pub kappa: Option<f64>,
     /// `Δ` — the energy quantization step, in nats, for the bit-sliced energy weights (derivation
-    /// §7). `None` → `0.5`. Consumed by the logit-idf energy weighting (derivation §7). Keep it
-    /// sane: work scales as `~1/Δ` (the engine's plane count, `max_score`, and reachability array
-    /// all grow with `E_max/Δ`), so a pathologically tiny `Δ` is a memory / `u32`-overflow hazard.
-    /// A non-finite, zero, or negative value falls back to the `0.5` default.
+    /// §7). `None` → `0.5`. Keep it sane: work scales as `~1/Δ` (the engine's plane count,
+    /// `max_score`, and reachability array all grow with `E_max/Δ`), so a pathologically tiny `Δ`
+    /// is a memory / `u32`-overflow hazard. A non-finite, zero, or negative value falls back to
+    /// the `0.5` default.
     pub delta: Option<f64>,
     /// `k` — the confidence-bounded stop's target candidate-pool size; the stop aims for `ln(N/k)`
-    /// nats (derivation §5). `None` → `128`. Consumed by the v0.4/M4 Cantelli stop.
+    /// nats (derivation §5). `None` → `128`. Consumed by the Cantelli stop.
     pub k_target: Option<u64>,
     /// `c` — the Cantelli stopping margin (a distribution-free bound, *not* a z-score; derivation
-    /// §5). `None` → `2.0`. Consumed by the v0.4/M4 Cantelli stop.
+    /// §5). `None` → `2.0`. Consumed by the Cantelli stop.
     pub c_margin: Option<f64>,
-    /// An opt-in raw-SQL [`SqlFilter`] over the caller's live data, folded into per-bucket
-    /// provenance. `None` = unfiltered.
-    pub filter: Option<SqlFilter<'a>>,
 }
 
-impl<'a> SearchOpts<'a> {
-    /// Default options (weighted-overlap order, weight step `D = 1.0`, no filter).
+impl Tuning {
+    /// All-default tuning (every knob at its derived default).
     pub fn new() -> Self {
-        SearchOpts {
-            min_shared: None,
-            df_budget: None,
-            weight_step: DEFAULT_WEIGHT_STEP,
-            nu: None,
-            kappa: None,
-            delta: None,
-            k_target: None,
-            c_margin: None,
-            filter: None,
-        }
-    }
-
-    /// Set the match floor `m`.
-    pub fn min_shared(mut self, m: u32) -> Self {
-        self.min_shared = Some(m);
-        self
-    }
-
-    /// Set the work budget `C` — cap the cumulative `Σdf` of the selected tokens (bounds scan
-    /// work). Overrides the corpus-derived default (see [`df_budget`](SearchOpts::df_budget)).
-    pub fn df_budget(mut self, budget: u64) -> Self {
-        self.df_budget = Some(budget);
-        self
-    }
-
-    /// Set `D`, the df-doublings per IDF weight step.
-    pub fn weight_step(mut self, d: f64) -> Self {
-        self.weight_step = d;
-        self
+        Tuning::default()
     }
 
     /// Set `ν` — corroboration depth (derivation §4).
@@ -292,6 +242,68 @@ impl<'a> SearchOpts<'a> {
         self.c_margin = Some(c);
         self
     }
+}
+
+/// Per-search options. Construct with [`SearchOpts::new`] and the builder setters.
+///
+/// The front line is the three knobs a caller actually reaches for day to day — `min_shared`
+/// (strictness), `df_budget` (work), `filter` (scope). The derivation-level scoring knobs live
+/// behind [`tuning`](SearchOpts::tuning) (v0.5).
+///
+/// `limit` is **not** here — it is a terminal-op argument ([`Reader::matches`]), because the
+/// [`candidates`](Reader::candidates) stream is lazy/unbounded (the caller pulls depth via
+/// `take`). `#[non_exhaustive]`: build from [`new`](SearchOpts::new), not a struct literal.
+#[non_exhaustive]
+pub struct SearchOpts<'a> {
+    /// `m` — the match floor (shared rare tokens for a hit). `None` → `2`.
+    pub min_shared: Option<u32>,
+    /// `C` — the work budget: a cap on the cumulative document frequency (`Σdf`) of the selected
+    /// tokens, which is what candidate generation scans — so this bounds *work* directly.
+    /// Rarest-first tokens are kept while `Σdf` stays within budget; the typo floor is always kept.
+    /// This is the derivation's work budget `C` (the cap on `Σdf` over the pruned set, derivation
+    /// §5/§7). `None` (the default) does **not** mean unbounded — it means **derive `C` from the
+    /// corpus** (`C = (1/σ)·ln(N/k)·d̄/ln(N/d̄)`, `d̄ = exp(mean_lndf + 2·std_lndf)`; the Lagrangian
+    /// dual of the §5 stop, pooled per query over that query's own script classes). A
+    /// caller-supplied value overrides the derived one; the derivation's recall-safe guards fall
+    /// the derived budget back to unbounded on a degenerate corpus (tiny `N`, non-finite stats).
+    /// Bind an explicit huge value to force fully-unbounded selection.
+    pub df_budget: Option<u64>,
+    /// The derivation-level scoring/stop knobs (`ν`, `κ`, `Δ`, `k`, `c`) — see [`Tuning`].
+    pub tuning: Tuning,
+    /// An opt-in raw-SQL [`SqlFilter`] over the caller's live data, folded into per-bucket
+    /// provenance. `None` = unfiltered.
+    pub filter: Option<SqlFilter<'a>>,
+}
+
+impl<'a> SearchOpts<'a> {
+    /// Default options (derived budget, default tuning, no filter).
+    pub fn new() -> Self {
+        SearchOpts {
+            min_shared: None,
+            df_budget: None,
+            tuning: Tuning::default(),
+            filter: None,
+        }
+    }
+
+    /// Set the match floor `m`.
+    pub fn min_shared(mut self, m: u32) -> Self {
+        self.min_shared = Some(m);
+        self
+    }
+
+    /// Set the work budget `C` — cap the cumulative `Σdf` of the selected tokens (bounds scan
+    /// work). Overrides the corpus-derived default (see [`df_budget`](SearchOpts::df_budget)).
+    pub fn df_budget(mut self, budget: u64) -> Self {
+        self.df_budget = Some(budget);
+        self
+    }
+
+    /// Set the derivation-level scoring/stop knobs (see [`Tuning`]).
+    pub fn tuning(mut self, tuning: Tuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
 
     /// Set an opt-in [`SqlFilter`].
     pub fn filter(mut self, filter: SqlFilter<'a>) -> Self {
@@ -307,9 +319,8 @@ impl Default for SearchOpts<'_> {
 }
 
 /// A read-only snapshot of the index's observable state.
-///
-/// Not `Eq` because [`weight_step_hint`](Stats::weight_step_hint) carries floats.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stats {
     /// Number of indexed segments (`N`).
     pub segments: u64,
@@ -327,30 +338,10 @@ pub struct Stats {
     pub schema_version: u32,
     /// The schema fingerprint currently stamped.
     pub schema_fingerprint: u64,
-    /// A corpus-derived suggestion for [`SearchOpts::weight_step`] `D`, accumulated from the
-    /// band-spreads of the searches run since this index was opened. `None` until at least one
-    /// search has run. See [`WeightStepHint`].
-    pub weight_step_hint: Option<WeightStepHint>,
-}
-
-/// A suggested [`SearchOpts::weight_step`] `D`, with the band-spread distribution it came from.
-///
-/// Built from the per-query band-spreads (`log2(df_max/df_min)`) observed since the index was
-/// opened. `suggested ≈ median / 3`. The `iqr` is the confidence signal: a tight IQR means one
-/// `D` fits; a wide one means the corpus has multiple query regimes.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WeightStepHint {
-    /// The suggested `D` (`max(0.5, median_spread / 3)`).
-    pub suggested: f64,
-    /// Median per-query band-spread, in df-doublings.
-    pub median_spread: f64,
-    /// The interquartile range `(Q1, Q3)` of band-spreads, in df-doublings.
-    pub iqr: (f64, f64),
-    /// How many searches contributed.
-    pub samples: u64,
 }
 
 /// What a [`compact`](Index::compact) reclaimed.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompactStats {
     /// Tokens whose pending delta was folded into the base.
@@ -390,10 +381,6 @@ pub struct Index<T: Tokenizer = DefaultTokenizer> {
     /// swap committed: every lease then fails closed until the caller reopens (or a later
     /// `rebuild` succeeds), rather than serving from a stale, mis-routed map.
     poisoned: AtomicBool,
-    /// In-memory per-query band-spread histogram: each search adds one sample
-    /// `log2(df_max/df_min)` over its present postings. [`stats`](Self::stats) derives a suggested
-    /// [`weight_step`](SearchOpts::weight_step) from it. Process-local; reset by reopening.
-    band_spread_hist: [AtomicU64; HINT_BUCKETS],
 }
 
 impl Index<DefaultTokenizer> {
@@ -431,7 +418,6 @@ impl<T: Tokenizer> Index<T> {
             schema,
             dict: Dictionary::empty(),
             poisoned: AtomicBool::new(false),
-            band_spread_hist: std::array::from_fn(|_| AtomicU64::new(0)),
         };
         index.init()?;
         {
@@ -465,7 +451,6 @@ impl<T: Tokenizer> Index<T> {
             // reader detects the change.
             schema::bump_dict_generation(&tx, ns)?;
             schema::write_stamps(&tx, ns, self.data_version, fingerprint, schema_fp)?;
-            self.reset_band_spread_hist();
         }
         tx.commit()?;
         Ok(())
@@ -482,35 +467,6 @@ impl<T: Tokenizer> Index<T> {
             ));
         }
         Ok(())
-    }
-
-    /// Record one query's band-spread (`log2(df_max/df_min)` over its present postings) into the
-    /// in-memory histogram backing the [`Stats`] weight-step hint. Only a query with **≥ 2**
-    /// present postings is sampled (a band needs two endpoints). Cheap: one `log2` + one atomic add.
-    pub(crate) fn observe_band_spread(&self, present_dfs: &[u64]) {
-        let (mut lo, mut hi, mut n) = (u64::MAX, 0u64, 0u32);
-        for &df in present_dfs {
-            if df > 0 {
-                lo = lo.min(df);
-                hi = hi.max(df);
-                n += 1;
-            }
-        }
-        if n < 2 {
-            return;
-        }
-        let spread = (hi as f64 / lo.max(1) as f64).log2();
-        let bucket = ((spread / HINT_BUCKET_WIDTH) as usize).min(HINT_BUCKETS - 1);
-        self.band_spread_hist[bucket].fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Zero the band-spread histogram. Called on a successful [`rebuild`](Self::rebuild) and on a
-    /// drift/desync reset (both can shift the corpus df distribution). A [`compact`](Self::compact)
-    /// leaves every df unchanged, so it does **not** reset.
-    fn reset_band_spread_hist(&self) {
-        for b in &self.band_spread_hist {
-            b.store(0, Ordering::Relaxed);
-        }
     }
 
     /// A cheap consistency probe: the monotonic-id invariant `max(seg.id) < next_id`. A
@@ -603,7 +559,7 @@ impl<T: Tokenizer> Index<T> {
         Ok(conn
             .query_row(
                 &format!("SELECT id FROM {} WHERE key = ?1 AND label = ?2", ns.seg()),
-                rusqlite::params![key.to_value(), label],
+                rusqlite::params![key, label],
                 |r| r.get(0),
             )
             .optional()?)
@@ -649,7 +605,7 @@ impl<T: Tokenizer> Index<T> {
                 "INSERT INTO {}(id, key, label, txt, len) VALUES(?1, ?2, ?3, ?4, ?5)",
                 ns.seg()
             ),
-            rusqlite::params![id, key.to_value(), label, text, seg_len],
+            rusqlite::params![id, key, label, text, seg_len],
         )?;
         let bm: Bitmap = ids.iter().copied().collect();
         conn.execute(
@@ -849,7 +805,7 @@ impl<T: Tokenizer> Index<T> {
                     total_seg_len += seg_len;
                     seg_ins.execute(rusqlite::params![
                         seg_id,
-                        doc.key.to_value(),
+                        doc.key,
                         label,
                         text.as_str(),
                         seg_len
@@ -901,7 +857,6 @@ impl<T: Tokenizer> Index<T> {
             return Err(e);
         }
         self.poisoned.store(false, Ordering::Release);
-        self.reset_band_spread_hist();
         Ok(())
     }
 
@@ -934,38 +889,6 @@ impl<T: Tokenizer> Index<T> {
             schema_fingerprint: stamps
                 .schema_fingerprint
                 .unwrap_or_else(|| self.schema.fingerprint()),
-            weight_step_hint: self.weight_step_hint(),
-        })
-    }
-
-    /// Derive a [`WeightStepHint`] from the band-spread histogram (the searches run since open).
-    /// `None` until at least one search has contributed.
-    fn weight_step_hint(&self) -> Option<WeightStepHint> {
-        let hist: [u64; HINT_BUCKETS] =
-            std::array::from_fn(|b| self.band_spread_hist[b].load(Ordering::Relaxed));
-        let total: u64 = hist.iter().sum();
-        if total == 0 {
-            return None;
-        }
-        // Nearest-rank quantile over the bucketed spreads, reported at the bucket midpoint.
-        let quantile = |p: f64| -> f64 {
-            let target = (p * total as f64).ceil().max(1.0) as u64;
-            let mut cum = 0u64;
-            for (b, &count) in hist.iter().enumerate() {
-                cum += count;
-                if cum >= target {
-                    return b as f64 * HINT_BUCKET_WIDTH + HINT_BUCKET_WIDTH / 2.0;
-                }
-            }
-            (HINT_BUCKETS - 1) as f64 * HINT_BUCKET_WIDTH + HINT_BUCKET_WIDTH / 2.0
-        };
-        let median_spread = quantile(0.5);
-        let suggested = (median_spread / 3.0).max(0.5);
-        Some(WeightStepHint {
-            suggested,
-            median_spread,
-            iqr: (quantile(0.25), quantile(0.75)),
-            samples: total,
         })
     }
 }
@@ -1108,7 +1031,7 @@ impl<'a, T: Tokenizer> Writer<'a, T> {
             let ids: Vec<u32> = {
                 let mut stmt =
                     conn.prepare_cached(&format!("SELECT id FROM {} WHERE key = ?1", ns.seg()))?;
-                let mut rows = stmt.query(rusqlite::params![key.to_value()])?;
+                let mut rows = stmt.query(rusqlite::params![key])?;
                 let mut v = Vec::new();
                 while let Some(r) = rows.next()? {
                     v.push(r.get::<_, i64>(0)? as u32);
@@ -1127,7 +1050,7 @@ impl<'a, T: Tokenizer> Writer<'a, T> {
                         "SELECT count(*), coalesce(sum(len), 0) FROM {} WHERE key = ?1",
                         ns.seg()
                     ),
-                    rusqlite::params![key.to_value()],
+                    rusqlite::params![key],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
                 let arr: std::rc::Rc<Vec<Value>> =
@@ -1138,7 +1061,7 @@ impl<'a, T: Tokenizer> Writer<'a, T> {
                 )?;
                 conn.execute(
                     &format!("DELETE FROM {} WHERE key = ?1", ns.seg()),
-                    rusqlite::params![key.to_value()],
+                    rusqlite::params![key],
                 )?;
                 schema::bump_seg_stats(conn, ns, -seg_n, -seg_len)?;
             }

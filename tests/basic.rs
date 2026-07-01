@@ -204,6 +204,9 @@ fn duplicate_label_in_one_upsert_is_last_wins_with_no_df_residue() {
     }
     h.index.compact().unwrap();
     let stats = h.index.stats().unwrap();
-    assert_eq!(stats.terms, 0, "no phantom df survives the duplicate-label upsert");
+    assert_eq!(
+        stats.terms, 0,
+        "no phantom df survives the duplicate-label upsert"
+    );
     assert_eq!(stats.segments, 0);
 }

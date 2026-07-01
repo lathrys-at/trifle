@@ -13,7 +13,7 @@
 
 mod common;
 use common::*;
-use trifle::SearchOpts;
+use trifle::{SearchOpts, Tuning};
 
 /// A corpus of `n` docs: every doc contains the common word "common" (so its trigrams have `df = n`),
 /// and the first `rare_docs` of them additionally contain the rare word "zqxwv" (its trigrams have
@@ -152,7 +152,7 @@ fn batch_equals_serial_with_the_stop_active_and_under_a_budget() {
     for opts in [
         SearchOpts::new(),                             // stop on at default k/c
         SearchOpts::new().df_budget(30).min_shared(2), // tight budget
-        SearchOpts::new().k_target(8).c_margin(2.0),   // small k -> larger target -> later stop
+        SearchOpts::new().tuning(Tuning::new().k_target(8).c_margin(2.0)), // small k -> larger target -> later stop
     ] {
         let reader = h.index.reader().unwrap();
         let batched = reader.matches_batch(&queries, &opts, 20).unwrap();

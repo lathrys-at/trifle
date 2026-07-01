@@ -8,7 +8,7 @@
 mod common;
 use common::*;
 use trifle::tokenize::DefaultTokenizer;
-use trifle::{Config, Index, Schema, SearchOpts};
+use trifle::{Config, Index, Schema, SearchOpts, Tuning};
 
 /// Load `(id, text)` docs under label `"f"` in one writer batch (faster than per-doc commits).
 fn load(h: &Harness, docs: &[(i64, &str)]) {
@@ -124,11 +124,11 @@ fn degenerate_knobs_fall_back_to_defaults() {
     let baseline = ids(&h.search(q, 10).unwrap());
     assert!(!baseline.is_empty(), "the probe query must hit something");
     let degenerate = [
-        SearchOpts::new().nu(0.0),
-        SearchOpts::new().nu(-1.0),
-        SearchOpts::new().nu(f64::NAN),
-        SearchOpts::new().kappa(f64::NAN),
-        SearchOpts::new().delta(f64::INFINITY),
+        SearchOpts::new().tuning(Tuning::new().nu(0.0)),
+        SearchOpts::new().tuning(Tuning::new().nu(-1.0)),
+        SearchOpts::new().tuning(Tuning::new().nu(f64::NAN)),
+        SearchOpts::new().tuning(Tuning::new().kappa(f64::NAN)),
+        SearchOpts::new().tuning(Tuning::new().delta(f64::INFINITY)),
     ];
     for opts in &degenerate {
         let hits = h.search_opts(q, opts, 10).unwrap();
@@ -308,10 +308,7 @@ fn drain_ordering_is_deterministic_across_runs() {
 
 /// Open a flat index at `dir/trifle.db` with a caller-chosen `σ` (the rest default).
 fn open_with_sigma(dir: &std::path::Path, sigma: f64) -> Index<DefaultTokenizer> {
-    let cfg = Config {
-        sigma,
-        ..Config::default()
-    };
+    let cfg = Config::default().with_sigma(sigma);
     Index::open_at(&dir.join("trifle.db"), Schema::flat(), cfg).unwrap()
 }
 
@@ -389,7 +386,11 @@ fn coarse_delta_trips_the_quantization_guard_in_debug() {
         .collect();
     load(&h, &docs);
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = h.search_opts("assorted filler", &SearchOpts::new().delta(100.0), 10);
+        let _ = h.search_opts(
+            "assorted filler",
+            &SearchOpts::new().tuning(Tuning::new().delta(100.0)),
+            10,
+        );
     }));
     assert!(res.is_err(), "coarse Δ = 100 trips the §7 guard at N = 40");
 }

@@ -185,6 +185,10 @@ impl Candidate {
     }
 }
 
+/// A query's `(script, order)` class sets: `actual` (its own gram classes — the derived budget's
+/// pool) and `with_siblings` (plus the ±1 sibling orders, for the ΔH vocabulary lookups).
+type QueryClassSets = (FxHashSet<(u8, u8)>, FxHashSet<(u8, u8)>);
+
 /// The distinct **word-tagged** tokens per query and the batch-wide distinct **term** set (the
 /// resolution input). Each token carries its §5 word id (the comonotone stopping-block id the
 /// Cantelli stop needs). The read path stays in term-space: it resolves from each token's
@@ -535,7 +539,7 @@ fn concentration_cap(energies: &[f64], floored: &[bool]) -> Option<f64> {
             top = Some(i);
         }
     }
-    let Some(top) = top else { return None };
+    let top = top?;
     let e_top = energies[top];
     if e_top <= 0.0 {
         return None; // no dominant rare gram (all-common / empty) — μ survives (§7/§9)
@@ -599,7 +603,7 @@ fn prepare<T: Tokenizer>(
     // produces only one order but weighs both). The batch snapshot below is the union — a
     // superset is harmless because every entry is a global corpus statistic; only *pool
     // membership* was ever a leak.
-    let q_classes: Vec<(FxHashSet<(u8, u8)>, FxHashSet<(u8, u8)>)> = query_tokens
+    let q_classes: Vec<QueryClassSets> = query_tokens
         .iter()
         .map(|q| {
             let mut actual: FxHashSet<(u8, u8)> = FxHashSet::default();
@@ -650,20 +654,20 @@ fn prepare<T: Tokenizer>(
     // slip a bare `d > 0.0`). Note work scales as `~1/Δ`: the engine's plane count, `max_score`,
     // and reachability array all grow with `E_max/Δ`, so a pathologically tiny `Δ` is a
     // memory/`u32`-overflow hazard — the default `0.5` keeps this bounded; no hard lower clamp.
-    let nu = opts.nu.unwrap_or(DEFAULT_NU);
+    let nu = opts.tuning.nu.unwrap_or(DEFAULT_NU);
     let nu = if nu.is_finite() && nu >= 1.0 {
         nu
     } else {
         DEFAULT_NU
     };
-    let kappa = opts.kappa.unwrap_or(DEFAULT_KAPPA);
+    let kappa = opts.tuning.kappa.unwrap_or(DEFAULT_KAPPA);
     let kappa = if kappa.is_finite() && kappa >= 0.0 {
         kappa
     } else {
         DEFAULT_KAPPA
     };
     let delta = {
-        let d = opts.delta.unwrap_or(DEFAULT_DELTA);
+        let d = opts.tuning.delta.unwrap_or(DEFAULT_DELTA);
         if d.is_finite() && d > 0.0 {
             d
         } else {
@@ -674,14 +678,14 @@ fn prepare<T: Tokenizer>(
     // (a Cantelli margin), `k ≥ 1` (the stop target `ln(N/k)`), both falling back on a degenerate
     // value (recall-safe). `σ` is the index-level corpus constant, sanitized at open.
     let c_margin = {
-        let c = opts.c_margin.unwrap_or(DEFAULT_C_MARGIN);
+        let c = opts.tuning.c_margin.unwrap_or(DEFAULT_C_MARGIN);
         if c.is_finite() && c >= 0.0 {
             c
         } else {
             DEFAULT_C_MARGIN
         }
     };
-    let k_target = opts.k_target.unwrap_or(DEFAULT_K_TARGET).max(1);
+    let k_target = opts.tuning.k_target.unwrap_or(DEFAULT_K_TARGET).max(1);
 
     // Snapshot-wide corpus stats (N, L̄) for the N-anchored scoring path (energy/floor/stop/null).
     // Read once for the whole batch from this snapshot's rolling counters, so every query sees the
@@ -820,7 +824,7 @@ fn prepare<T: Tokenizer>(
         let mut fused_selected: Vec<String> = Vec::new();
         let mut seen: FxHashSet<String> = FxHashSet::default();
         for selected in &vs.views {
-            let plan = build_view_plan(index, selected, &postings_map, &resolve, &batch);
+            let plan = build_view_plan::<T>(selected, &postings_map, &resolve, &batch);
             for s in &plan.selected_strings {
                 if seen.insert(s.clone()) {
                     fused_selected.push(s.clone());
@@ -1065,7 +1069,6 @@ fn view_weights_from_dh<T: Tokenizer>(
 /// the M1 logit-idf energy planes, the M2 floored flags + §9-capped per-order count credit, and the
 /// M3 length-null split — the whole M1–M4 scoring pipeline, unchanged, per view (derivation §2–§9).
 fn build_view_plan<T: Tokenizer>(
-    index: &Index<T>,
     selected: &[T::Token],
     postings_map: &FxHashMap<TermId, Bitmap>,
     resolve: &impl Fn(&T::Token) -> Option<(TermId, i64)>,
@@ -1094,8 +1097,6 @@ fn build_view_plan<T: Tokenizer>(
         }
         selected_strings.push(s);
     }
-    // Telemetry for the weight-step hint (the band-spread of this view's present postings).
-    index.observe_band_spread(&present_dfs);
     // The `Σ kept-posting cardinality` work-done probe — only evaluated under the `tracing`
     // feature (the macro does not evaluate its args otherwise), so the hot path pays nothing
     // by default. The benchmark profile pass reads this event.
@@ -1440,6 +1441,12 @@ fn hydrate_matches<T: Tokenizer>(
                 label: c.label.clone(),
                 span,
                 text,
+                // The §10 score + components (v0.5): the cross-query-comparable nat-scale
+                // magnitude, from the candidate's governing rank-view.
+                score: c.nat_score(),
+                energy: c.energy(),
+                count: c.count(),
+                length: c.length(),
             }
         })
         .collect())
@@ -1829,8 +1836,10 @@ impl<T: Tokenizer> CandidateStream<'_, T> {
     pub fn n_segments(&self) -> u64 {
         self.planned.n_segments
     }
-    /// Mean segment gram length (`avgdl`) on this snapshot. `0.0` on an empty corpus.
-    pub fn avgdl(&self) -> f64 {
+    /// Mean **distinct-gram** segment length `L̄` on this snapshot — the §6 length null's
+    /// denominator. `0.0` on an empty corpus. (v0.5: renamed from `avgdl`, a BM25-era name; the
+    /// derivation's quantity is `L̄`, the mean distinct-gram count.)
+    pub fn mean_segment_grams(&self) -> f64 {
         self.planned.avgdl
     }
     /// The selected tokens that have a posting, each with its document frequency `df` (no SQL —
@@ -2297,8 +2306,7 @@ mod credit_tests {
             "the pre-v0.5 cap admitted the inversion this test pins the fix for"
         );
         // A NON-floored anchor keeps the #c − 1 denominator (it earns μ itself).
-        let cap_unfloored =
-            concentration_cap(&energies, &[false; 4]).expect("concentrated");
+        let cap_unfloored = concentration_cap(&energies, &[false; 4]).expect("concentrated");
         approx(cap_unfloored, (e_top - sum_c) / 2.0);
     }
 
@@ -2467,7 +2475,6 @@ mod null_tests {
             prev = null;
         }
     }
-
 }
 
 #[cfg(test)]
@@ -2549,7 +2556,9 @@ mod topk_tests {
             let mut state: Vec<(i64, f64)> = Vec::new();
             let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
             for i in 0..500 {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let key = (x >> 33) as i64 % 40;
                 let bump = ((x >> 11) & 0xFFF) as f64 / 256.0 + 1e-3;
                 match state.iter_mut().find(|(k2, _)| *k2 == key) {

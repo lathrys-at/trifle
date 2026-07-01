@@ -552,12 +552,17 @@ impl<const N: usize> Tokenizer for NgramTokenizer<N> {
     }
 
     fn fingerprint(&self) -> u64 {
-        // FNV-1a over a canonical encoding of the behavior: a tag, the window width, and the
-        // normalization bytes. `N` is hashed at full width so two widths never collide.
-        let mut bytes = Vec::with_capacity(2 + 8 + 3);
+        // FNV-1a over a canonical encoding of the behavior: a tag, the window width, the
+        // normalization bytes, and a layout-version byte (parity with `DefaultTokenizer` — a
+        // future change to the windowing *behavior* bumps the byte and drift-resets, without
+        // overloading the tag). `N` is hashed at full width so two widths never collide.
+        let mut bytes = Vec::with_capacity(2 + 8 + 3 + 1);
         bytes.extend_from_slice(b"ng");
         bytes.extend_from_slice(&(N as u64).to_le_bytes());
         bytes.extend_from_slice(&self.norm.fingerprint_bytes());
+        // Layout version. 1 as of v0.5 (adding the byte itself drift-resets pre-v0.5
+        // NgramTokenizer caches once — the expected drop-and-rebuild path, not a migration).
+        bytes.push(1);
         fnv1a_64(&bytes)
     }
 
@@ -707,9 +712,11 @@ pub struct DefaultTokenizer {
 
 /// Per-script-class window sizes for [`DefaultTokenizer`], indexed by the script-class byte
 /// (`unicode_script::Script as u8`, the same byte the term encoding stores). The default is
-/// trigrams everywhere except the dense CJK scripts, which take bigrams.
+/// trigrams everywhere except the dense CJK scripts, which take bigrams. `pub(crate)` (v0.5):
+/// there is no public constructor or setter, so public visibility was dead surface — a caller
+/// wanting a custom policy needs a custom [`Tokenizer`], which owns its own windowing anyway.
 #[derive(Clone, Debug)]
-pub struct WindowPolicy {
+pub(crate) struct WindowPolicy {
     sizes: [u8; 256],
 }
 

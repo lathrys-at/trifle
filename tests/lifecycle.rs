@@ -147,21 +147,6 @@ fn stats_report_segment_and_term_counts() {
 }
 
 #[test]
-fn weight_step_hint_appears_after_searches() {
-    let h = Harness::new();
-    load_fixture(&h);
-    assert!(
-        h.index.stats().unwrap().weight_step_hint.is_none(),
-        "no hint before any search"
-    );
-    // A multi-trigram query yields a band with two endpoints — an informative sample.
-    let _ = h.search("quick brown fox jumps", 10).unwrap();
-    let hint = h.index.stats().unwrap().weight_step_hint;
-    assert!(hint.is_some(), "a sampled search populates the hint");
-    assert!(hint.unwrap().suggested >= 0.5);
-}
-
-#[test]
 fn data_survives_reopen_of_the_same_file() {
     let h = Harness::new();
     load_fixture(&h);

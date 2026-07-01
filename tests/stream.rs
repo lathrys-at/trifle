@@ -56,7 +56,7 @@ fn corpus_signals_and_term_introspection() {
     let mut stream = reader.candidates("quick brown", &opts).unwrap();
 
     assert_eq!(stream.n_segments(), FIXTURE.len() as u64);
-    assert!(stream.avgdl() > 0.0);
+    assert!(stream.mean_segment_grams() > 0.0);
     // present_terms are the selected tokens that have a posting, each with its df.
     let present: Vec<(String, u64)> = stream
         .present_terms()

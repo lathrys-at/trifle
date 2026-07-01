@@ -346,10 +346,11 @@ pub(crate) fn set_next_id(conn: &Connection, ns: &Namespace, next_id: i64) -> Re
 /// malformed-present → [`Error::Corrupt`](crate::Error::Corrupt) (a silently-defaulted
 /// generation could falsely match a reader's captured one).
 pub(crate) fn dict_generation(conn: &Connection, ns: &Namespace) -> Result<u64> {
-    Ok(
-        parse_counter(KEY_DICT_GENERATION, meta_get(conn, ns, KEY_DICT_GENERATION)?)?
-            .unwrap_or(0),
-    )
+    Ok(parse_counter(
+        KEY_DICT_GENERATION,
+        meta_get(conn, ns, KEY_DICT_GENERATION)?,
+    )?
+    .unwrap_or(0))
 }
 
 /// Bump the dictionary generation. Called whenever term-ids are reassigned — a
@@ -538,7 +539,10 @@ mod tests {
         // Malformed-present → Corrupt, from both the reader and the allocator.
         meta_set(&c, &ns, KEY_NEXT_ID, "not-a-number").unwrap();
         assert!(matches!(next_id(&c, &ns), Err(crate::Error::Corrupt(_))));
-        assert!(matches!(alloc_ids(&c, &ns, 1), Err(crate::Error::Corrupt(_))));
+        assert!(matches!(
+            alloc_ids(&c, &ns, 1),
+            Err(crate::Error::Corrupt(_))
+        ));
         meta_set(&c, &ns, KEY_DICT_GENERATION, "-3").unwrap(); // u64: negative is malformed
         assert!(matches!(
             dict_generation(&c, &ns),

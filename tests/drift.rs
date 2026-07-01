@@ -70,7 +70,7 @@ fn avgdl_of(idx: &Index<DefaultTokenizer>) -> f64 {
     let reader = idx.reader().unwrap();
     let opts = SearchOpts::new();
     let stream = reader.candidates("zzz", &opts).unwrap();
-    stream.avgdl()
+    stream.mean_segment_grams()
 }
 
 #[test]

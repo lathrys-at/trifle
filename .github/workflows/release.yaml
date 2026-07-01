@@ -142,21 +142,30 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - name: Publish
-        # Publish the workspace in dependency order (trifle-overlap, then trifle), skipping any
-        # version already on crates.io. The skip makes this idempotent — it tolerates a re-run and
-        # the one-time hand-bootstrap of trifle-overlap (a new crate name Trusted Publishing cannot
-        # first-publish). `cargo publish` waits for the index before returning, so a freshly
-        # published trifle-overlap resolves when trifle is published next.
+        # Publish the workspace in dependency order (trifle-overlap, then trifle). Idempotent via
+        # cargo's own sparse-index check: a version already on crates.io makes `cargo publish` exit
+        # with "already exists", which we treat as a skip; any other failure fails the job. This
+        # tolerates a re-run and the one-time hand-bootstrap of trifle-overlap (a new crate name
+        # Trusted Publishing cannot first-publish). `cargo publish` waits for the index before
+        # returning, so a freshly published trifle-overlap resolves when trifle is published next.
+        # (We rely on cargo's index check, NOT the crates.io web API — the latter's User-Agent
+        # policy makes an HTTP existence probe unreliable.)
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          set +e   # we handle cargo's exit status ourselves (the default shell runs with -e)
           for pkg in trifle-overlap trifle; do
-            ver="$(cargo metadata --no-deps --format-version 1 \
-              | jq -r --arg p "$pkg" '.packages[] | select(.name==$p).version')"
-            if curl -fs -o /dev/null "https://crates.io/api/v1/crates/$pkg/$ver"; then
-              echo "::notice::$pkg $ver already on crates.io — skipping"
+            echo "::group::publish $pkg"
+            out="$(cargo publish -p "$pkg" --locked 2>&1)"
+            status=$?
+            echo "$out"
+            echo "::endgroup::"
+            if [ "$status" -eq 0 ]; then
+              echo "::notice::published $pkg"
+            elif echo "$out" | grep -qiE 'already (exists|uploaded)'; then
+              echo "::notice::$pkg version already on crates.io — skipping"
             else
-              echo "Publishing $pkg $ver"
-              cargo publish -p "$pkg" --locked
+              echo "::error::$pkg publish failed (exit $status)"
+              exit 1
             fi
           done
         env:

@@ -135,10 +135,15 @@ impl Dictionary {
             .copied()
     }
 
-    /// Resolve a batch of distinct terms to ids and snapshot the classes they touch, all
-    /// under one read-lock, capturing the generation atomically with the resolution. Returns
+    /// Resolve a batch of distinct terms to ids and snapshot the given `(script, order)` classes,
+    /// all under one read-lock, capturing the generation atomically with the resolution. Returns
     /// `(term-key→id, generation, class snapshot)`; a term absent from the corpus is omitted
     /// from the map (and resolves to df 0 downstream).
+    ///
+    /// `classes` is caller-supplied (rather than derived from `terms`) so the search path can
+    /// request a **superset** — every query's classes *plus their sibling orders* — and then carve
+    /// per-query [`ClassSnap::subset`]s out of the one snapshot; each entry is a global corpus
+    /// statistic, so a superset never perturbs a per-query value (`batch == serial`).
     ///
     /// Keyed by the term's packed `u128` so the read path resolves straight from a tokenizer
     /// token's [`term()`](crate::IntoTerm::term) — no `Token → String → re-encode` round-trip,
@@ -146,17 +151,16 @@ impl Dictionary {
     pub(crate) fn resolve_terms(
         &self,
         terms: &[Term],
+        classes: impl IntoIterator<Item = (u8, u8)>,
     ) -> (FxHashMap<u128, TermId>, u64, ClassSnap) {
         let guard = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut out = FxHashMap::with_capacity_and_hasher(terms.len(), Default::default());
-        let mut classes_seen: Vec<(u8, u8)> = Vec::new();
         for t in terms {
-            classes_seen.push((t.class(), t.order()));
             if let Some(&id) = guard.map.get(&t.0) {
                 out.insert(t.0, id);
             }
         }
-        let snap = guard.classes.snapshot_for(classes_seen);
+        let snap = guard.classes.snapshot_for(classes);
         (out, guard.generation, snap)
     }
 

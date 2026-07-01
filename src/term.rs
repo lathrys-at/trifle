@@ -24,6 +24,13 @@
 
 use unicode_script::{Script, UnicodeScript};
 
+/// The `Common` script-class byte — the class of a gram with no strong-script codepoint (digits,
+/// punctuation, symbols). The search path treats this class specially: `Common` grams are usually
+/// *interior fragments* of a strong-script run (digits inherit the run they sit in), so per-class
+/// policies keyed on "the script produced no primary gram" must not treat an interior `Common`
+/// sub-gram as a starved script (`search::plan_views`).
+pub(crate) const COMMON_CLASS: u8 = Script::Common as u8;
+
 /// A packed term: a gram (≤3 codepoints) plus a script tag, `[ script:8 | c0:32 | c1:32
 /// | c2:32 | reserved:24=0 ]` (MSB→LSB). Produced by [`IntoTerm::term`]; opaque to
 /// callers (the encoding is an internal detail).

@@ -120,7 +120,10 @@ impl ClassStats {
         }
     }
 
-    /// Snapshot the given `(script, order)` classes' stats for one query (then lock-free).
+    /// Snapshot the given `(script, order)` classes' stats for one query (then lock-free). The
+    /// cached pool ([`pooled_log_df`](ClassSnap::pooled_log_df)) is over **all** the snapshot's
+    /// classes; a per-query view with a distinct pool set is carved with
+    /// [`subset`](ClassSnap::subset).
     pub(crate) fn snapshot_for(&self, classes: impl IntoIterator<Item = (u8, u8)>) -> ClassSnap {
         let mut by_class = FxHashMap::default();
         for (c, o) in classes {
@@ -128,72 +131,120 @@ impl ClassStats {
                 .entry((c, o))
                 .or_insert_with(|| self.by_class[class_index(c, o)].snapshot());
         }
-        ClassSnap { by_class }
+        let pooled = pool_entries(by_class.values());
+        ClassSnap { by_class, pooled }
     }
 }
 
-/// A per-query, immutable snapshot of the `(script, order)`-class stats the query's tokens touch.
+/// Parallel-Welford pool of per-class `(n, mean, σ_eff)` entries into one
+/// `(mean_log_df, std_log_df)` over `ln(df)`, by sample count `n` (the derived work-budget's
+/// representative-gram statistic, derivation §5/§7). Only classes with a **defined** variance
+/// (`n ≥ 2`, finite `σ_eff`) contribute; a class too sparse to normalize is skipped. `None` when
+/// no class qualifies (`Σn < 2`). The pool is the standard parallel-Welford combination
+/// [Chan1979]: `μ = Σ nᵢμᵢ / Σ nᵢ`, and combined `M2 = Σ[(nᵢ−1)σᵢ² + nᵢ(μᵢ−μ)²]`, so
+/// `std = √(M2/(Σnᵢ−1))`.
+fn pool_entries<'a>(entries: impl Iterator<Item = &'a (u64, f64, f64)> + Clone) -> Option<(f64, f64)> {
+    let mut n_total: u64 = 0;
+    let mut mean_acc = 0.0; // Σ nᵢ·μᵢ
+    for &(n, mean, sigma) in entries.clone() {
+        if n >= 2 && sigma.is_finite() && mean.is_finite() {
+            n_total += n;
+            mean_acc += n as f64 * mean;
+        }
+    }
+    if n_total < 2 {
+        return None;
+    }
+    let pooled_mean = mean_acc / n_total as f64;
+    let mut m2 = 0.0; // Σ [ (nᵢ−1)·σᵢ² + nᵢ·(μᵢ−μ)² ]
+    for &(n, mean, sigma) in entries {
+        if n >= 2 && sigma.is_finite() && mean.is_finite() {
+            let var_i = sigma * sigma;
+            m2 += (n as f64 - 1.0) * var_i + n as f64 * (mean - pooled_mean).powi(2);
+        }
+    }
+    let pooled_var = (m2 / (n_total as f64 - 1.0)).max(0.0);
+    let std = pooled_var.sqrt();
+    if pooled_mean.is_finite() && std.is_finite() {
+        Some((pooled_mean, std))
+    } else {
+        None
+    }
+}
+
+/// A per-query, immutable snapshot of the `(script, order)`-class stats the query's tokens touch,
+/// with the query's pooled `ln(df)` statistic precomputed (cached once — both the derived work
+/// budget and the [`rarity`](Self::rarity) fallback read it).
 pub(crate) struct ClassSnap {
     by_class: FxHashMap<(u8, u8), (u64, f64, f64)>, // (class, order) -> (n, mean, σ_eff)
+    /// Cached pool over this snapshot's designated pool classes (all of `by_class` for a
+    /// [`ClassStats::snapshot_for`] snapshot; the explicit `pool` set for a [`subset`](Self::subset)).
+    pooled: Option<(f64, f64)>,
 }
 
 impl ClassSnap {
-    /// An empty snapshot — every [`rarity`](Self::rarity) falls back to raw DF. Used by
+    /// An empty snapshot — every [`rarity`](Self::rarity) falls back to `ln(df)`. Used by
     /// the `select` unit tests.
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
         ClassSnap {
             by_class: FxHashMap::default(),
+            pooled: None,
         }
+    }
+
+    /// Carve a **per-query** view out of a batch snapshot (v0.5, the `batch == serial` repair):
+    /// `classes` are the entries to retain (the query's own `(script, order)` classes plus the
+    /// sibling orders its rank-view `ΔH` may consult), and `pool` — a subset of `classes` — are
+    /// the classes whose stats pool into the cached
+    /// [`pooled_log_df`](Self::pooled_log_df) (the query's *actual gram* classes only, since the
+    /// derived budget's `d̄` must reflect the postings this query will scan, never a sibling
+    /// order's or a co-batched query's regime).
+    pub(crate) fn subset(
+        &self,
+        classes: &crate::hash::FxHashSet<(u8, u8)>,
+        pool: &crate::hash::FxHashSet<(u8, u8)>,
+    ) -> ClassSnap {
+        let mut by_class = FxHashMap::default();
+        for co in classes {
+            if let Some(&v) = self.by_class.get(co) {
+                by_class.insert(*co, v);
+            }
+        }
+        let pooled = pool_entries(
+            by_class
+                .iter()
+                .filter(|(co, _)| pool.contains(co))
+                .map(|(_, v)| v),
+        );
+        ClassSnap { by_class, pooled }
     }
 
     /// The class-normalized rarity of a term (lower = rarer, so the pruner sorts
-    /// ascending). Returns the `z`-score for a well-populated `(script, order)` class, else falls
-    /// back to raw DF (`df` as `f64`) — keeping the rarest-first ordering well-defined either way.
+    /// ascending). Returns the `z`-score for a well-populated `(script, order)` class. A class too
+    /// sparse to normalize falls back to the `z`-score against the snapshot's **pooled** `ln(df)`
+    /// stats ([`pooled_log_df`](Self::pooled_log_df)) — commensurable with the per-class
+    /// `z`-scores it interleaves with in one sort key (v0.5; raw df mixed scales) — and, when
+    /// nothing pools at all, to raw `ln(df)` (every gram then falls back uniformly, so the
+    /// ordering is plain rarest-by-df either way).
     pub(crate) fn rarity(&self, df: i64, class: u8, order: u8) -> f64 {
+        let ln_df = (df.max(1) as f64).ln();
         if let Some(&(n, mean, sigma)) = self.by_class.get(&(class, order)) {
             if n >= N_NORMALIZE_FLOOR && sigma.is_finite() {
-                return ((df.max(1) as f64).ln() - mean) / sigma;
+                return (ln_df - mean) / sigma;
             }
         }
-        df as f64
+        if let Some((mean, std)) = self.pooled {
+            return (ln_df - mean) / std.max(SIGMA_FLOOR);
+        }
+        ln_df
     }
 
-    /// Pool the query's **present** `(script, order)` classes into one `(mean_log_df, std_log_df)`
-    /// over `ln(df)`, by sample count `n` (the derived work-budget's representative-gram statistic,
-    /// derivation §5/§7 — consumed by `search::derived_budget`). Only classes with
-    /// a **defined** variance (`n ≥ 2`, finite `σ_eff`) contribute; a class too sparse to normalize
-    /// is skipped. Returns `None` when no present class qualifies (`Σn < 2`) — the caller then falls
-    /// back to an unbounded budget (recall-safe). The pool is the standard parallel-Welford
-    /// combination [Chan1979]: `μ = Σ nᵢμᵢ / Σ nᵢ`, and combined `M2 = Σ[(nᵢ−1)σᵢ² + nᵢ(μᵢ−μ)²]`,
-    /// so `std = √(M2/(Σnᵢ−1))`.
+    /// The cached pool over this snapshot's pool classes (see [`subset`](Self::subset) and
+    /// [`ClassStats::snapshot_for`]); consumed by `search::derived_budget` and the
+    /// [`rarity`](Self::rarity) fallback.
     pub(crate) fn pooled_log_df(&self) -> Option<(f64, f64)> {
-        let mut n_total: u64 = 0;
-        let mut mean_acc = 0.0; // Σ nᵢ·μᵢ
-        for &(n, mean, sigma) in self.by_class.values() {
-            if n >= 2 && sigma.is_finite() && mean.is_finite() {
-                n_total += n;
-                mean_acc += n as f64 * mean;
-            }
-        }
-        if n_total < 2 {
-            return None;
-        }
-        let pooled_mean = mean_acc / n_total as f64;
-        let mut m2 = 0.0; // Σ [ (nᵢ−1)·σᵢ² + nᵢ·(μᵢ−μ)² ]
-        for &(n, mean, sigma) in self.by_class.values() {
-            if n >= 2 && sigma.is_finite() && mean.is_finite() {
-                let var_i = sigma * sigma;
-                m2 += (n as f64 - 1.0) * var_i + n as f64 * (mean - pooled_mean).powi(2);
-            }
-        }
-        let pooled_var = (m2 / (n_total as f64 - 1.0)).max(0.0);
-        let std = pooled_var.sqrt();
-        if pooled_mean.is_finite() && std.is_finite() {
-            Some((pooled_mean, std))
-        } else {
-            None
-        }
+        self.pooled
     }
 
     /// The **vocabulary size** `V` (distinct in-class terms) of a `(script, order)` class — the
@@ -241,14 +292,69 @@ mod tests {
     }
 
     #[test]
-    fn degenerate_class_falls_back_to_raw_df() {
-        // n < 2 -> sigma infinite -> raw df.
+    fn degenerate_class_falls_back_to_ln_df() {
+        // n < 2 -> sigma infinite, and nothing pools -> raw ln(df) (monotone in df, so the
+        // rarest-first ordering is plain rarest-by-df).
         let mut stats = ClassStats::new();
         stats.add_sample(1, 3, 10); // one sample only, class (1, order 3)
         let snap = stats.snapshot_for([(1u8, 3u8)]);
-        assert_eq!(snap.rarity(10, 1, 3), 10.0);
+        assert_eq!(snap.rarity(10, 1, 3), 10.0f64.ln());
         // Empty snapshot also falls back.
-        assert_eq!(ClassSnap::empty().rarity(7, 1, 3), 7.0);
+        assert_eq!(ClassSnap::empty().rarity(7, 1, 3), 7.0f64.ln());
+    }
+
+    #[test]
+    fn sparse_class_falls_back_to_the_pooled_z_score() {
+        // v0.5 (§2.5 of the post-v0.4 review): a class too sparse to normalize must NOT interleave
+        // raw df with other classes' z-scores. It falls back to the z against the snapshot's pooled
+        // ln(df) stats — same scale as the per-class z-scores.
+        let mut stats = ClassStats::new();
+        for df in 1..=100 {
+            stats.add_sample(1, 3, df); // a well-populated class (pools)
+        }
+        stats.add_sample(2, 3, 40); // a single-sample (degenerate) class
+        let snap = stats.snapshot_for([(1u8, 3u8), (2u8, 3u8)]);
+        let (mean, std) = snap.pooled_log_df().expect("the populated class pools");
+        let got = snap.rarity(40, 2, 3);
+        let want = (40f64.ln() - mean) / std;
+        assert!(
+            (got - want).abs() < 1e-9,
+            "sparse-class rarity is the pooled z ({got} vs {want})"
+        );
+        // Scale sanity: the fallback lands in z-range, not raw-df range.
+        assert!(got.abs() < 10.0, "pooled z is z-scaled, not df-scaled: {got}");
+    }
+
+    #[test]
+    fn subset_retains_requested_classes_and_pools_only_the_pool_set() {
+        // v0.5 batch==serial repair: a per-query subset pools ONLY the query's actual gram
+        // classes, even when sibling classes are retained for ΔH lookups.
+        use crate::hash::FxHashSet;
+        let mut stats = ClassStats::new();
+        for df in 1..=80 {
+            stats.add_sample(1, 3, df);
+        }
+        for df in 100..=300 {
+            stats.add_sample(1, 2, df);
+        }
+        let batch = stats.snapshot_for([(1u8, 3u8), (1u8, 2u8)]);
+        let classes: FxHashSet<(u8, u8)> = [(1u8, 3u8), (1u8, 2u8)].into_iter().collect();
+        let pool: FxHashSet<(u8, u8)> = [(1u8, 2u8)].into_iter().collect();
+        let sub = batch.subset(&classes, &pool);
+        // Retained classes still resolve (vocab present for both orders)...
+        assert_eq!(sub.vocab(1, 3), 80);
+        assert_eq!(sub.vocab(1, 2), 201);
+        // ...but the pool is exactly the (1,2) class's own stats.
+        let mut w = Welford::default();
+        for df in 100..=300 {
+            w.add((df as f64).ln());
+        }
+        let (_, wmean, wsigma) = w.snapshot();
+        let (mean, std) = sub.pooled_log_df().expect("the pool class pools");
+        assert!((mean - wmean).abs() < 1e-9, "pool == the pool class's mean");
+        assert!((std - wsigma).abs() < 1e-9, "pool == the pool class's σ");
+        // The batch snapshot's own pool spans both classes (differs from the subset's).
+        assert_ne!(batch.pooled_log_df(), sub.pooled_log_df());
     }
 
     #[test]

@@ -203,15 +203,20 @@ pub(crate) fn select<Tk: Clone + Ord>(
     // Present grams, rarest-first: class-normalized rarity, then true-df ascending (the §5 tie-break
     // that resolves z-score ties and keeps the cheapest first in the floored tail), then token (a
     // deterministic final tie-break so the hash-set dedup upstream cannot leak nondeterminism).
-    let mut present: Vec<&GramRow<Tk>> = rows.iter().filter(|r| r.df > 0).collect();
-    present.sort_by(|a, b| {
-        classes
-            .rarity(a.df, a.class, a.order)
-            .partial_cmp(&classes.rarity(b.df, b.class, b.order))
+    // Decorate-sort-undecorate: the rarity key (a `ln` per gram) is computed once per gram, not
+    // per comparison — `O(n)` transcendentals instead of `O(n log n)`.
+    let mut decorated: Vec<(f64, &GramRow<Tk>)> = rows
+        .iter()
+        .filter(|r| r.df > 0)
+        .map(|r| (classes.rarity(r.df, r.class, r.order), r))
+        .collect();
+    decorated.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.df.cmp(&b.df))
-            .then_with(|| a.token.cmp(&b.token))
+            .then(a.1.df.cmp(&b.1.df))
+            .then_with(|| a.1.token.cmp(&b.1.token))
     });
+    let present: Vec<&GramRow<Tk>> = decorated.into_iter().map(|(_, r)| r).collect();
 
     let n = present.len();
     let cmax: u64 = params.df_budget.unwrap_or(u64::MAX);

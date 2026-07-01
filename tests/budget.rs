@@ -167,6 +167,49 @@ fn batch_equals_serial_with_the_stop_active_and_under_a_budget() {
     }
 }
 
+/// v0.5 regression (post-v0.4 review §1.1): the DERIVED work budget must pool each query's OWN
+/// class stats, never the batch union's. Pre-v0.5, `prepare` pooled `d̄` over every class in the
+/// batch, so a Latin-only query co-batched with a CJK query saw CJK df stats folded into its
+/// derived `C` — a different budget, a different pruned selection, different candidates than
+/// `matches(q)` alone. The corpus makes the two script regimes deliberately dissimilar (dense CJK,
+/// sparse-to-mid Latin) so a union pool would visibly shift `d̄`.
+#[test]
+fn mixed_script_batch_equals_serial_for_the_derived_budget() {
+    let h = Harness::new();
+    {
+        let mut w = h.index.writer().unwrap();
+        for d in 1..=400i64 {
+            let body = if d <= 4 {
+                format!("zqxwvy plingorf common filler{d}")
+            } else if d <= 200 {
+                // A dense CJK regime: the same bigrams in half the corpus.
+                format!("日本語処理研究 filler{d}")
+            } else {
+                format!("common filler{d}")
+            };
+            w.upsert(d, &[("f", body.as_str())]).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    let queries = [
+        "zqxwvy plingorf common", // Latin-only: its derived C must not see CJK class stats
+        "日本語処理",             // CJK-only: and vice versa
+        "plingorf 日本語 common", // genuinely mixed: pools both (its own classes)
+    ];
+    // No caller df_budget → the corpus-derived C is in effect (the surface under test).
+    let opts = SearchOpts::new();
+    let reader = h.index.reader().unwrap();
+    let batched = reader.matches_batch(&queries, &opts, 20).unwrap();
+    for (i, q) in queries.iter().enumerate() {
+        let serial = h.index.reader().unwrap().matches(q, &opts, 20).unwrap();
+        assert_eq!(
+            ids(&serial),
+            ids(&batched[i]),
+            "a query's derived budget must be a pure function of its own tokens: {q:?}"
+        );
+    }
+}
+
 #[test]
 fn the_budget_still_finds_the_rare_docs() {
     // The bounded selection preserves recall for the in-budget grams: the rare docs are still found

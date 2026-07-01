@@ -156,3 +156,39 @@ fn too_short_query_uses_the_structural_bigram_fallback() {
     h.put(1, "f", "go team");
     assert!(hit(&h.search("go", 10).unwrap(), 1));
 }
+
+/// v0.5 regression (post-v0.4 review §1.2): an INTERIOR digit bigram must not trip a spurious
+/// secondary view on a clean query. In `ab12cd`, every primary trigram carries a Latin letter
+/// (class Latin), but the secondary bigram `12` has no strong script (class `Common`) — and
+/// `Common` never produces a primary-order gram in mixed text, so the pre-v0.5 per-class
+/// structural trigger (`produced == 0`) marked it starved and formed a secondary view for a fully
+/// corroborated query. Doc 2 shares only the sub-gram bigrams `12`/`cd` (no trigram), so it can
+/// surface only through that spurious secondary view.
+#[test]
+fn interior_digit_bigram_does_not_activate_the_secondary_view() {
+    let h = Harness::new();
+    h.put(1, "f", "ab12cd marker");
+    h.put(2, "f", "ee12ff ggcdhh"); // shares the bigrams "12" and "cd", but no trigram
+    h.put(3, "f", "unrelated control text");
+    let hits = h.search("ab12cd", 10).unwrap();
+    assert!(hit(&hits, 1), "the genuine doc matches via primary trigrams");
+    assert!(
+        !hit(&hits, 2),
+        "a digit-bigram coincidence must not leak into a clean digit-bearing query: {:?}",
+        ids(&hits)
+    );
+}
+
+/// The counterpart guard: a STANDALONE digit word (its word produced no primary gram) is still
+/// structurally starved, so pure- and mixed-query digit words keep their secondary-view signal
+/// (the v0.5 `Common` rule is word-granular, not a blanket exclusion).
+#[test]
+fn standalone_digit_word_still_reaches_the_secondary_view() {
+    let h = Harness::new();
+    h.put(1, "f", "xx 12 yy");
+    h.put(2, "f", "totally unrelated");
+    assert!(
+        hit(&h.search("12", 10).unwrap(), 1),
+        "a pure digit query still matches via the structural fallback"
+    );
+}

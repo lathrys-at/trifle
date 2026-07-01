@@ -393,16 +393,20 @@ fn e_max(n: f64, nu: f64) -> f64 {
 
 /// Per-gram query-side energy with a **precomputed** contamination floor — the hot-path form, so a
 /// per-query loop never recomputes the `df_min` `powf` (it is `N`/`ν`-constant across the batch).
-/// `E_g = ln((N − df_eff − κ)/(df_eff + κ))`, the RSJ logit-idf of the Jeffreys-smoothed, floored
-/// estimate (derivation §2/§4), with `df_eff = max(df, df_min)`. Negative for `p_eff > 0.5`
-/// (clamped to `0` at quantization); returns `−∞` for a gram present in (nearly) every segment,
-/// which [`quantize_energy`] maps to weight `0`.
+/// `E_g = ln((N − df_eff + κ)/(df_eff + κ))`, the RSJ log-odds of the **exact** Beta(κ,κ)
+/// posterior-mean presence rate `p̂ = (df_eff + κ)/(N + 2κ)` (Jeffreys smoothing at `κ = ½`,
+/// derivation §2/§4), with `df_eff = max(df, df_min)`. Negative for `p̂ > 0.5` (clamped to `0` at
+/// quantization) and **finite for every `df ∈ [0, N]`** — at `df = N` it is `ln(κ/(N + κ))`, so
+/// the pre-v0.5 `−∞` special case for a ubiquitous gram is dissolved (that was an artifact of the
+/// unnormalized `(N − df − κ)` numerator, undefined at `df ≥ N − κ`). The guard below is a pure
+/// out-of-contract backstop (`df > N + κ`, or `κ = 0` on a degenerate input), unreachable at the
+/// sanitized defaults; it degrades to weight `0` via [`quantize_energy`], recall-safe.
 fn energy_with_floor(df: f64, df_min: f64, n: f64, kappa: f64) -> f64 {
     let df_eff = df.max(df_min);
-    let num = n - df_eff - kappa;
+    let num = n - df_eff + kappa;
     let den = df_eff + kappa;
     if num <= 0.0 || den <= 0.0 {
-        return f64::NEG_INFINITY; // p_eff ≈ 1; logit → −∞, clamped to weight 0 at use
+        return f64::NEG_INFINITY; // out-of-contract backstop; weight 0 at use
     }
     (num / den).ln()
 }
@@ -413,7 +417,7 @@ fn energy(df: f64, n: f64, nu: f64, kappa: f64) -> f64 {
     energy_with_floor(df, df_min(n, nu), n, kappa)
 }
 
-/// Realized floored-gram energy `E_floored = ln((N − df_min − κ)/(df_min + κ)) ≤ E_max` — the
+/// Realized floored-gram energy `E_floored = ln((N − df_min + κ)/(df_min + κ)) ≤ E_max` — the
 /// energy every floored (`df ≤ df_min`) gram carries (derivation §4/§7). The §7 quantization guard
 /// `Δ < 2·E_floored` keeps `round(E_floored/Δ) ≥ 1`, so a floored gram never quantizes to `0`. For
 /// a tiny corpus this is small or negative — see [`prepare`]'s guard.
@@ -516,24 +520,41 @@ fn derived_budget(n_segments: u64, k_target: u64, r: f64, class_snap: &ClassSnap
 /// energies, none below `½·E_top`) trips the `commons.len() < 2` guard. Both are load-bearing:
 /// without them an all-common query would spuriously cap (to 0 in the ubiquitous case).
 ///
-/// `cap = max(0, (E_top − Σ_common max(0,E)) / (#common − 1))`. The hard floor at 0 (reached when
-/// the commons collectively outweigh the dominant gram) is the baseline; §9's smoother shrink
-/// toward the cap is a deferred tuning refinement.
+/// `cap = max(0, (E_top − Σ_common max(0,E)) / (#common − 1 + 1{anchor floored}))`. The hard floor
+/// at 0 (reached when the commons collectively outweigh the dominant gram) is the baseline; §9's
+/// smoother shrink toward the cap is a deferred tuning refinement.
 ///
-/// **Floored grams are NOT excluded from `E_top` — the literal §12 reading (v0.4/M6, resolved).**
-/// The cap ranges over *all* of `P`. This is deliberate: on a large corpus `df_min = √N` is a low
-/// bar, so a *genuinely rare, real* discriminating gram is itself floored (sits at `E_max`) — the
-/// common and valuable "find the doc with this rare term" query. Keeping it in `E_top` lets it
-/// anchor the cap, tightening μ so a commons-only doc cannot out-credit the on-topic doc (the strong
-/// case). Excluding floored grams (considered and rejected in M6) would instead *disable* the cap
-/// for exactly those queries — no non-floored dominant remains, so μ goes uncapped and the commons
-/// win. The price paid here is the rare *adversarial* case — a query pairing a junk floored gram
-/// (which loosens the cap) with a real *non-floored* discriminator — but a rare gram the user typed
-/// is almost always the intended discriminator, so that case is uncommon; §9 also frames such a
-/// distortion as "one the reranker undoes." The floored *exclusion* still governs which grams earn
-/// count credit (`popcount_credit`) and the M4 stop — just not the cap's `E_top`.
-fn concentration_cap(energies: &[f64]) -> Option<f64> {
-    let e_top = energies.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+/// **The denominator tracks the anchor's credit (v0.5 — resolves handoff flag #2).** The cap is
+/// derived from `score(on-topic) ≥ score(commons-doc)`. A **non-floored** dominant gram itself
+/// earns `μ`, so `E_top + μ ≥ Σ E_c + #c·μ` gives the `#c − 1` denominator. A **floored** anchor —
+/// the common case: `df_min = √N` floors genuinely-rare real grams — earns **no** credit (§9
+/// withholding), the inequality is `E_top ≥ Σ E_c + #c·μ`, and the tight cap divides by `#c`. The
+/// pre-v0.5 formula used `#c − 1` unconditionally, over-crediting a commons-only doc by exactly
+/// one `μ` past the floored-anchor doc — precisely the flag-#2 inversion (off-topic 8.09 vs
+/// on-topic 6.20). No ambiguity at the argmax: a floored gram carries `E_floored`, strictly above
+/// every non-floored energy, so ties never straddle the floored/non-floored boundary.
+///
+/// **Floored grams are NOT excluded from `E_top` — the literal §12 reading (v0.4/M6, resolved;
+/// unchanged in v0.5).** The cap ranges over *all* of `P`. This is deliberate: on a large corpus
+/// `df_min = √N` is a low bar, so a *genuinely rare, real* discriminating gram is itself floored
+/// (sits at `E_max`) — the common and valuable "find the doc with this rare term" query. Keeping
+/// it in `E_top` lets it anchor the cap, tightening μ so a commons-only doc cannot out-credit the
+/// on-topic doc (the strong case). Excluding floored grams (considered and rejected in M6) would
+/// instead *disable* the cap for exactly those queries — no non-floored dominant remains, so μ
+/// goes uncapped and the commons win. The denominator correction above is what makes the retained
+/// floored anchor actually *protect* its doc rather than merely bound the loss. The floored
+/// *exclusion* still governs which grams earn count credit (`popcount_credit`) and the M4 stop —
+/// just not the cap's `E_top`.
+fn concentration_cap(energies: &[f64], floored: &[bool]) -> Option<f64> {
+    debug_assert_eq!(energies.len(), floored.len());
+    let mut top: Option<usize> = None;
+    for (i, &e) in energies.iter().enumerate() {
+        if top.is_none_or(|t| e > energies[t]) {
+            top = Some(i);
+        }
+    }
+    let Some(top) = top else { return None };
+    let e_top = energies[top];
     if e_top <= 0.0 {
         return None; // no dominant rare gram (all-common / empty) — μ survives (§7/§9)
     }
@@ -543,7 +564,8 @@ fn concentration_cap(energies: &[f64]) -> Option<f64> {
         return None;
     }
     let sum_commons: f64 = commons.iter().map(|&e| e.max(0.0)).sum();
-    let cap = (e_top - sum_commons) / (commons.len() as f64 - 1.0);
+    let denom = commons.len() - 1 + usize::from(floored[top]);
+    let cap = (e_top - sum_commons) / denom as f64;
     Some(cap.max(0.0))
 }
 
@@ -581,11 +603,47 @@ fn prepare<T: Tokenizer>(
 ) -> Result<Vec<PlannedQuery>> {
     let (query_tokens, all_terms) = query_terms(queries, |q| index.distinct_tokens_tagged(q));
 
+    // Per-query class sets (v0.5, the batch==serial repair): `actual` is the query's own
+    // `(script, order)` classes — the pool the derived budget's `d̄` reflects, since it must
+    // represent the postings THIS query will scan, never a co-batched query's regime.
+    // `with_siblings` adds the ±1 sibling orders so the rank-view ΔH vocabulary lookups
+    // (`view_weights_from_dh`) resolve identically solo or batched (a structural-fallback query
+    // produces only one order but weighs both). The batch snapshot below is the union — a
+    // superset is harmless because every entry is a global corpus statistic; only *pool
+    // membership* was ever a leak.
+    let q_classes: Vec<(FxHashSet<(u8, u8)>, FxHashSet<(u8, u8)>)> = query_tokens
+        .iter()
+        .map(|q| {
+            let mut actual: FxHashSet<(u8, u8)> = FxHashSet::default();
+            let mut with_siblings: FxHashSet<(u8, u8)> = FxHashSet::default();
+            for (tok, _) in q {
+                if let Some(t) = tok.term() {
+                    let (c, o) = (t.class(), t.order());
+                    actual.insert((c, o));
+                    with_siblings.insert((c, o));
+                    if o >= 2 {
+                        with_siblings.insert((c, o - 1));
+                    }
+                    if o < 3 {
+                        with_siblings.insert((c, o + 1));
+                    }
+                }
+            }
+            (actual, with_siblings)
+        })
+        .collect();
+    let batch_classes: FxHashSet<(u8, u8)> = q_classes
+        .iter()
+        .flat_map(|(_, ws)| ws.iter().copied())
+        .collect();
+
     // Resolve terms in memory + capture the dict generation atomically, then read the snapshot's
     // stored generation (the tx pins the WAL snapshot) to compare. A skew means a concurrent
     // rebuild/reset reassigned term-ids vs this snapshot — surface as retryable Busy (the store
     // is the consistent new generation; the caller retries on a fresh reader). No internal retry.
-    let (resolved, gen_mem, class_snap) = index.dict.resolve_terms(&all_terms);
+    let (resolved, gen_mem, class_snap) = index
+        .dict
+        .resolve_terms(&all_terms, batch_classes.iter().copied());
     let gen_snap = schema::dict_generation(conn, ns)?;
     if gen_snap != gen_mem {
         return Err(Error::busy(
@@ -654,16 +712,13 @@ fn prepare<T: Tokenizer>(
     // `batch == serial`.
     let df_min_batch = df_min(n_segments as f64, nu);
 
-    // v0.4/M6 (§5/§7): the work budget `C` defaults to the corpus-derived Lagrangian dual of the §5
-    // stop — a caller-supplied `df_budget` overrides it, else the derived budget, else `None`
-    // (unbounded on a degenerate corpus). Pure function of the shared snapshot (N, k, σ, the query's
-    // class stats) ⇒ batch == serial.
-    let derived_c = derived_budget(n_segments, k_target, index.sigma, &class_snap);
-    let df_budget = opts.df_budget.or(derived_c);
-    let sel_params = SelectParams {
+    // The knob-derived selection parameters shared by every query; the work budget `C` is filled
+    // in **per query** below (v0.5) — it pools the query's own class stats, so it cannot be a
+    // batch constant without breaking `batch == serial`.
+    let base_sel = SelectParams {
         min_shared,
         typo_damage: TYPO_DAMAGE,
-        df_budget,
+        df_budget: None,
         c_margin,
         k_target,
         n_segments,
@@ -691,16 +746,28 @@ fn prepare<T: Tokenizer>(
     // query runs PRIMARY-ONLY unless a present script is STARVED — too few/too weak primary grams,
     // or none at all (a query too short to produce the primary, the structural fallback) — in which
     // case the secondary view also runs and the two are RRF-fused (§8/§12). The single-view path is
-    // exactly the M1–M4 pipeline, so clean queries pay nothing for §8. Selection/starvation/ΔH are
-    // pure functions of THIS query's grams + the shared per-batch snapshot ⇒ `batch == serial`.
+    // exactly the M1–M4 pipeline, so clean queries pay nothing for §8.
+    //
+    // Everything class-derived is **per query** (v0.5): the query's own snapshot view (`subset`),
+    // the derived work budget `C` (§5/§7 — the corpus-derived Lagrangian dual of the §5 stop,
+    // pooling ONLY this query's classes; a caller-supplied `df_budget` overrides it, else `None`/
+    // unbounded on a degenerate corpus), and selection/starvation/ΔH — all pure functions of THIS
+    // query's grams + the shared per-batch snapshot ⇒ `batch == serial`.
     let planned_sel: Vec<ViewSel<T::Token>> = query_tokens
         .iter()
-        .map(|q| {
+        .zip(&q_classes)
+        .map(|(q, (actual, with_siblings))| {
+            let q_snap = class_snap.subset(with_siblings, actual);
+            let derived_c = derived_budget(n_segments, k_target, index.sigma, &q_snap);
+            let sel_params = SelectParams {
+                df_budget: opts.df_budget.or(derived_c),
+                ..base_sel
+            };
             plan_views(
                 q,
                 &resolve,
                 &index.tokenizer,
-                &class_snap,
+                &q_snap,
                 sel_params,
                 df_min_batch,
                 n_segments,
@@ -836,13 +903,27 @@ fn plan_views<T: Tokenizer>(
     let mut produced_primary_count: FxHashMap<u8, u32> = FxHashMap::default();
     let mut primary_present_count: FxHashMap<u8, u32> = FxHashMap::default();
     let mut full_primary_e: FxHashMap<u8, f64> = FxHashMap::default();
+    // Word-granular coverage for the `Common` structural rule (v0.5, see `starved_scripts`):
+    // which query words produced ≥ 1 primary-order gram, and which words own a `Common`-class
+    // gram. A `Common` gram is usually an *interior* fragment of a strong-script run (digits
+    // inherit the run they sit in — `"12"` inside `ab12cd`), whose word IS primary-covered.
+    let mut word_has_primary: FxHashSet<u32> = FxHashSet::default();
+    let mut common_words: FxHashSet<u32> = FxHashSet::default();
     for (tok, word) in q {
-        let class = tok.term().map(|t| t.class()).unwrap_or(0);
+        // An unencodable token (over the 3-codepoint ceiling / NUL) has no term and rides along
+        // absent (df 0); `Common` is the `script_of`-consistent class for "no strong script".
+        let class = tok
+            .term()
+            .map(|t| t.class())
+            .unwrap_or(crate::term::COMMON_CLASS);
         let df = resolve(tok).map_or(0, |(_, df)| df);
         let order = tok.borrow().chars().count() as u8;
         let energy = energy_with_floor(df.max(0) as f64, df_min_batch, n_segments as f64, kappa);
         let floored = (df.max(0) as f64) <= df_min_batch;
         present_scripts.insert(class);
+        if class == crate::term::COMMON_CLASS {
+            common_words.insert(*word);
+        }
         // A gram is SECONDARY iff its order is one shorter than its script's primary order (the
         // tokenizer owns the per-script policy; a single-order tokenizer returns `u8::MAX`, so no
         // gram is ever secondary and the secondary view never forms).
@@ -861,6 +942,7 @@ fn plan_views<T: Tokenizer>(
             secondary_rows.push(row);
         } else {
             *produced_primary_count.entry(class).or_insert(0) += 1;
+            word_has_primary.insert(*word);
             if df > 0 {
                 *primary_present_count.entry(class).or_insert(0) += 1;
                 *full_primary_e.entry(class).or_insert(0.0) += energy.max(0.0);
@@ -881,7 +963,15 @@ fn plan_views<T: Tokenizer>(
     }
     // starved(s): bring in the secondary view when EITHER
     //   • STRUCTURAL — the script produced no primary gram at all (the query is too short to make
-    //     one: a 2-char Latin / 1-char CJK run), so the shorter order is the only signal; OR
+    //     one: a 2-char Latin / 1-char CJK run), so the shorter order is the only signal. For the
+    //     `Common` class the trigger is **word-granular** (v0.5): `Common` grams are usually
+    //     interior fragments of a strong-script run (digits inherit the run — the `"12"` bigram
+    //     inside `ab12cd` classes `Common` while every primary trigram classes Latin), so "the
+    //     class produced no primary gram" is spuriously true for almost any digit-bearing clean
+    //     query. `Common` is structurally starved only when some `Common` gram's *word* produced
+    //     no primary gram at all (a standalone digit/symbol word like the `12` in `hello 12`,
+    //     whose content genuinely has no primary-order signal) — an interior fragment whose word
+    //     is primary-covered never trips a spurious secondary view; OR
     //   • CORROBORATIVE — the script has ≥1 in-corpus primary gram but it is too thin to stand
     //     alone (`< ν` distinct in-corpus primary grams, or the budget pruned most of the primary
     //     energy — `collected_energy_far_below`, §5/§12), so the shorter order corroborates.
@@ -904,7 +994,12 @@ fn plan_views<T: Tokenizer>(
             let present = primary_present_count.get(&s).copied().unwrap_or(0);
             let fe = full_primary_e.get(&s).copied().unwrap_or(0.0);
             let ce = collected_primary_e.get(&s).copied().unwrap_or(0.0);
-            let structural = produced == 0;
+            let structural = if s == crate::term::COMMON_CLASS {
+                // Word-granular (see above): an interior digit fragment is primary-covered.
+                common_words.iter().any(|w| !word_has_primary.contains(w))
+            } else {
+                produced == 0
+            };
             let corroborative = present >= 1
                 && ((present as f64) < nu || (fe > 0.0 && ce < STARVED_ENERGY_RATIO * fe));
             structural || corroborative
@@ -1054,7 +1149,7 @@ fn build_view_plan<T: Tokenizer>(
         .iter()
         .map(|t| t.chars().count() as u8)
         .collect();
-    let mu_capped = match concentration_cap(&energies) {
+    let mu_capped = match concentration_cap(&energies, &present_floored) {
         Some(cap) => mu.min(cap),
         None => mu,
     };
@@ -1171,8 +1266,10 @@ impl Provenance<'_> {
 /// Fold one candidate into the per-key best-float map, keeping the **max-`corrected_score`**
 /// segment per caller key (derivation §7's float top-k). `corrected` is precomputed (cheap, no
 /// allocation), so the [`Candidate`] — which clones `key`/`label` — is materialized **only on an
-/// insert or a strict win**, never for a loser (the engine-review (4) cost note). Deterministic
-/// only via the later sort tiebreak; this map itself is order-free.
+/// insert or a strict win**, never for a loser (the engine-review (4) cost note). Returns whether
+/// the candidate was accepted (inserted or strictly won) — the eager path feeds accepted events
+/// to its [`TopK`] tracker. Deterministic only via the later sort tiebreak; this map itself is
+/// order-free.
 #[allow(clippy::too_many_arguments)]
 fn upsert_best(
     best: &mut FxHashMap<Key, (Candidate, f64)>,
@@ -1185,7 +1282,7 @@ fn upsert_best(
     energy: f64,
     count: f64,
     length: f64,
-) {
+) -> bool {
     let build = || Candidate {
         key: key.clone(),
         label: label.to_string(),
@@ -1201,23 +1298,119 @@ fn upsert_best(
         Some(slot) => {
             if corrected > slot.1 {
                 *slot = (build(), corrected);
+                true
+            } else {
+                false
             }
         }
         None => {
             best.insert(key.clone(), (build(), corrected));
+            true
         }
     }
 }
 
-/// The `k`-th **largest** float in `vals` (1-indexed: `k = 1` is the max). `O(n)` via
-/// `select_nth_unstable`. The caller guarantees `1 ≤ k ≤ vals.len()`; used only for the eager
-/// early-stop's `kth_best_float` ceiling.
-fn kth_largest(vals: &[f64], k: usize) -> f64 {
-    debug_assert!(k >= 1 && k <= vals.len());
-    let mut v = vals.to_vec();
-    let idx = k - 1;
-    v.select_nth_unstable_by(idx, |a, b| b.total_cmp(a));
-    v[idx]
+/// An `f64` with a total order (`f64::total_cmp`), for the [`TopK`] heap.
+#[derive(Clone, Copy, PartialEq)]
+struct TotalF64(f64);
+impl Eq for TotalF64 {}
+impl PartialOrd for TotalF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TotalF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// Incremental top-`k` tracker over per-key best floats — the eager early-stop's `kth_best`
+/// ceiling (derivation §7). v0.5: replaces the per-qualifying-chunk `O(n)` `kth_largest`
+/// recompute (worst `O(union²/CHUNK)` on a deep-`k` query) with amortized `O(log n)` per event
+/// and an amortized-`O(1)` [`kth_best`](Self::kth_best) read; no per-check allocation.
+///
+/// Keys are interned to dense `u32` slots (one `Key` clone per distinct key). The scheme is a
+/// **lazy min-heap over the current top set**: `in_top` holds the top-`k` slots; the heap holds
+/// every `(value, slot)` event accepted for a top slot, and an entry is stale iff its slot left
+/// the top set or its slot's value moved past it — both detected (and popped) on peek. Soundness
+/// leans on the caller's invariant that a key's value only ever **increases** (the per-key best
+/// is max-folded), so a slot's older entries are always strictly below its current value.
+struct TopK {
+    k: usize,
+    /// key → dense slot id.
+    slots: FxHashMap<Key, u32>,
+    /// Current value per slot (the staleness oracle).
+    vals: Vec<f64>,
+    /// The slots currently in the top-`k` set (`len == min(k, #keys)`).
+    in_top: FxHashSet<u32>,
+    /// Min-heap of `(value, slot)` events for top slots; lazily invalidated.
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(TotalF64, u32)>>,
+}
+
+impl TopK {
+    fn new(k: usize) -> Self {
+        TopK {
+            k,
+            slots: FxHashMap::default(),
+            vals: Vec::new(),
+            in_top: FxHashSet::default(),
+            heap: std::collections::BinaryHeap::new(),
+        }
+    }
+
+    /// Fold one accepted per-key event (an insert, or a strictly-improved best) into the tracker.
+    fn observe(&mut self, key: &Key, v: f64) {
+        let slot = match self.slots.get(key) {
+            Some(&s) => {
+                debug_assert!(v > self.vals[s as usize], "per-key bests only increase");
+                self.vals[s as usize] = v;
+                s
+            }
+            None => {
+                let s = self.vals.len() as u32;
+                self.slots.insert(key.clone(), s);
+                self.vals.push(v);
+                s
+            }
+        };
+        if self.in_top.contains(&slot) {
+            // An improved top member: push the new live entry (the old one is now stale).
+            self.heap.push(std::cmp::Reverse((TotalF64(v), slot)));
+        } else if self.in_top.len() < self.k {
+            self.in_top.insert(slot);
+            self.heap.push(std::cmp::Reverse((TotalF64(v), slot)));
+        } else if self.peek_valid().is_some_and(|(min_v, _)| v > min_v) {
+            // Promote: displace the top set's current minimum (its live entry is the peek).
+            let (_, min_slot) = self.peek_valid().expect("just checked");
+            self.heap.pop();
+            self.in_top.remove(&min_slot);
+            self.in_top.insert(slot);
+            self.heap.push(std::cmp::Reverse((TotalF64(v), slot)));
+        }
+        // else: v ≤ the k-th best — the top set is unchanged; the event needs no entry (the key
+        // re-enters consideration only via a future, larger event).
+    }
+
+    /// The current `k`-th largest per-key best, or `None` while fewer than `k` keys are tracked.
+    fn kth_best(&mut self) -> Option<f64> {
+        if self.in_top.len() < self.k {
+            return None;
+        }
+        self.peek_valid().map(|(v, _)| v)
+    }
+
+    /// The heap's minimum **live** entry (popping stale ones): the smallest value in the top set.
+    fn peek_valid(&mut self) -> Option<(f64, u32)> {
+        while let Some(&std::cmp::Reverse((TotalF64(v), slot))) = self.heap.peek() {
+            let live = self.in_top.contains(&slot) && self.vals[slot as usize] == v;
+            if live {
+                return Some((v, slot));
+            }
+            self.heap.pop();
+        }
+        None
+    }
 }
 
 /// Hydrate text + span for exactly `kept` in ONE batched `WHERE id IN rarray(?1)` read.
@@ -1314,6 +1507,8 @@ fn score_union(
     let mut walk = counter.walk();
     // Max-corrected candidate per caller key, accumulated over the union.
     let mut best: FxHashMap<Key, (Candidate, f64)> = FxHashMap::default();
+    // The eager path's incremental `kth_best` tracker (fed by accepted `upsert_best` events).
+    let mut topk = limit.map(TopK::new);
     // Seg ids the walk yielded — completes only when the walk exhausts; gates the U_zero pass so a
     // seg matching both weight-0 and positive grams is not double-recovered.
     let mut seen_segs: FxHashSet<u32> = FxHashSet::default();
@@ -1353,10 +1548,14 @@ fn score_union(
                     if corrected > max_float_seen {
                         max_float_seen = corrected;
                     }
-                    upsert_best(
+                    if upsert_best(
                         &mut best, key, label, s.id, s.score, s.overlap, corrected, energy, count,
                         length,
-                    );
+                    ) {
+                        if let Some(t) = topk.as_mut() {
+                            t.observe(key, corrected);
+                        }
+                    }
                 }
             }
         }
@@ -1369,19 +1568,16 @@ fn score_union(
                 match counter.advance(&mut walk) {
                     Some(s) => {
                         let bound = s.score as f64 * delta + cred_max;
-                        // Cheap gate first (kth_best ≤ max_float_seen): only then pay kth_largest.
-                        // PERF (deferred, derivation §7): this per-qualifying-chunk `kth_largest`
-                        // recompute is a KNOWN, BOUNDED cost — worst `O(union²/CHUNK)` on a deep-k
-                        // query where the stop never fires (the cheap gate then never opens, so the
-                        // worst case is mostly avoided), ~0 for a shallow k, cardinality-independent
-                        // (so flatness holds), and dominated by the per-chunk `O(union)` SQL. A
-                        // bounded top-k min-heap / memoized `kth_best` is a focused perf follow-up;
-                        // it is deliberately NOT done here to avoid churning the verified reshape.
+                        // Cheap gate first (kth_best ≤ max_float_seen): only then consult the
+                        // incremental tracker (v0.5 — replaces the per-qualifying-chunk `O(n)`
+                        // `kth_largest` recompute, worst `O(union²/CHUNK)` on a deep-k query,
+                        // with an amortized-`O(1)` read; no per-check allocation).
                         if bound < max_float_seen {
-                            let vals: Vec<f64> = best.values().map(|(_, f)| *f).collect();
-                            if bound < kth_largest(&vals, lim) {
-                                early_stopped = true;
-                                break;
+                            if let Some(kth) = topk.as_mut().and_then(TopK::kth_best) {
+                                if bound < kth {
+                                    early_stopped = true;
+                                    break;
+                                }
                             }
                         }
                         pending = Some(s);
@@ -1767,12 +1963,14 @@ mod energy_tests {
     }
 
     #[test]
-    fn energy_matches_logit_idf_by_hand() {
+    fn energy_matches_the_exact_jeffreys_posterior_log_odds_by_hand() {
         let n = 10_000.0_f64;
-        // df = 1000 (> df_min = 100): E = ln((N − df − κ)/(df + κ)).
+        // df = 1000 (> df_min = 100): E = ln((N − df + κ)/(df + κ)) — the log-odds of the exact
+        // Beta(κ,κ) posterior mean p̂ = (df + κ)/(N + 2κ) (v0.5; the pre-v0.5 −κ numerator was
+        // the unnormalized approximation, undefined at df ≥ N − κ).
         approx(
             energy(1_000.0, n, NU, KAPPA),
-            ((n - 1_000.0 - 0.5) / (1_000.0 + 0.5)).ln(),
+            ((n - 1_000.0 + 0.5) / (1_000.0 + 0.5)).ln(),
         );
         // A gram at or below df_min is floored to df_min, so it carries E_floored exactly.
         approx(energy(100.0, n, NU, KAPPA), e_floored(n, NU, KAPPA)); // df == df_min boundary
@@ -1780,11 +1978,16 @@ mod energy_tests {
     }
 
     #[test]
-    fn energy_is_nonpositive_for_common_grams() {
+    fn energy_is_nonpositive_for_common_grams_and_finite_at_df_equals_n() {
         let n = 1_000.0;
         assert!(energy(500.0, n, NU, KAPPA) <= 1e-9); // p ≈ 0.5 ⇒ logit ≈ 0
         assert!(energy(900.0, n, NU, KAPPA) < 0.0); // p > 0.5 ⇒ negative
-        assert_eq!(energy(1_000.0, n, NU, KAPPA), f64::NEG_INFINITY); // in every segment ⇒ −∞
+        // A ubiquitous gram (df = N) has FINITE energy under the exact posterior form (v0.5):
+        // E = ln(κ/(N + κ)) — deeply negative, quantized to weight 0, but no −∞ special case.
+        let ubiquitous = energy(1_000.0, n, NU, KAPPA);
+        assert!(ubiquitous.is_finite(), "df = N is finite: {ubiquitous}");
+        approx(ubiquitous, (0.5 / (n + 0.5)).ln());
+        assert_eq!(super::quantize_energy(ubiquitous, 0.5), 0);
     }
 
     #[test]
@@ -1899,12 +2102,14 @@ mod energy_tests {
 
     #[test]
     fn quantization_guard_degrades_safely_on_a_tiny_corpus() {
-        // On N = 4 the floored energy is negative, so the guard cannot hold and is intentionally
-        // skipped (E_floored < GUARD_MIN_E_FLOORED). The floored weight quantizes to 0; recall is
-        // preserved not here but by the §7 count-only union (`score_union`) recovering the seg.
+        // On N = 4 the floored energy is non-positive (exactly 0 under the exact posterior form:
+        // df_min = 2 ⇒ ln((4 − 2 + κ)/(2 + κ)) = ln 1), so the guard cannot hold and is
+        // intentionally skipped (E_floored < GUARD_MIN_E_FLOORED). The floored weight quantizes
+        // to 0; recall is preserved not here but by the §7 count-only union (`score_union`)
+        // recovering the seg.
         let n = 4.0;
         let ef = e_floored(n, NU, KAPPA);
-        assert!(ef < 0.0, "E_floored negative at N=4: {ef}");
+        assert!(ef <= 0.0, "E_floored non-positive at N=4: {ef}");
         assert!(
             ef < GUARD_MIN_E_FLOORED,
             "guard correctly skipped (tiny corpus)"
@@ -1946,9 +2151,10 @@ mod credit_tests {
         assert!((a - b).abs() < 1e-6, "expected ≈ {b}, got {a}");
     }
 
-    /// Thin alias for [`concentration_cap`] keeping the fixtures concise.
+    /// Thin alias for [`concentration_cap`] with an all-non-floored flag vector, keeping the
+    /// (majority) non-floored-anchor fixtures concise.
     fn cap(energies: &[f64]) -> Option<f64> {
-        concentration_cap(energies)
+        concentration_cap(energies, &vec![false; energies.len()])
     }
 
     #[test]
@@ -2032,8 +2238,9 @@ mod credit_tests {
 
     #[test]
     fn cap_neg_infinity_commons_contribute_zero_no_nan() {
-        // df = N ubiquitous grams carry −∞ energy: they count as commons (`< ½·E_top`) but
-        // contribute `max(0,−∞) = 0` to the sum, so the cap stays finite (no NaN).
+        // Extreme-negative energies (a degenerate/backstop input; in-contract v0.5 energies are
+        // finite even at df = N) count as commons (`< ½·E_top`) but contribute `max(0,−∞) = 0`
+        // to the sum, so the cap stays finite (no NaN).
         let c = cap(&[5.0, f64::NEG_INFINITY, f64::NEG_INFINITY]).expect("2 commons");
         approx(c, 5.0); // (5 − 0)/(2 − 1)
         assert!(c.is_finite());
@@ -2048,15 +2255,48 @@ mod credit_tests {
     fn cap_floored_e_top_anchors_and_protects_the_rare_gram() {
         // Literal §12 (§9/§12, v0.4/M6, resolved): a genuinely-rare, real discriminating gram is
         // itself FLOORED (df ≤ √N, so it sits at E_max ≈ 6.9) — the common "find the doc with this
-        // rare term" query. Because floored grams are NOT excluded, that 6.9 anchors `E_top`: with
-        // two commons at 0.5, cap = (6.9 − 1.0)/(2 − 1) = 5.9, a healthy budget that still bounds μ
-        // so a commons-only doc cannot out-credit the on-topic doc. (Excluding the floored gram —
-        // considered and rejected — would drop `E_top` to 0.5, leave no dominant, and DISABLE the
-        // cap for exactly this query, letting the commons win.)
+        // rare term" query. Because floored grams are NOT excluded, that 6.9 anchors `E_top`; and
+        // because a floored anchor earns NO credit itself (§9 withholding), the tight inequality
+        // is `E_top ≥ Σ E_c + #c·μ`, so the denominator is `#c` (v0.5 — resolves flag #2): with
+        // two commons at 0.5, cap = (6.9 − 1.0)/2 = 2.95. At that cap, a two-commons-only doc
+        // scores Σ E_c + 2μ ≤ 6.9 = the on-topic doc's E_top — protected, not merely bounded.
+        // (Excluding the floored gram — considered and rejected — would drop `E_top` to 0.5,
+        // leave no dominant, and DISABLE the cap for exactly this query, letting the commons win.)
         approx(
-            concentration_cap(&[6.9, 0.5, 0.5]).expect("the floored rare gram anchors E_top"),
-            5.9,
+            concentration_cap(&[6.9, 0.5, 0.5], &[true, false, false])
+                .expect("the floored rare gram anchors E_top"),
+            2.95,
         );
+    }
+
+    #[test]
+    fn cap_denominator_resolves_the_flag_2_inversion() {
+        // The recorded M2-panel inversion (handoff flag #2): an off-topic commons doc scored 8.09
+        // vs the on-topic floored-anchor doc's 6.20. Mechanism: the pre-v0.5 `#c − 1` denominator
+        // assumes the anchor ALSO earns μ; a floored anchor earns none, so a commons doc could
+        // out-credit it by exactly one μ. With the `#c` denominator, the commons doc's best score
+        // Σ E_c + #c·cap = E_top never exceeds the anchored doc's.
+        let (e_top, commons) = (6.2_f64, [0.9_f64, 0.8, 0.7]);
+        let energies = [e_top, commons[0], commons[1], commons[2]];
+        let floored = [true, false, false, false];
+        let sum_c: f64 = commons.iter().sum();
+        let cap_new = concentration_cap(&energies, &floored).expect("concentrated");
+        approx(cap_new, (e_top - sum_c) / 3.0); // #c = 3 (anchor floored)
+        let commons_doc = sum_c + 3.0 * cap_new;
+        assert!(
+            commons_doc <= e_top + 1e-9,
+            "commons-only doc ({commons_doc}) can no longer out-credit the on-topic doc ({e_top})"
+        );
+        // The old denominator (#c − 1) permitted exactly the inversion:
+        let cap_old = (e_top - sum_c) / 2.0;
+        assert!(
+            sum_c + 3.0 * cap_old > e_top,
+            "the pre-v0.5 cap admitted the inversion this test pins the fix for"
+        );
+        // A NON-floored anchor keeps the #c − 1 denominator (it earns μ itself).
+        let cap_unfloored =
+            concentration_cap(&energies, &[false; 4]).expect("concentrated");
+        approx(cap_unfloored, (e_top - sum_c) / 2.0);
     }
 
     #[test]
@@ -2163,11 +2403,10 @@ mod budget_tests {
 
 #[cfg(test)]
 mod null_tests {
-    //! Numerical fixtures for the v0.4 M3 §6 saturating length null and the eager early-stop's
-    //! `kth_largest` ceiling: the `rel_len = 0` no-op, the separable rare-gram slope, the commons'
-    //! saturating `π_g` (incl. `p = 1` full debit), the rare linear over-debit direction, length
-    //! monotonicity, and k-th-largest selection.
-    use super::{kth_largest, length_null};
+    //! Numerical fixtures for the v0.4 M3 §6 saturating length null: the `rel_len = 0` no-op, the
+    //! separable rare-gram slope, the commons' saturating `π_g` (incl. `p = 1` full debit), the
+    //! rare linear over-debit direction, and length monotonicity.
+    use super::length_null;
 
     fn approx(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-6, "expected ≈ {b}, got {a}");
@@ -2228,13 +2467,103 @@ mod null_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod topk_tests {
+    //! The v0.5 incremental top-`k` tracker behind the eager early-stop's `kth_best` ceiling:
+    //! oracle agreement under inserts and per-key increases (the two event kinds `upsert_best`
+    //! emits), promotion/demotion through the top set, and the not-yet-full `None`.
+    use super::TopK;
+    use crate::model::Key;
+
+    /// The `k`-th largest of the current per-key values, by sort (the oracle).
+    fn oracle(vals: &[(i64, f64)], k: usize) -> Option<f64> {
+        if vals.len() < k {
+            return None;
+        }
+        let mut v: Vec<f64> = vals.iter().map(|&(_, x)| x).collect();
+        v.sort_by(|a, b| b.total_cmp(a));
+        Some(v[k - 1])
+    }
+
     #[test]
-    fn kth_largest_selects_the_descending_position() {
-        let v = [3.0, 1.0, 5.0, 2.0, 4.0];
-        approx(kth_largest(&v, 1), 5.0); // the max
-        approx(kth_largest(&v, 2), 4.0);
-        approx(kth_largest(&v, 5), 1.0); // the min
-        approx(kth_largest(&[7.0], 1), 7.0);
+    fn tracks_the_kth_best_under_inserts_and_promotions() {
+        let mut t = TopK::new(3);
+        let mut state: Vec<(i64, f64)> = Vec::new();
+        assert_eq!(t.kth_best(), None, "empty");
+        for (key, v) in [(1, 5.0), (2, 3.0)] {
+            t.observe(&Key::Integer(key), v);
+            state.push((key, v));
+            assert_eq!(t.kth_best(), None, "fewer than k keys");
+        }
+        // Fill to k, then stream a mix of new keys (some below the kth, some promoting).
+        for (key, v) in [(3, 4.0), (4, 1.0), (5, 6.0), (6, 3.5), (7, 4.5)] {
+            t.observe(&Key::Integer(key), v);
+            state.push((key, v));
+            assert_eq!(t.kth_best(), oracle(&state, 3), "after inserting {key}={v}");
+        }
+    }
+
+    #[test]
+    fn per_key_increases_update_in_place_and_can_promote() {
+        let mut t = TopK::new(2);
+        let mut state: Vec<(i64, f64)> = vec![(1, 5.0), (2, 4.0), (3, 1.0)];
+        for &(k, v) in &state {
+            t.observe(&Key::Integer(k), v);
+        }
+        assert_eq!(t.kth_best(), oracle(&state, 2)); // {5, 4} → 4
+        // A top member improves: kth unchanged (it was the max's peer), stale entry ignored.
+        t.observe(&Key::Integer(2), 4.5);
+        state[1].1 = 4.5;
+        assert_eq!(t.kth_best(), oracle(&state, 2)); // {5, 4.5} → 4.5
+        // A non-top key improves past the kth: promoted, demoting the previous kth.
+        t.observe(&Key::Integer(3), 4.8);
+        state[2].1 = 4.8;
+        assert_eq!(t.kth_best(), oracle(&state, 2)); // {5, 4.8} → 4.8
+        // The demoted key re-improves and re-promotes (stale entries from both phases ignored).
+        t.observe(&Key::Integer(2), 6.0);
+        state[1].1 = 6.0;
+        assert_eq!(t.kth_best(), oracle(&state, 2)); // {6, 5} → 5
+    }
+
+    #[test]
+    fn k_of_one_tracks_the_max() {
+        let mut t = TopK::new(1);
+        t.observe(&Key::Integer(1), 2.0);
+        assert_eq!(t.kth_best(), Some(2.0));
+        t.observe(&Key::Integer(2), 1.0); // below — ignored
+        assert_eq!(t.kth_best(), Some(2.0));
+        t.observe(&Key::Integer(2), 9.0); // promotes
+        assert_eq!(t.kth_best(), Some(9.0));
+        t.observe(&Key::Integer(1), 11.0); // the demoted key re-promotes
+        assert_eq!(t.kth_best(), Some(11.0));
+    }
+
+    #[test]
+    fn randomized_stream_agrees_with_the_oracle() {
+        // A deterministic pseudo-random stream of inserts + increases across ks.
+        for k in [1usize, 2, 5, 8] {
+            let mut t = TopK::new(k);
+            let mut state: Vec<(i64, f64)> = Vec::new();
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in 0..500 {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let key = (x >> 33) as i64 % 40;
+                let bump = ((x >> 11) & 0xFFF) as f64 / 256.0 + 1e-3;
+                match state.iter_mut().find(|(k2, _)| *k2 == key) {
+                    Some(slot) => {
+                        slot.1 += bump; // strictly increases (the upsert_best contract)
+                        t.observe(&Key::Integer(key), slot.1);
+                    }
+                    None => {
+                        state.push((key, bump));
+                        t.observe(&Key::Integer(key), bump);
+                    }
+                }
+                assert_eq!(t.kth_best(), oracle(&state, k), "step {i}, k={k}");
+            }
+        }
     }
 }
 

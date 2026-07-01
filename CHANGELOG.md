@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.5.0
+
+The post-v0.4.0 review rollup: two correctness fixes to load-bearing invariants, two mathematical
+corrections that make the derivation's claims exact, the v0.4.1 performance items, and a breaking
+API cleanup that removes the last v0.3 legacy. Purely a **runtime** release for the store — no
+`SCHEMA_VERSION` change and no storage-format change — but the `DefaultTokenizer` fingerprint is
+unchanged while the `NgramTokenizer` fingerprint gains a layout-version byte, so **NgramTokenizer
+caches drift-reset once** on open (drop + rebuild, never migrate); `DefaultTokenizer` caches are
+untouched.
+
+### Correctness
+
+- **`batch == serial` restored for mixed-script batches.** The derived work budget `C` pooled its
+  representative df `d̄` over the *batch-union* class snapshot, so a Latin-only query co-batched
+  with a CJK query derived a different `C` — and could select and rank differently — than the same
+  query alone. `C` (and the rank-view `ΔH` lookups, a second membership-dependent leak) are now
+  pure functions of each query's own classes. Multi-query `matches_batch` rankings may move — to
+  their documented per-query values.
+- **Interior digit/symbol fragments no longer trip a spurious secondary rank-view.** In a clean
+  query like `ab12cd`, the `Common`-class bigram `12` marked the `Common` "script" structurally
+  starved (it never produces a primary-order gram in mixed text), fusing a bigram view into a
+  fully-corroborated query — a digit-bigram coincidence could then evict a genuine match under a
+  tight `limit`. The `Common` structural trigger is now **word-granular**: an interior fragment
+  whose word has primary coverage is not starvation; a standalone digit word still is.
+- **Malformed meta counters fail closed.** A present-but-unparseable `next_id` or
+  `dict_generation` is now `Error::Corrupt` (mid-operation) or a desync reset (at open) instead of
+  silently defaulting — a defaulted `next_id` would *reuse* segment ids.
+- **Duplicate labels within one `upsert` call resolve last-wins** (equivalent to sequential
+  upserts). Previously debug-asserted; release builds permanently leaked the superseded segment's
+  posting entries (df drift + a dead id per shared token until rebuild).
+
+### Scoring (rank-affecting, both in the recall-safe direction)
+
+- **Exact Jeffreys posterior log-odds energy**: `E_g = ln((N − df + κ)/(df + κ))` — the log-odds
+  of the exact Beta(κ,κ) posterior mean — replaces the unnormalized `−κ` numerator, which was
+  undefined at `df ≥ N − κ` and needed a `−∞` special case. Finite for every `df ≤ N`; differences
+  concentrate in the common tail the `max(0,·)` clamp zeroes anyway.
+- **The §9 concentration-cap denominator tracks the anchor's credit**:
+  `#common − 1 + 1{anchor floored}`. A floored dominant gram earns no count credit itself, so the
+  old `#common − 1` over-credited a commons-only doc by exactly one `μ` past the on-topic doc —
+  the recorded 8.09-vs-6.20 inversion (v0.4 handoff flag #2), now resolved. Floored grams remain
+  eligible to anchor `E_top` (the v0.4/M6 ruling stands).
+- Sparse-class rarity now falls back to a **z-score against the query's pooled `ln df` stats**
+  (then `ln df`), never raw df — raw df interleaved incommensurably with other classes' z-scores
+  in one sort key.
+
+### Performance (no behavior change)
+
+- The engine seam is fused: `trifle-overlap` is **energy-only** (it no longer retains a deep copy
+  of every posting nor runs its own raw-overlap `contains` sweep); `search.rs` computes raw
+  overlap + count credit + the floor gate in **one** `contains` pass per candidate, before any
+  provenance SQL.
+- The eager early-stop's `kth_best` ceiling is an **incremental top-k tracker** (amortized
+  `O(log n)` per candidate) instead of a per-chunk `O(n)` re-selection (worst `O(union²/CHUNK)`).
+- One `alloc_ids(N)` + one `bump_seg_stats` per `upsert` call (was ~6 meta statements per
+  segment); selection sort keys are precomputed (`O(n)` transcendentals, not `O(n log n)`);
+  `Key` binds as a borrowed SQL parameter (no `Text`/`Blob` clone per bind).
+- `benchmarks/` compiles again: the removed `t_max`/`weight_step` sweep arms are replaced by the
+  `df_budget` frontier with a derived-`C` marker (the `Z`-knee evaluation of `docs/v0.4.1-plan.md`).
+
+### Breaking API changes
+
+- **`SearchOpts::weight_step`, `WeightStepHint`, and `Stats::weight_step_hint` are removed.**
+  `weight_step` has been scoring-inert since v0.4/M1 (the 4-tier weighting it tuned is gone), so
+  the hint suggested a value for a knob that did nothing. (Supersedes the v0.3 "keep the
+  band-spread hint" ruling, whose rationale died with the tier scheme.)
+- **The derivation knobs move behind `SearchOpts::tuning(Tuning)`** (`nu`, `kappa`, `delta`,
+  `k_target`, `c_margin`, builder-style). The front line is `min_shared` / `df_budget` / `filter`.
+- **[`Match`] now carries the §10 score + components** — `score` (nat-scale
+  `energy + count − length` from the governing rank-view, cross-query comparable), `energy`,
+  `count`, `length` — and is `PartialEq`-only (floats) and `#[non_exhaustive]`.
+- **`#[non_exhaustive]`** on `Config` (new `with_sigma` builder), `Document`, `Match`, `Stats`,
+  `CompactStats` — construct via the constructors, not struct literals.
+- **`CandidateStream::avgdl()` → `mean_segment_grams()`** (the derivation's `L̄`; `avgdl` was a
+  BM25-era name). `tokenize::WindowPolicy` is no longer public (it had no public constructor or
+  setter).
+- **`trifle-overlap` 0.5.0**: `Counter::build` and `tier_weights` (the v0.3 4-tier scheme) are
+  removed — the consumer owns the weighting model; the zero-copy blob API
+  (`build_from_blobs`/`build_weighted_from_blobs`, the crate's only `unsafe`) is deleted (no
+  consumer could exist: trifle's effective posting is a three-way merge, never a single stored
+  blob); `Scored` drops its `overlap` field and the engine no longer enforces the raw-overlap
+  floor (`floor()` is advisory; the consumer gates). The weight sum is checked (panics on `u32`
+  overflow) with the weight-ceiling precondition documented.
+
+### Docs
+
+- `docs/derivation.md` updated to the exact energy and cap forms, with a quantified §2
+  calibration bound, the `ln V` realization of `ΔH` stated, whitespace-only word breaking stated
+  as the operative choice, and a new **"Deviations from §12"** table tracking every known
+  doc-vs-code gap (including the legacy typo floor `F = m + d`, kept in v0.5 and gated on the
+  revived benchmark harness).
+- The `Tokenizer` trait documents the full third-party implementor contract; `casefold` is
+  documented as locale-independent lowercasing.
+
+
 ## 0.4.0
 
 A scoring rework that re-derives the engine from probabilistic IR (`docs/derivation.md`). The

@@ -159,6 +159,43 @@ impl ClassSnap {
         df as f64
     }
 
+    /// Pool the query's **present** `(script, order)` classes into one `(mean_log_df, std_log_df)`
+    /// over `ln(df)`, by sample count `n` (the derived work-budget's representative-gram statistic,
+    /// derivation §5/§7 — consumed by `search::derived_budget`). Only classes with
+    /// a **defined** variance (`n ≥ 2`, finite `σ_eff`) contribute; a class too sparse to normalize
+    /// is skipped. Returns `None` when no present class qualifies (`Σn < 2`) — the caller then falls
+    /// back to an unbounded budget (recall-safe). The pool is the standard parallel-Welford
+    /// combination [Chan1979]: `μ = Σ nᵢμᵢ / Σ nᵢ`, and combined `M2 = Σ[(nᵢ−1)σᵢ² + nᵢ(μᵢ−μ)²]`,
+    /// so `std = √(M2/(Σnᵢ−1))`.
+    pub(crate) fn pooled_log_df(&self) -> Option<(f64, f64)> {
+        let mut n_total: u64 = 0;
+        let mut mean_acc = 0.0; // Σ nᵢ·μᵢ
+        for &(n, mean, sigma) in self.by_class.values() {
+            if n >= 2 && sigma.is_finite() && mean.is_finite() {
+                n_total += n;
+                mean_acc += n as f64 * mean;
+            }
+        }
+        if n_total < 2 {
+            return None;
+        }
+        let pooled_mean = mean_acc / n_total as f64;
+        let mut m2 = 0.0; // Σ [ (nᵢ−1)·σᵢ² + nᵢ·(μᵢ−μ)² ]
+        for &(n, mean, sigma) in self.by_class.values() {
+            if n >= 2 && sigma.is_finite() && mean.is_finite() {
+                let var_i = sigma * sigma;
+                m2 += (n as f64 - 1.0) * var_i + n as f64 * (mean - pooled_mean).powi(2);
+            }
+        }
+        let pooled_var = (m2 / (n_total as f64 - 1.0)).max(0.0);
+        let std = pooled_var.sqrt();
+        if pooled_mean.is_finite() && std.is_finite() {
+            Some((pooled_mean, std))
+        } else {
+            None
+        }
+    }
+
     /// The **vocabulary size** `V` (distinct in-class terms) of a `(script, order)` class — the
     /// Welford sample count. `0` if the class is absent from this snapshot. The v0.4/M5
     /// rank-view fusion uses `ln V` as the per-`(script, order)` vocabulary-complexity proxy for
@@ -245,5 +282,66 @@ mod tests {
         let _ = snap.rarity(150, 1, 2);
         let _ = snap.rarity(40, 1, 3);
         assert_eq!(snap.vocab(9, 3), 0, "an absent class has vocab 0");
+    }
+
+    #[test]
+    fn pooled_log_df_matches_a_single_class_welford() {
+        // One populated class: the pool is exactly that class's (mean, σ) over ln(df).
+        let mut stats = ClassStats::new();
+        for df in 1..=100 {
+            stats.add_sample(1, 3, df);
+        }
+        let snap = stats.snapshot_for([(1u8, 3u8)]);
+        let (mean, std) = snap.pooled_log_df().expect("a populated class pools");
+        // Compare against a direct Welford over the same ln(df) samples.
+        let mut w = Welford::default();
+        for df in 1..=100 {
+            w.add((df as f64).ln());
+        }
+        let (_, wmean, wsigma) = w.snapshot();
+        assert!((mean - wmean).abs() < 1e-9, "pooled mean == class mean");
+        assert!((std - wsigma).abs() < 1e-9, "pooled std == class σ");
+    }
+
+    #[test]
+    fn pooled_log_df_combines_two_classes_by_sample_count() {
+        // Two classes pool into the combined mean/variance of all ln(df) samples (parallel Welford).
+        let mut stats = ClassStats::new();
+        for df in 1..=80 {
+            stats.add_sample(1, 3, df);
+        }
+        for df in 100..=300 {
+            stats.add_sample(2, 3, df);
+        }
+        let snap = stats.snapshot_for([(1u8, 3u8), (2u8, 3u8)]);
+        let (mean, std) = snap.pooled_log_df().expect("two classes pool");
+        // Oracle: one Welford over the union of both classes' samples.
+        let mut w = Welford::default();
+        for df in 1..=80 {
+            w.add((df as f64).ln());
+        }
+        for df in 100..=300 {
+            w.add((df as f64).ln());
+        }
+        let (_, wmean, wsigma) = w.snapshot();
+        assert!(
+            (mean - wmean).abs() < 1e-9,
+            "pooled mean matches the union Welford"
+        );
+        assert!(
+            (std - wsigma).abs() < 1e-9,
+            "pooled std matches the union Welford"
+        );
+    }
+
+    #[test]
+    fn pooled_log_df_is_none_for_sparse_or_empty_snapshots() {
+        // Empty snapshot → None.
+        assert_eq!(ClassSnap::empty().pooled_log_df(), None);
+        // A single-sample class (n < 2, σ_eff = ∞) does not qualify → None.
+        let mut stats = ClassStats::new();
+        stats.add_sample(1, 3, 10);
+        let snap = stats.snapshot_for([(1u8, 3u8)]);
+        assert_eq!(snap.pooled_log_df(), None);
     }
 }

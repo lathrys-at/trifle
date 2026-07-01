@@ -96,10 +96,6 @@ pub(crate) struct SelectParams {
     pub min_shared: u32,
     /// `d` — per-typo token damage; the typo floor is `F = m + d`.
     pub typo_damage: u32,
-    /// `t_max` — a hard **count ceiling** (a backstop). In v0.4 the §5 stop + the work budget are
-    /// the governing cutoff; `t_max` only caps a pathological long query that never stops. The
-    /// unconditional minimum (`F` + the per-class floor) is always kept, even past `t_max`.
-    pub t_max: usize,
     /// `C` — the work budget: a cap on the cumulative document frequency (`Σdf`, the posting-list
     /// scan cost) of the selected grams (derivation §5/§7). The unconditional minimum keeps only
     /// `df ≤ C` grams; beyond it, a gram that would breach `C` is **skipped** (scanning continues).
@@ -225,11 +221,11 @@ pub(crate) fn select<Tk: Clone + Ord>(
     let nseg = params.n_segments.max(1);
     let target = (nseg as f64 / k as f64).ln();
 
-    // The typo floor `F = m + d`, clamped to the match floor and to what's present (`t_max` can
-    // never undercut it). The count ceiling is a hard backstop only — the stop + budget govern.
+    // The typo floor `F = m + d`, clamped to the match floor and to what's present. With `t_max`
+    // removed (v0.4/M6), count is bounded only by the query's finite gram set and work by the
+    // budget `C`; selection is `F + per-class floors + rarest-first until (Cantelli stop ⊓ C)`.
     let f = params.min_shared as usize + params.typo_damage as usize;
     let floor = f.max(params.min_shared as usize).min(n);
-    let ceiling = params.t_max.max(floor).min(n);
 
     let mut kept = vec![false; n];
     let mut n_kept = 0usize;
@@ -278,9 +274,6 @@ pub(crate) fn select<Tk: Clone + Ord>(
             if kept[i] {
                 continue;
             }
-            if n_kept >= ceiling {
-                break; // the hard count backstop (t_max)
-            }
             let row = present[i];
             if acc.sum_df.saturating_add(row.df.max(0) as u64) > cmax {
                 continue; // skip-and-continue: over budget, keep scanning (z-order is not df-monotone)
@@ -324,12 +317,11 @@ mod tests {
     use crate::welford::{ClassSnap, ClassStats};
 
     /// A high-`σ`, lenient default: no stop firing on these tiny fixtures unless the target is
-    /// cleared, a generous budget, `t_max` high. `min_shared`/`t_max` are the knobs under test.
-    fn params(min_shared: u32, t_max: usize) -> SelectParams {
+    /// cleared, a generous (unbounded) budget. `min_shared` is the knob under test.
+    fn params(min_shared: u32) -> SelectParams {
         SelectParams {
             min_shared,
             typo_damage: 4,
-            t_max,
             df_budget: None,
             c_margin: 2.0,
             k_target: 128,
@@ -364,8 +356,8 @@ mod tests {
 
     #[test]
     fn keeps_the_typo_floor_rarest_present_grams() {
-        // 8 present, m=2, d=4 -> F=6. With a huge stop target nothing extra is collected: keep the
-        // 6 rarest (rarest-first). (t_max=6 == F here.)
+        // 8 present, m=2, d=4 -> F=6. A budget that admits the 6 rarest (df ≤ 6) but skips the two
+        // commonest (df 7, 8) isolates the floor: keep exactly the 6 rarest, rarest-first.
         let t = rows(&[
             ("a", 1),
             ("b", 2),
@@ -376,42 +368,24 @@ mod tests {
             ("g", 7),
             ("h", 8),
         ]);
-        assert_eq!(
-            select(&t, params(2, 6), &snap()),
-            ["a", "b", "c", "d", "e", "f"]
-        );
-    }
-
-    #[test]
-    fn t_max_below_the_typo_floor_keeps_the_floor() {
-        // A misconfigured t_max below F=6 must not drop below the floor.
-        let t = rows(&[
-            ("a", 1),
-            ("b", 2),
-            ("c", 3),
-            ("d", 4),
-            ("e", 5),
-            ("f", 6),
-            ("g", 7),
-        ]);
-        assert_eq!(
-            select(&t, params(2, 3), &snap()).len(),
-            6,
-            "floor F=6 wins over t_max=3"
-        );
+        let p = SelectParams {
+            df_budget: Some(6),
+            ..params(2)
+        };
+        assert_eq!(select(&t, p, &snap()), ["a", "b", "c", "d", "e", "f"]);
     }
 
     #[test]
     fn floor_caps_at_present_count() {
         let t = rows(&[("a", 1), ("b", 2)]); // only 2 present, F would be 6
-        assert_eq!(select(&t, params(2, 12), &snap()), ["a", "b"]);
+        assert_eq!(select(&t, params(2), &snap()), ["a", "b"]);
     }
 
     #[test]
     fn floor_clamps_when_m_exceeds_present_count() {
         // m=5 -> F=9, but only 2 grams present: keep both, not 9.
         let t = rows(&[("a", 1), ("b", 2)]);
-        assert_eq!(select(&t, params(5, 12), &snap()).len(), 2);
+        assert_eq!(select(&t, params(5), &snap()).len(), 2);
     }
 
     #[test]
@@ -419,7 +393,7 @@ mod tests {
         // A pathological `min_shared` near u32::MAX must not panic on the floor add (debug overflow
         // check); the floor just clamps to what is present.
         let t = rows(&[("a", 1), ("b", 2), ("c", 3)]);
-        let kept = select(&t, params(u32::MAX, 12), &snap());
+        let kept = select(&t, params(u32::MAX), &snap());
         assert_eq!(kept, ["a", "b", "c"]); // clamped to present.len()
     }
 
@@ -439,7 +413,7 @@ mod tests {
         ]);
         let p = SelectParams {
             df_budget: Some(100),
-            ..params(1, 12)
+            ..params(1)
         };
         let kept = select(&t, p, &snap());
         assert!(
@@ -462,7 +436,7 @@ mod tests {
             min_shared: 1,
             typo_damage: 1,
             df_budget: Some(5),
-            ..params(1, 12)
+            ..params(1)
         };
         let kept = select(&t, p, &snap());
         assert!(
@@ -482,7 +456,7 @@ mod tests {
         let t = rows(&[("a", 500), ("b", 600), ("c", 700)]);
         let p = SelectParams {
             df_budget: Some(10),
-            ..params(2, 12)
+            ..params(2)
         };
         let kept = select(&t, p, &snap());
         assert_eq!(
@@ -495,7 +469,7 @@ mod tests {
     #[test]
     fn absent_grams_kept_uncharged_and_after_present() {
         let t = rows(&[("z", 0), ("a", 5), ("y", 0), ("b", 3)]);
-        let kept = select(&t, params(2, 12), &snap());
+        let kept = select(&t, params(2), &snap());
         // present rarest-first: b(3), a(5); then absent in token order: y, z.
         assert_eq!(kept, ["b", "a", "y", "z"]);
     }
@@ -508,7 +482,7 @@ mod tests {
             &t,
             SelectParams {
                 typo_damage: 0,
-                ..params(3, 12)
+                ..params(3)
             },
             &snap(),
         );
@@ -520,8 +494,8 @@ mod tests {
         // Identical inputs -> identical output (incl. the stop), regardless of any external state.
         let t = rows(&[("a", 1), ("b", 2), ("c", 9)]);
         assert_eq!(
-            select(&t, params(2, 12), &snap()),
-            select(&t, params(2, 12), &snap())
+            select(&t, params(2), &snap()),
+            select(&t, params(2), &snap())
         );
     }
 
@@ -559,7 +533,7 @@ mod tests {
                 floored: false,
             },
         ];
-        let kept = select(&t, params(1, 2), &cs);
+        let kept = select(&t, params(1), &cs);
         assert_eq!(kept, ["dense40", "sparse40"]);
     }
 
@@ -599,7 +573,7 @@ mod tests {
             typo_damage: 0,
             n_segments: 1000,
             k_target: 128,
-            ..params(1, 64)
+            ..params(1)
         };
         let kept = select(&t, p, &snap());
         // Each gram in its own evidence: with one block (word 0), one or two high-energy grams clear
@@ -628,7 +602,7 @@ mod tests {
             n_segments: 1000,
             k_target: 128,
             sigma: 0.5, // below the 0.8 gate at B=1
-            ..params(1, 64)
+            ..params(1)
         };
         let kept_low = select(&t, low_r, &snap());
         assert_eq!(kept_low.len(), 4, "low r cannot fire the stop -> keeps all");
@@ -681,7 +655,7 @@ mod tests {
             typo_damage: 0,
             n_segments: 1000,
             k_target: 128,
-            ..params(1, 64)
+            ..params(1)
         };
         let one = select(&one_block, p, &snap()).len();
         let multi = select(&multi_block, p, &snap()).len();
@@ -712,7 +686,7 @@ mod tests {
             typo_damage: 0,
             n_segments: 1000,
             k_target: 128,
-            ..params(1, 64)
+            ..params(1)
         };
         let kept = select(&t, p, &snap());
         assert_eq!(
@@ -740,7 +714,7 @@ mod tests {
             typo_damage: 4, // F = 6
             n_segments: 3,  // tiny: target ln(3/128) < 0
             k_target: 128,
-            ..params(2, 64)
+            ..params(2)
         };
         let kept = select(&t, p, &snap());
         assert!(
@@ -780,7 +754,7 @@ mod tests {
             df_budget: Some(50),
             n_segments: 1000,
             k_target: 128,
-            ..params(1, 64)
+            ..params(1)
         };
         let kept = select(&t, p, &snap());
         assert!(
@@ -846,7 +820,7 @@ mod tests {
             typo_damage: 0,
             n_segments: 1000,
             k_target: 128,
-            ..params(1, 64)
+            ..params(1)
         };
         assert_eq!(select(&t, p, &snap()), ["only"], "the lone gram is kept");
     }
@@ -867,7 +841,7 @@ mod tests {
             typo_damage: 1, // F = 2
             n_segments: 1000,
             k_target: 128,
-            ..params(1, 64)
+            ..params(1)
         };
         let kept = select(&t, p, &snap());
         assert_eq!(
@@ -897,7 +871,7 @@ mod tests {
             df_budget: Some(50),
             n_segments: 1000,
             k_target: 128,
-            ..params(1, 64)
+            ..params(1)
         };
         let kept = select(&t, p, &snap());
         assert!(kept.contains(&"maj".to_string()), "in-budget class seated");

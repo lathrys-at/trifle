@@ -40,8 +40,7 @@ use crate::tokenize::Tokenizer;
 use crate::welford::ClassSnap;
 use crate::{
     DEFAULT_C_MARGIN, DEFAULT_DELTA, DEFAULT_K_TARGET, DEFAULT_KAPPA, DEFAULT_MIN_SHARED,
-    DEFAULT_NU, DEFAULT_T_MAX, Error, Index, IntoTerm, Result, SearchOpts, TYPO_DAMAGE, postings,
-    schema,
+    DEFAULT_NU, Error, Index, IntoTerm, Result, SearchOpts, TYPO_DAMAGE, postings, schema,
 };
 
 /// How many engine candidates to pull per provenance/filter round-trip.
@@ -106,6 +105,13 @@ pub struct Candidate {
     score: u32,
     overlap: u32,
     corrected_score: f64,
+    /// The §10 score components (all in **nats**), from the candidate's **governing** rank-view (its
+    /// best-ranked / retained view — never a cross-view sum; see [`energy`](Self::energy)). Stored at
+    /// score-time so a downstream fusion consumer reads a stable, cross-query-comparable magnitude
+    /// ([`nat_score`](Self::nat_score)) without recomputation.
+    energy: f64,
+    count: f64,
+    length: f64,
 }
 
 impl Candidate {
@@ -143,6 +149,39 @@ impl Candidate {
     /// wants trifle's own per-query ordering value.
     pub fn corrected_score(&self) -> f64 {
         self.corrected_score
+    }
+
+    /// The matched grams' logit-idf **energy** `E_acc·Δ`, in **nats**, from this candidate's
+    /// **governing** rank-view (the best-ranked / retained view — never a cross-view sum, which
+    /// would double-count the same text at two granularities; see [`corrected_score`] on the fused
+    /// path). A standalone §10 component usable on its own; a downstream fusion consumer combines
+    /// it with [`count`](Self::count)/[`length`](Self::length) via [`nat_score`](Self::nat_score).
+    ///
+    /// [`corrected_score`]: Self::corrected_score
+    pub fn energy(&self) -> f64 {
+        self.energy
+    }
+
+    /// The §3/§9 **count credit** `Σ μ` (nats) over this candidate's matched **non-floored** grams,
+    /// from its governing rank-view. A standalone §10 component (see [`energy`](Self::energy)).
+    pub fn count(&self) -> f64 {
+        self.count
+    }
+
+    /// The §6 saturating **length null** (nats) debited from this candidate, from its governing
+    /// rank-view. A standalone §10 component (see [`energy`](Self::energy)).
+    pub fn length(&self) -> f64 {
+        self.length
+    }
+
+    /// trifle's length-corrected **relevance magnitude** in nats: `energy + count − length` (§10).
+    /// Unlike [`corrected_score`](Self::corrected_score) — which is the within-query RRF rank key on
+    /// a fused query and flips scale by query cleanliness — this is **cross-query comparable** by
+    /// construction, the fusion-ready absolute-goodness input for a downstream consumer. For a
+    /// single-view (clean) query it *equals* `corrected_score()`; for a fused query it is the stable
+    /// nat-scale magnitude of the governing view while `corrected_score()` remains the RRF rank key.
+    pub fn nat_score(&self) -> f64 {
+        self.energy + self.count - self.length
     }
 }
 
@@ -224,7 +263,7 @@ impl QueryPlan {
     /// The derivation §3/§9 count credit for candidate `id`: `μ` times the popcount of matched
     /// **non-floored** grams, bucketed by gram order (§7/§12 `Σ_n μ_n·popcount_n`). Floored
     /// (junk-suspect) grams earn nothing (§9) — the policy that restores the junk-below-real
-    /// ordering the floor's `E_max` energy alone would invert. `O(k)` per candidate (`k ≤ t_max`),
+    /// ordering the floor's `E_max` energy alone would invert. `O(k)` per candidate (`k` = the selected present grams),
     /// so the post-pass stays bounded (flatness).
     fn count_credit(&self, id: u32) -> f64 {
         popcount_credit(
@@ -239,7 +278,7 @@ impl QueryPlan {
     /// Raw overlap **and** count credit for `id` in a **single** fused pass over the present
     /// postings (one `contains` per posting, derivation §7's popcount alongside the raw count). Used
     /// for count-only candidates (E_acc = 0), which need both the `min_shared` floor check (raw
-    /// overlap) and the credit, without a second pass. `O(k)`, `k ≤ t_max`.
+    /// overlap) and the credit, without a second pass. `O(k)`, `k` = the selected present grams.
     fn overlap_and_credit(&self, id: u32) -> (u32, f64) {
         let mut overlap = 0u32;
         let mut credit = 0.0;
@@ -265,10 +304,15 @@ impl QueryPlan {
         length_null(rel_len, self.k_rare, &self.null_commons)
     }
 
-    /// The §6/§7 length-corrected ranking key `E_acc·Δ + credit − null`. `e_acc` is the integer
-    /// bit-sliced energy, `credit` the §3/§9 count credit, `rel_len = L_d/L̄`.
-    fn corrected(&self, e_acc: u32, credit: f64, rel_len: f64) -> f64 {
-        e_acc as f64 * self.delta + credit - self.length_null(rel_len)
+    /// The §6/§7 length-corrected ranking key `E_acc·Δ + credit − null` **together with its §10
+    /// components** `(corrected, energy, count, length)`, all in nats — so [`score_union`] stores the
+    /// components on the [`Candidate`] (C4) without recomputing. `e_acc` is the integer bit-sliced
+    /// energy, `credit` the §3/§9 count credit, `rel_len = L_d/L̄`; `corrected = energy + count −
+    /// length`.
+    fn corrected_parts(&self, e_acc: u32, credit: f64, rel_len: f64) -> (f64, f64, f64, f64) {
+        let energy = e_acc as f64 * self.delta;
+        let length = self.length_null(rel_len);
+        (energy + credit - length, energy, credit, length)
     }
 }
 
@@ -409,6 +453,59 @@ fn count_credit(sigma: f64) -> f64 {
     (sigma / (1.0 - sigma)).ln().max(0.0)
 }
 
+/// The derived work budget `C` (derivation §5/§7) — the Lagrangian dual of the §5 confidence-bounded
+/// stop, and the default `df_budget` (v0.4/M6). The stop targets `ln(N/k)` nats of identification
+/// evidence; `df_budget` is that same requirement in **work-space** (postings scanned). Scanning
+/// `df` postings buys `≈ ln(N/df)` nats, so the work to collect the target is
+///
+/// ```text
+/// C = (1/r) · ln(N/k) · d̄ / ln(N/d̄),   d̄ = exp(mean_lndf + Z·std_lndf),  Z = 2
+/// ```
+///
+/// with `r = σ` the reliability, `k = k_target`, and `d̄` a representative surviving-gram df at the
+/// `Z = 2` (≈ P98) percentile of the query's present classes' `ln df` (pooled by
+/// [`ClassSnap::pooled_log_df`](crate::welford::ClassSnap)). `Z > 0` makes `d̄` a *commoner*
+/// percentile ⇒ a larger, **recall-safer** `C`; the in-tree recall-guard (`tests/recall_budget.rs`)
+/// is the gate on this shape constant.
+///
+/// **Recall-safe guards — every degeneracy returns `None` (unbounded), never a too-tight `C`:**
+/// stats unavailable (every present class `n < 2`), `N ≤ k`, a non-finite / non-positive `r`,
+/// `d̄ ∉ [1, N−1]`, `ln(N/d̄) ≤ 0`, `ln(N/k) ≤ 0`, or a non-finite / overflowing result.
+fn derived_budget(n_segments: u64, k_target: u64, r: f64, class_snap: &ClassSnap) -> Option<u64> {
+    /// The `d̄` percentile shape constant `Z` (derivation §5/§7, ratified decision A): `Z = 2`
+    /// (≈ P98 of `ln df`) — recall-safe with margin, still capping the common-gram tail so `C` bites.
+    const Z: f64 = 2.0;
+
+    // A corpus no larger than the target pool has no meaningful pruning to do.
+    if n_segments <= k_target {
+        return None;
+    }
+    if !r.is_finite() || r <= 0.0 {
+        return None;
+    }
+    let (mean_log_df, std_log_df) = class_snap.pooled_log_df()?;
+    if !mean_log_df.is_finite() || !std_log_df.is_finite() {
+        return None;
+    }
+    let n = n_segments as f64;
+    let k = k_target.max(1) as f64;
+    let d_bar = (mean_log_df + Z * std_log_df).exp();
+    // d̄ must be a valid df strictly inside `(1, N)` so `ln(N/d̄) > 0`.
+    if !d_bar.is_finite() || d_bar < 1.0 || d_bar > n - 1.0 {
+        return None;
+    }
+    let ln_n_dbar = (n / d_bar).ln();
+    let ln_n_k = (n / k).ln();
+    if ln_n_dbar <= 0.0 || ln_n_k <= 0.0 {
+        return None;
+    }
+    let c = (1.0 / r) * ln_n_k * d_bar / ln_n_dbar;
+    if !c.is_finite() || c < 0.0 || c >= u64::MAX as f64 {
+        return None;
+    }
+    Some(c.round() as u64)
+}
+
 /// The §9 **concentration cap** on the count credit. Returns `Some(cap)` when the pruned set's
 /// energies are *concentrated* — a single dominant rare gram (positive top energy `E_top`) amid
 /// **≥ 2** query-relative commons (a gram with `E < ½·E_top`) — else `None` (μ uncapped). An
@@ -420,31 +517,32 @@ fn count_credit(sigma: f64) -> f64 {
 /// without them an all-common query would spuriously cap (to 0 in the ubiquitous case).
 ///
 /// `cap = max(0, (E_top − Σ_common max(0,E)) / (#common − 1))`. The hard floor at 0 (reached when
-/// the commons collectively outweigh the dominant gram) is the M2 baseline; §9's smoother shrink
+/// the commons collectively outweigh the dominant gram) is the baseline; §9's smoother shrink
 /// toward the cap is a deferred tuning refinement.
 ///
-/// **Interpretation note (auditable):** floored grams are **not** excluded from `E_top`. This is
-/// the literal §12 reading — `concentrated(P)`/`concentration_cap(P)` range over all of `P` — and
-/// matches §9's framing of the cap as a *query-structure* property: a dominant gram (junk-suspect
-/// or not) should not be out-credited by commons. The floored *exclusion* governs only which grams
-/// earn credit (above) and the M4 stop, not the cap's `E_top`.
-///
-/// **Consequence flagged for the design owner (behavior NOT changed in M2).** When a *floored* gram
-/// is the dominant `E_top` (it sits at `E_max`) and a *real* mid-rare gram is co-present below it,
-/// that high floored `E_top` *loosens* the cap, so the cap no longer protects the real
-/// discriminating gram from commons-credit — a floored-*excluded* `E_top` would instead clamp
-/// tighter and protect it (R1's numeric: off-topic commons doc `8.09 >` on-topic rare doc `6.20`;
-/// floored-excluded would tie at `5.25`). This is the literal §12 reading, KEPT for M2 and
-/// recall-safe (§9: "a precision distortion the reranker undoes"). Whether the cap should key off
-/// only the *real* (non-floored) discriminating grams is a deferred §9/§12 **derivation-text**
-/// question for the design owner; M2 does not change the behavior either way.
-fn concentration_cap(energies: &[f64]) -> Option<f64> {
-    let e_top = energies.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+/// **Floored grams are excluded from `E_top` and the commons (v0.4/M6, §9/§12).** The cap exists to
+/// protect the real discriminating gram from being out-credited by commons; a floored (junk-suspect)
+/// gram sits at `E_max` and, if it were eligible to be `E_top`, its high energy would *loosen* the
+/// cap and defeat that protection. So `concentration_cap` keys off the **non-floored** grams only
+/// (parallel `floored` mask), consistent with where credit is actually earned and with the M4 stop.
+/// (R1's numeric, now fixed: with a floored `E_top = 6.9` co-present with a real gram `4.0` and two
+/// commons `0.5`, the floored-excluded reading takes `E_top = 4.0` and caps at `(4.0 − 1.0)/1 = 3.0`,
+/// protecting the real gram, rather than the floored-included `5.9` that loosened it.)
+fn concentration_cap(energies: &[f64], floored: &[bool]) -> Option<f64> {
+    // Range over the NON-floored grams only: a floored E_max gram must not be a dominant E_top.
+    let non_floored = || {
+        energies
+            .iter()
+            .zip(floored)
+            .filter(|&(_, &f)| !f)
+            .map(|(&e, _)| e)
+    };
+    let e_top = non_floored().fold(f64::NEG_INFINITY, f64::max);
     if e_top <= 0.0 {
-        return None; // no dominant rare gram (all-common / empty) — μ survives (§7/§9)
+        return None; // no dominant real rare gram (all-common / all-floored / empty) — μ survives (§7/§9)
     }
     let half = 0.5 * e_top;
-    let commons: Vec<f64> = energies.iter().copied().filter(|&e| e < half).collect();
+    let commons: Vec<f64> = non_floored().filter(|&e| e < half).collect();
     if commons.len() < 2 {
         return None;
     }
@@ -456,7 +554,7 @@ fn concentration_cap(energies: &[f64]) -> Option<f64> {
 /// `μ`-weighted popcount of `id`'s matched **non-floored** grams, bucketed by gram order
 /// (derivation §7/§12 `Σ_n μ_n·popcount_n`). A floored gram is skipped (no credit, §9); a
 /// non-floored gram contributes its order's capped `μ_n`. Free function so it is unit-testable
-/// without a full [`QueryPlan`]. `O(k)` over the present grams (`k ≤ t_max`).
+/// without a full [`QueryPlan`]. `O(k)` over the present grams.
 fn popcount_credit(
     id: u32,
     postings: &[Bitmap],
@@ -560,11 +658,16 @@ fn prepare<T: Tokenizer>(
     // `batch == serial`.
     let df_min_batch = df_min(n_segments as f64, nu);
 
+    // v0.4/M6 (§5/§7): the work budget `C` defaults to the corpus-derived Lagrangian dual of the §5
+    // stop — a caller-supplied `df_budget` overrides it, else the derived budget, else `None`
+    // (unbounded on a degenerate corpus). Pure function of the shared snapshot (N, k, σ, the query's
+    // class stats) ⇒ batch == serial.
+    let derived_c = derived_budget(n_segments, k_target, index.sigma, &class_snap);
+    let df_budget = opts.df_budget.or(derived_c);
     let sel_params = SelectParams {
         min_shared,
         typo_damage: TYPO_DAMAGE,
-        t_max: opts.t_max.unwrap_or(DEFAULT_T_MAX),
-        df_budget: opts.df_budget,
+        df_budget,
         c_margin,
         k_target,
         n_segments,
@@ -942,11 +1045,11 @@ fn build_view_plan<T: Tokenizer>(
     );
     // v0.4 M2 (§3/§4/§9): per-gram floored flag (query-side `df ≤ df_min`) + gram order
     // (codepoint count), then the §9-capped per-order count credit. The cap ranges over P's
-    // energies (floored grams included in `E_top`, §9/§12 — see `concentration_cap`); `σ` is
-    // index-level and uniform across orders query-side, so every present non-floored order maps
-    // to the same capped `μ`. The per-order bucketing is kept structural for a future doc-side
-    // `ρ = σ(1−ε)^n`. All of this is a pure function of THIS view's grams + the shared
-    // (σ, N, ν, κ, Δ) snapshot ⇒ `batch == serial`.
+    // **non-floored** energies (a floored `E_max` gram is excluded from `E_top`, §9/§12/M6 — see
+    // `concentration_cap`); `σ` is index-level and uniform across orders query-side, so every
+    // present non-floored order maps to the same capped `μ`. The per-order bucketing is kept
+    // structural for a future doc-side `ρ = σ(1−ε)^n`. All of this is a pure function of THIS
+    // view's grams + the shared (σ, N, ν, κ, Δ) snapshot ⇒ `batch == serial`.
     let present_floored: Vec<bool> = present_dfs
         .iter()
         .map(|&df| (df as f64) <= df_min_batch)
@@ -955,7 +1058,7 @@ fn build_view_plan<T: Tokenizer>(
         .iter()
         .map(|t| t.chars().count() as u8)
         .collect();
-    let mu_capped = match concentration_cap(&energies) {
+    let mu_capped = match concentration_cap(&energies, &present_floored) {
         Some(cap) => mu.min(cap),
         None => mu,
     };
@@ -1083,6 +1186,9 @@ fn upsert_best(
     score: u32,
     overlap: u32,
     corrected: f64,
+    energy: f64,
+    count: f64,
+    length: f64,
 ) {
     let build = || Candidate {
         key: key.clone(),
@@ -1091,6 +1197,9 @@ fn upsert_best(
         score,
         overlap,
         corrected_score: corrected,
+        energy,
+        count,
+        length,
     };
     match best.get_mut(key) {
         Some(slot) => {
@@ -1243,11 +1352,15 @@ fn score_union(
             for s in &scored {
                 if let Some((key, label, len)) = found.get(&s.id) {
                     let credit = plan.count_credit(s.id);
-                    let corrected = plan.corrected(s.score, credit, rel_len(Some(*len), avgdl));
+                    let (corrected, energy, count, length) =
+                        plan.corrected_parts(s.score, credit, rel_len(Some(*len), avgdl));
                     if corrected > max_float_seen {
                         max_float_seen = corrected;
                     }
-                    upsert_best(&mut best, key, label, s.id, s.score, s.overlap, corrected);
+                    upsert_best(
+                        &mut best, key, label, s.id, s.score, s.overlap, corrected, energy, count,
+                        length,
+                    );
                 }
             }
         }
@@ -1313,8 +1426,11 @@ fn score_union(
             for (id, overlap, credit) in keep {
                 if let Some((key, label, len)) = found.get(&id) {
                     // E_acc = 0 (matched only weight-0 grams).
-                    let corrected = plan.corrected(0, credit, rel_len(Some(*len), avgdl));
-                    upsert_best(&mut best, key, label, id, 0, overlap, corrected);
+                    let (corrected, energy, count, length) =
+                        plan.corrected_parts(0, credit, rel_len(Some(*len), avgdl));
+                    upsert_best(
+                        &mut best, key, label, id, 0, overlap, corrected, energy, count, length,
+                    );
                 }
             }
         }
@@ -1834,6 +1950,12 @@ mod credit_tests {
         assert!((a - b).abs() < 1e-6, "expected ≈ {b}, got {a}");
     }
 
+    /// The §9 cap over an **all-non-floored** energy set (the common case), so the existing fixtures
+    /// stay concise; the floored-exclusion tests call `concentration_cap` with an explicit mask.
+    fn cap(energies: &[f64]) -> Option<f64> {
+        concentration_cap(energies, &vec![false; energies.len()])
+    }
+
     #[test]
     fn mu_is_logit_sigma_clamped_at_zero() {
         approx(count_credit(0.9), 9.0_f64.ln()); // logit 0.9 = ln 9 ≈ 2.1972
@@ -1880,89 +2002,82 @@ mod credit_tests {
     #[test]
     fn cap_passes_through_an_all_common_set() {
         // All energies ≤ 0 (no dominant rare gram) ⇒ not concentrated ⇒ μ survives uncapped.
-        assert_eq!(concentration_cap(&[-1.0, -0.5, -2.0]), None);
+        assert_eq!(cap(&[-1.0, -0.5, -2.0]), None);
         // Comparable positive energies with no member below ½·E_top ⇒ no commons ⇒ uncapped.
-        assert_eq!(concentration_cap(&[2.0, 2.0, 2.0]), None);
+        assert_eq!(cap(&[2.0, 2.0, 2.0]), None);
         // Degenerate inputs never panic / never spuriously cap.
-        assert_eq!(concentration_cap(&[]), None);
-        assert_eq!(
-            concentration_cap(&[f64::NEG_INFINITY, f64::NEG_INFINITY]),
-            None
-        );
+        assert_eq!(cap(&[]), None);
+        assert_eq!(cap(&[f64::NEG_INFINITY, f64::NEG_INFINITY]), None);
     }
 
     #[test]
     fn cap_limits_a_concentrated_set() {
         // One dominant gram (E_top=5) amid 2 commons (0.5, 0.3 < 2.5): cap = (5 − 0.8)/(2−1) = 4.2.
-        let cap = concentration_cap(&[5.0, 0.5, 0.3]).expect("concentrated");
-        approx(cap, 4.2);
+        approx(cap(&[5.0, 0.5, 0.3]).expect("concentrated"), 4.2);
         // Only 1 common (3.0 ≥ ½·5) ⇒ no dominant-amid-commons ⇒ not concentrated.
-        assert_eq!(concentration_cap(&[5.0, 0.5, 3.0]), None);
+        assert_eq!(cap(&[5.0, 0.5, 3.0]), None);
     }
 
     #[test]
     fn cap_floors_at_zero_when_commons_outweigh() {
         // The commons collectively outweigh the dominant gram ⇒ the hard floor discards the credit.
-        let cap = concentration_cap(&[1.0, 0.4, 0.4, 0.4]).expect("concentrated");
-        approx(cap, 0.0); // (1.0 − 1.2)/3 < 0 ⇒ max(0, ·) = 0
+        approx(cap(&[1.0, 0.4, 0.4, 0.4]).expect("concentrated"), 0.0); // (1.0 − 1.2)/3 < 0 ⇒ 0
     }
 
     #[test]
-    fn cap_includes_floored_energy_in_e_top() {
-        // Interpretation guard (§9/§12): a floored gram's E_max-level energy IS eligible to be the
-        // dominant E_top — it is not excluded from the cap. E_top=6.9 with 2 commons at 0 ⇒
-        // cap = (6.9 − 0)/(2−1) = 6.9, so the high floored energy drove the cap (it was not skipped).
-        let cap = concentration_cap(&[6.9, 0.0, 0.0]).expect("floored gram is a valid dominant");
-        approx(cap, 6.9);
-        // With 3 commons the divisor grows: cap = 6.9/(3−1) = 3.45.
-        approx(
-            concentration_cap(&[6.9, 0.0, 0.0, 0.0]).expect("concentrated"),
-            3.45,
+    fn cap_excludes_floored_energy_from_e_top() {
+        // v0.4/M6 (§9/§12): a floored gram's E_max-level energy is NOT eligible to be the dominant
+        // E_top — it is excluded from the cap. With the 6.9 floored and only two 0.0 non-floored
+        // grams left, there is no positive dominant ⇒ not concentrated ⇒ uncapped (μ survives).
+        assert_eq!(
+            concentration_cap(&[6.9, 0.0, 0.0], &[true, false, false]),
+            None,
+            "a floored top is excluded, so no dominant real gram remains"
         );
+        // The SAME energies, now all non-floored, DO concentrate: cap = (6.9 − 0)/(2−1) = 6.9.
+        approx(cap(&[6.9, 0.0, 0.0]).expect("all-real concentrates"), 6.9);
     }
 
     #[test]
     fn cap_boundary_e_equals_half_is_not_common() {
         // §9 uses a STRICT `E < ½·E_top`: a gram exactly at half is NOT a common, so two grams at
         // the boundary leave 0 commons ⇒ uncapped.
-        assert_eq!(concentration_cap(&[4.0, 2.0, 2.0]), None);
+        assert_eq!(cap(&[4.0, 2.0, 2.0]), None);
         // One nudged just below half ⇒ still only 1 common ⇒ uncapped (needs ≥ 2).
-        assert_eq!(concentration_cap(&[4.0, 2.0, 1.999]), None);
+        assert_eq!(cap(&[4.0, 2.0, 1.999]), None);
         // Two strictly below half ⇒ concentrated.
-        assert!(concentration_cap(&[4.0, 1.999, 1.999]).is_some());
+        assert!(cap(&[4.0, 1.999, 1.999]).is_some());
     }
 
     #[test]
     fn cap_neg_infinity_commons_contribute_zero_no_nan() {
         // df = N ubiquitous grams carry −∞ energy: they count as commons (`< ½·E_top`) but
         // contribute `max(0,−∞) = 0` to the sum, so the cap stays finite (no NaN).
-        let cap =
-            concentration_cap(&[5.0, f64::NEG_INFINITY, f64::NEG_INFINITY]).expect("2 commons");
-        approx(cap, 5.0); // (5 − 0)/(2 − 1)
-        assert!(cap.is_finite());
+        let c = cap(&[5.0, f64::NEG_INFINITY, f64::NEG_INFINITY]).expect("2 commons");
+        approx(c, 5.0); // (5 − 0)/(2 − 1)
+        assert!(c.is_finite());
         // More ubiquitous commons shrink the cap (the chance-match guard), still finite.
-        let cap =
-            concentration_cap(&[5.0, f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY])
-                .expect("3 commons");
-        approx(cap, 2.5); // 5/(3 − 1)
-        assert!(cap.is_finite());
+        let c = cap(&[5.0, f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY])
+            .expect("3 commons");
+        approx(c, 2.5); // 5/(3 − 1)
+        assert!(c.is_finite());
     }
 
     #[test]
-    fn cap_floored_e_top_with_co_present_real_gram() {
-        // R1's interpretation pin (§9/§12): a FLOORED gram pins E_top = E_max (≈6.9) while a real
-        // mid-rare gram (4.0) is co-present above the commons (0.5, 0.5). Under the literal §12
-        // reading the real gram is NOT a common (4.0 ≥ ½·6.9 = 3.45), so only the two 0.5 commons
-        // count: cap = (6.9 − (0.5+0.5))/(2 − 1) = 5.9 — the high floored E_top loosens the cap.
-        let cap = concentration_cap(&[6.9, 4.0, 0.5, 0.5]).expect("concentrated");
-        approx(cap, 5.9);
-        // A floored-EXCLUDED reading (not what M2 does) would instead take E_top = 4.0, making the
-        // 0.5s its commons and the cap a tighter (4.0 − 1.0)/1 = 3.0 — pinned here for contrast so a
-        // future derivation-text change to exclude floored grams is a visible, deliberate edit.
+    fn cap_floored_e_top_no_longer_loosens_the_cap_r1_regression() {
+        // R1 regression (§9/§12, v0.4/M6): a FLOORED gram at E_max (≈6.9) is co-present with a real
+        // mid-rare gram (4.0) above two commons (0.5, 0.5). Excluding the floored gram from E_top,
+        // the dominant is the REAL 4.0, its commons are the two 0.5s (4.0 ≥ ½·6.9 would have hidden
+        // them under the old reading), and the cap is the tighter (4.0 − 1.0)/(2 − 1) = 3.0 — which
+        // protects the real discriminating gram. The old floored-INCLUDED reading gave 5.9 (loose).
         approx(
-            concentration_cap(&[4.0, 0.5, 0.5]).expect("concentrated"),
+            concentration_cap(&[6.9, 4.0, 0.5, 0.5], &[true, false, false, false])
+                .expect("the real gram is the dominant once the floored top is excluded"),
             3.0,
         );
+        // Cross-check: the same non-floored trio {4.0, 0.5, 0.5} alone yields the identical 3.0, so
+        // excluding the floored 6.9 truly reproduces the tight, protective cap.
+        approx(cap(&[4.0, 0.5, 0.5]).expect("concentrated"), 3.0);
     }
 
     #[test]
@@ -1990,6 +2105,80 @@ mod credit_tests {
             popcount_credit(1, &postings, &floored, &orders, &mu_by_order),
             0.0,
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    //! v0.4/M6 §5/§7 derived work budget `C = (1/r)·ln(N/k)·d̄/ln(N/d̄)`: the closed form against a
+    //! reference computation, the recall-safe guards (all → `None`/unbounded), and monotonicity in `d̄`.
+    use super::derived_budget;
+    use crate::welford::{ClassSnap, ClassStats};
+
+    /// A snapshot whose single Latin-trigram class carries the given `ln(df)` samples.
+    fn snap_with(dfs: impl IntoIterator<Item = i64>) -> ClassSnap {
+        let mut stats = ClassStats::new();
+        for df in dfs {
+            stats.add_sample(1, 3, df);
+        }
+        stats.snapshot_for([(1u8, 3u8)])
+    }
+
+    #[test]
+    fn formula_matches_the_closed_form() {
+        let snap = snap_with(1..=1000);
+        let (mean, std) = snap.pooled_log_df().unwrap();
+        let d_bar = (mean + 2.0 * std).exp();
+        let (n, k, r) = (100_000.0_f64, 128.0_f64, 0.9_f64);
+        let want = ((1.0 / r) * (n / k).ln() * d_bar / (n / d_bar).ln()).round();
+        let got = derived_budget(100_000, 128, 0.9, &snap).expect("a healthy corpus derives C");
+        assert!(
+            (got as f64 - want).abs() < 1.0,
+            "derived C matches the closed form: got {got}, want {want}"
+        );
+    }
+
+    #[test]
+    fn guards_fall_back_to_unbounded() {
+        let snap = snap_with(1..=1000);
+        // N ≤ k → None (no pruning to do).
+        assert_eq!(derived_budget(100, 128, 0.9, &snap), None);
+        assert_eq!(derived_budget(128, 128, 0.9, &snap), None);
+        // A non-finite / non-positive reliability → None.
+        assert_eq!(derived_budget(100_000, 128, f64::NAN, &snap), None);
+        assert_eq!(derived_budget(100_000, 128, 0.0, &snap), None);
+        assert_eq!(derived_budget(100_000, 128, -0.5, &snap), None);
+        // A snapshot too sparse to pool stats → None.
+        assert_eq!(derived_budget(100_000, 128, 0.9, &ClassSnap::empty()), None);
+    }
+
+    #[test]
+    fn d_bar_at_or_above_n_falls_back_to_unbounded() {
+        // When the representative gram df d̄ reaches N−1 (a ~ubiquitous corpus), ln(N/d̄) → 0 and the
+        // budget would blow up: the guard returns None (unbounded), the recall-safe outcome.
+        let snap = snap_with(1..=1000);
+        let (mean, std) = snap.pooled_log_df().unwrap();
+        let d_bar = (mean + 2.0 * std).exp();
+        // Pick N just below d̄ so d̄ > N−1.
+        let n = (d_bar as u64).max(2);
+        assert_eq!(derived_budget(n, 1, 0.9, &snap), None);
+    }
+
+    #[test]
+    fn c_is_monotone_increasing_in_d_bar() {
+        // Larger d̄ (a commoner representative gram) ⇒ larger C. Two tight, well-separated classes.
+        let low = snap_with(5..=15); // d̄ ≈ 20
+        let high = snap_with(990..=1000); // d̄ ≈ 1000
+        let (n, k, r) = (1_000_000u64, 128u64, 0.9);
+        let (m_lo, s_lo) = low.pooled_log_df().unwrap();
+        let (m_hi, s_hi) = high.pooled_log_df().unwrap();
+        assert!(
+            (m_hi + 2.0 * s_hi).exp() > (m_lo + 2.0 * s_lo).exp(),
+            "the high-df class has the larger d̄ (test premise)"
+        );
+        let c_lo = derived_budget(n, k, r, &low).unwrap();
+        let c_hi = derived_budget(n, k, r, &high).unwrap();
+        assert!(c_hi > c_lo, "larger d̄ ⇒ larger C ({c_hi} > {c_lo})");
     }
 }
 
@@ -2091,6 +2280,9 @@ mod fusion_tests {
             score: 1,
             overlap: 2,
             corrected_score: corrected,
+            energy: 0.0,
+            count: 0.0,
+            length: 0.0,
         }
     }
 
@@ -2129,6 +2321,47 @@ mod fusion_tests {
                 .map(|c| c.key().as_i64().unwrap())
                 .collect::<Vec<_>>(),
             [1, 3, 2]
+        );
+    }
+
+    #[test]
+    fn fused_candidate_reports_governing_view_components_never_a_cross_view_sum() {
+        // C4/§10: key 1 is in BOTH views — rank #1 in view_a, rank #2 in view_b — so `rrf_fuse`
+        // retains view_a's clone (the best-ranked). Its energy()/count()/length() must be view_a's
+        // (5.0/1.5/0.5), NEVER the cross-view sum with view_b's (3.0/9.9/9.9): summing would
+        // double-count the same text at two granularities, exactly what RRF exists to prevent.
+        let mut a1 = cand(1, 1, 0.0);
+        a1.energy = 5.0;
+        a1.count = 1.5;
+        a1.length = 0.5;
+        let mut b1 = cand(1, 1, 0.0);
+        b1.energy = 3.0;
+        b1.count = 9.9;
+        b1.length = 9.9;
+        let view_a = vec![a1, cand(9, 9, 0.0)]; // key 1 at rank 1 (retained)
+        let view_b = vec![cand(2, 2, 0.0), b1]; // key 1 at rank 2
+        let fused = rrf_fuse(&[view_a, view_b], &[0.5, 0.5], None);
+        let one = fused.iter().find(|c| c.key().as_i64() == Some(1)).unwrap();
+        assert_eq!(
+            one.energy(),
+            5.0,
+            "governing view's energy, not the 8.0 sum"
+        );
+        assert_eq!(one.count(), 1.5, "governing view's count");
+        assert_eq!(one.length(), 0.5, "governing view's length");
+        assert!(
+            (one.nat_score() - 6.0).abs() < 1e-12,
+            "nat_score = 5.0 + 1.5 − 0.5 (nat-scale, from the governing view)"
+        );
+        // The fused ranking key stays RRF-scale (small), a different scale from nat_score.
+        assert!(
+            one.corrected_score() > 0.0 && one.corrected_score() < 0.1,
+            "corrected_score is the RRF-scale rank key ({})",
+            one.corrected_score()
+        );
+        assert!(
+            one.nat_score() > 1.0,
+            "nat_score stays nat-scale for a fused query, not RRF-scale"
         );
     }
 

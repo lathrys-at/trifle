@@ -68,10 +68,11 @@ fn budget_bounds_selected_sigma_df_independent_of_n() {
 
 #[test]
 fn without_a_budget_common_grams_make_sigma_df_scale_with_n() {
-    // The mechanism, shown by its absence: with NO budget the df≈N common grams ride the typo floor
-    // into the selection (only 3 rare grams exist, fewer than F=6), so Σdf scales with N — exactly
-    // the M3 behavior the budget now bounds. The caller who omits C opts into this, as in v0.3.
-    let opts = SearchOpts::new().min_shared(2); // no df_budget
+    // The mechanism, shown by its absence: with the budget EXPLICITLY unbounded the df≈N common
+    // grams ride the typo floor into the selection (only 3 rare grams exist, fewer than F=6), so Σdf
+    // scales with N — exactly the M3 behavior the budget bounds. v0.4/M6: `None` now DERIVES a
+    // budget, so a caller wanting the old unbounded behavior must bind an explicit huge `df_budget`.
+    let opts = SearchOpts::new().min_shared(2).df_budget(u64::MAX); // explicitly unbounded
     let small = corpus(200, 3);
     let large = corpus(400, 3);
 

@@ -80,12 +80,19 @@ fn min_shared_controls_strictness_when_both_trigrams_are_present() {
 }
 
 #[test]
-fn wider_t_max_never_loses_a_narrow_hit() {
+fn wider_budget_never_loses_a_narrow_hit() {
+    // v0.4/M6 removed `t_max`; the selection-breadth knob is now the work budget `C` (`df_budget`).
+    // On this tiny fixture (N = 8, all grams df ≤ 8) a generous budget admits every gram (no skips),
+    // so its candidate set is a superset of a tight budget's — a wider budget never loses a hit.
     let h = Harness::new();
     load_fixture(&h);
     let q = "quick brown";
-    let narrow = h.search_opts(q, &SearchOpts::new().t_max(6), 10).unwrap();
-    let wide = h.search_opts(q, &SearchOpts::new().t_max(12), 10).unwrap();
+    let narrow = h
+        .search_opts(q, &SearchOpts::new().df_budget(6).min_shared(1), 10)
+        .unwrap();
+    let wide = h
+        .search_opts(q, &SearchOpts::new().df_budget(60).min_shared(1), 10)
+        .unwrap();
     assert!(
         !narrow.is_empty(),
         "narrow must hit something for this to be meaningful"
@@ -94,7 +101,7 @@ fn wider_t_max_never_loses_a_narrow_hit() {
     for d in ids(&narrow) {
         assert!(
             wide_ids.contains(&d),
-            "wider t_max dropped doc {d} that narrow found"
+            "wider budget dropped doc {d} that a narrower one found"
         );
     }
 }

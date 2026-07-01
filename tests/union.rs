@@ -44,8 +44,9 @@ fn grams(text: &str) -> BTreeSet<String> {
 /// The INDEPENDENT brute-force candidate set: every doc whose segment shares at least `floor` grams
 /// with the query, where `floor = min(min_shared, #present query grams)` — exactly the engine's
 /// `floor = min(min_shared, ops.len())` once selection keeps every present gram (true for the small
-/// queries here, all ≤ `t_max = 12`). Computed without the walk / `U_zero`, so it is a true oracle
-/// for the M3 spine `{raw_overlap ≥ floor}`.
+/// queries here: each has a handful of grams, and every corpus is ≤ k = 128 segments so the derived
+/// work budget is unbounded — no budget pruning). Computed without the walk / `U_zero`, so it is a
+/// true oracle for the M3 spine `{raw_overlap ≥ floor}`.
 fn brute_force_set(query: &str, docs: &[(i64, &str)], min_shared: usize) -> BTreeSet<i64> {
     let q = grams(query);
     let doc_grams: Vec<(i64, BTreeSet<String>)> =

@@ -103,8 +103,6 @@ use tokenize::{DefaultTokenizer, Tokenizer};
 pub(crate) const DEFAULT_MIN_SHARED: u32 = 2;
 /// Per-typo token damage `d`; the typo floor is `F = m + d`.
 pub(crate) const TYPO_DAMAGE: u32 = 4;
-/// Default `t_max` — the number of rarest query tokens selection keeps.
-pub(crate) const DEFAULT_T_MAX: usize = 12;
 /// Default `D` — df-doublings per IDF weight step in the overlap counter.
 const DEFAULT_WEIGHT_STEP: f64 = 1.0;
 
@@ -124,10 +122,6 @@ pub(crate) const DEFAULT_DELTA: f64 = 0.5;
 /// Default `σ` — query-side reliability / topicality, driving the count credit `μ = max(0, logit σ)`
 /// (derivation §3/§9). An index-level corpus constant (lives on [`Config`], not [`SearchOpts`]).
 pub(crate) const DEFAULT_SIGMA: f64 = 0.9;
-/// Default `ε` — doc-side per-character error rate; `0` selects the clean / query-side channel
-/// (derivation §3.2).
-#[expect(dead_code)]
-pub(crate) const DEFAULT_EPSILON: f64 = 0.0;
 /// Default `k` — the stop's target candidate-pool size; the stop aims for `ln(N/k)` nats
 /// (derivation §5). Wired into the M4 Cantelli stop (`search::prepare` → `select`).
 pub(crate) const DEFAULT_K_TARGET: u64 = 128;
@@ -194,14 +188,15 @@ fn sanitized_sigma(sigma: f64) -> f64 {
 pub struct SearchOpts<'a> {
     /// `m` — the match floor (shared rare tokens for a hit). `None` → `2`.
     pub min_shared: Option<u32>,
-    /// `t_max` — the number of rarest query tokens selection keeps, above the typo floor
-    /// `F = m + d`. `None` → `12`. The selection breadth (recall/cost) knob.
-    pub t_max: Option<usize>,
-    /// `B` — an optional cap on the cumulative document frequency (`Σdf`) of the selected
-    /// tokens, which is what candidate generation scans — so this bounds *work* directly
-    /// (`t_max` bounds count). Rarest-first tokens are kept while `Σdf` stays within budget; the
-    /// typo floor is always kept. `None` (the default) = no cap. This is the derivation's work
-    /// budget `C` (the cap on `Σdf` over the pruned set, derivation §5/§7).
+    /// `C` — the work budget: a cap on the cumulative document frequency (`Σdf`) of the selected
+    /// tokens, which is what candidate generation scans — so this bounds *work* directly.
+    /// Rarest-first tokens are kept while `Σdf` stays within budget; the typo floor is always kept.
+    /// This is the derivation's work budget `C` (the cap on `Σdf` over the pruned set, derivation
+    /// §5/§7). `None` (the default) does **not** mean unbounded — it means **derive `C` from the
+    /// corpus** (`C = (1/σ)·ln(N/k)·d̄/ln(N/d̄)`, `d̄ = exp(mean_lndf + 2·std_lndf)`; the Lagrangian
+    /// dual of the §5 stop). A caller-supplied value overrides the derived one; the derivation's
+    /// recall-safe guards fall the derived budget back to unbounded on a degenerate corpus (tiny
+    /// `N`, non-finite stats). Bind an explicit huge value to force fully-unbounded selection.
     pub df_budget: Option<u64>,
     /// `D` — df-doublings per IDF weight step. `1.0` is the default. **As of v0.4/M1 this no longer
     /// reaches the overlap counter** — the v0.3 4-tier df-rarity weighting it tuned was replaced by
@@ -222,15 +217,6 @@ pub struct SearchOpts<'a> {
     /// all grow with `E_max/Δ`), so a pathologically tiny `Δ` is a memory / `u32`-overflow hazard.
     /// A non-finite, zero, or negative value falls back to the `0.5` default.
     pub delta: Option<f64>,
-    /// `ε` — the doc-side per-character error rate; `0` selects the clean / query-side channel
-    /// (`ρ = σ(1−ε)^n`, derivation §3.2). `None` → `0.0`. **Reserved, not yet consumed.** v0.4 ships
-    /// the **query-side** channel only; the doc-side channel (no contamination floor, full idf, the
-    /// count credit on every gram) is a **deferred post-v0.4 milestone**, because it is a *per-field*
-    /// property and the contamination floor is baked into the per-posting bit-sliced energy planes —
-    /// a posting spans segments from many fields, so a per-field channel needs per-field posting
-    /// partitions (or per-candidate re-scoring), which is its own piece of work. `ε` is declared so
-    /// the surface is stable when that lands.
-    pub epsilon: Option<f64>,
     /// `k` — the confidence-bounded stop's target candidate-pool size; the stop aims for `ln(N/k)`
     /// nats (derivation §5). `None` → `128`. Consumed by the v0.4/M4 Cantelli stop.
     pub k_target: Option<u64>,
@@ -247,13 +233,11 @@ impl<'a> SearchOpts<'a> {
     pub fn new() -> Self {
         SearchOpts {
             min_shared: None,
-            t_max: None,
             df_budget: None,
             weight_step: DEFAULT_WEIGHT_STEP,
             nu: None,
             kappa: None,
             delta: None,
-            epsilon: None,
             k_target: None,
             c_margin: None,
             filter: None,
@@ -266,13 +250,8 @@ impl<'a> SearchOpts<'a> {
         self
     }
 
-    /// Set `t_max` — the number of rarest query tokens selection keeps.
-    pub fn t_max(mut self, t_max: usize) -> Self {
-        self.t_max = Some(t_max);
-        self
-    }
-
-    /// Set `df_budget` `B` — cap the cumulative `Σdf` of the selected tokens (bounds scan work).
+    /// Set the work budget `C` — cap the cumulative `Σdf` of the selected tokens (bounds scan
+    /// work). Overrides the corpus-derived default (see [`df_budget`](SearchOpts::df_budget)).
     pub fn df_budget(mut self, budget: u64) -> Self {
         self.df_budget = Some(budget);
         self
@@ -299,12 +278,6 @@ impl<'a> SearchOpts<'a> {
     /// Set `Δ` — the energy quantization step in nats (derivation §7).
     pub fn delta(mut self, delta: f64) -> Self {
         self.delta = Some(delta);
-        self
-    }
-
-    /// Set `ε` — the doc-side per-character error rate (derivation §3.2).
-    pub fn epsilon(mut self, epsilon: f64) -> Self {
-        self.epsilon = Some(epsilon);
         self
     }
 

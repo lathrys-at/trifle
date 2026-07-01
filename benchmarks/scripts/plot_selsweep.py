@@ -7,8 +7,8 @@ recall@k against the work it cost — Σdf and/or p99 latency. One selsweep run 
 now sweep a whole N ladder (`--docs 1000,5000,25000,...`), so the file carries
 several N; pick how to view them with `--mode`:
 
-  facet    (default) one panel-row per N, the two arms (t_max, df_budget)
-           overlaid per work axis. The per-N frontier; better arm sits up-left.
+  facet    (default) one panel-row per N: the swept `df_budget` frontier plus the
+           single `derived`-default marker point, per work axis. Per-N frontier.
   overlay  every N on shared axes (color = N, linestyle = arm). How the frontier
            shifts as the corpus grows.
   knee     the scaling analysis: for each N, the cheapest df_budget reaching
@@ -60,12 +60,14 @@ X_AXES = {
 }
 
 # Per-arm linestyle + marker (color is free to carry N in the overlay/knee views).
+# `derived` is a single marker point (the Z=2 default budget's landing on the frontier),
+# not a swept curve, so it gets a standout star.
 ARM_STYLE = {
-    "t_max": ("-", "o"),
     "df_budget": ("--", "s"),
+    "derived": ("", "*"),
 }
 # Per-arm color for the facet view, where each panel is a single N so arm owns color.
-ARM_COLOR = {"t_max": "tab:blue", "df_budget": "tab:orange"}
+ARM_COLOR = {"df_budget": "tab:orange", "derived": "tab:red"}
 
 
 def parse_rows(streams):
@@ -172,7 +174,7 @@ def draw_overlay(rows, k, x_choices, title):
     at_k = rows_at_k(rows, k)
     ns = sorted({r["N"] for r in at_k})
     colors = n_colors(ns)
-    arms = [a for a in ("t_max", "df_budget") if any(r["arm"] == a for r in at_k)]
+    arms = [a for a in ("df_budget", "derived") if any(r["arm"] == a for r in at_k)]
 
     fig, axes = plt.subplots(
         1, len(x_choices), figsize=(6.6 * len(x_choices), 4.6), squeeze=False
@@ -422,7 +424,7 @@ def main():
         title = args.title or f"Selection-cost frontier across N — recall@{args.k}"
         fig = draw_overlay(rows, args.k, x_choices, title)
     else:
-        title = args.title or f"Selection-cost frontier — recall@{args.k} (t_max vs df_budget)"
+        title = args.title or f"Selection-cost frontier — recall@{args.k} (df_budget + derived)"
         fig = draw_facet(rows, args.k, x_choices, title, annotate)
 
     fig.savefig(args.out, dpi=130)

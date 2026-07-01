@@ -171,10 +171,10 @@ SELSWEEP (selection-cost frontier; trifle only):
     --df-fracs <a,b,c>            df_budget grid as fractions of N (each = frac*N), e.g.
                                   0.03,0.05,0.08 [default: 0.005,0.01,0.02,0.05,0.1,0.2,0.5,1.0]
     --format <csv|json>           Output format [default: csv]
-    Columns: arm,knob,N,k,recall,sigma_df_p50,sigma_df_p99,lat_p50_us,lat_p99_us. The `df_budget`
+    Columns: arm,knob,N,k,recall,sigma_df_p50,sigma_df_p99,lat_p50_us,lat_p99_us. The df_budget
     rows sweep the grid; one extra `derived` row per N marks where trifle's DERIVED default budget
-    C (df_budget unset) lands on the frontier — its knob column is the observed Σdf-p50 (the
-    Z=2 "Z-knee"). Each N rebuilds the corpus; all rows land in one CSV (the N column pivots them
+    C (df_budget unset) lands on the frontier — its knob column is the observed Sigma-df-p50 (the
+    Z=2 Z-knee). Each N rebuilds the corpus; all rows land in one CSV (the N column pivots them
     apart). plot_selsweep.py --mode knee fits the optimal df_budget vs N relationship.
 
 OVERLAP (trifle-overlap engine microbench, synthetic bitmaps — no SQLite, no corpus):
@@ -288,23 +288,6 @@ impl Flags {
                 .parse::<u32>()
                 .map(Some)
                 .map_err(|_| format!("--{key}: not a u32: {v}")),
-            None => Ok(None),
-        }
-    }
-    fn opt_u64(&self, key: &str) -> Result<Option<u64>, String> {
-        match self.last(key) {
-            Some(v) => parse_u64(v)
-                .map(Some)
-                .ok_or_else(|| format!("--{key}: not an integer: {v}")),
-            None => Ok(None),
-        }
-    }
-    fn opt_f64(&self, key: &str) -> Result<Option<f64>, String> {
-        match self.last(key) {
-            Some(v) => v
-                .parse::<f64>()
-                .map(Some)
-                .map_err(|_| format!("--{key}: not a float: {v}")),
             None => Ok(None),
         }
     }
@@ -1420,7 +1403,7 @@ fn labeled_corpus(
         }
         corpus::CORPUS_GEONAMES_CITIES | corpus::CORPUS_GEONAMES_ALL => {
             let ent = corpus::geonames(which, n, q, seed).map_err(|e| format!("geonames: {e}"))?;
-            // selsweep/dsweep hold the typo count fixed at `edits` (they sweep selection / D).
+            // selsweep holds the typo count fixed at `edits` (it sweeps the df_budget selection).
             let e = edits.max(1);
             let qs = query::fuzzy_queries(&ent.targets, e, e, seed)
                 .into_iter()
@@ -1716,7 +1699,7 @@ fn cmd_fetch(args: &[String]) -> Result<(), String> {
     corpus::prefetch(&which).map_err(|e| format!("fetch: {e}"))
 }
 
-// ----- dsweep (recall vs weight_step D) ---------------------------------------
+// ----- shared parse helpers ---------------------------------------------------
 
 /// Parse a `--edits` spec into an inclusive `(lo, hi)` typo range: a single `N` → `(N, N)`, or a
 /// comma range `lo,hi` → `(min, max)` (order-insensitive, e.g. `0,2` and `2,0` both → `(0, 2)`).
@@ -1731,8 +1714,8 @@ fn parse_edits_range(s: &str) -> Result<(usize, usize), String> {
     Ok((lo, hi))
 }
 
-/// Parse a comma-separated `usize` list (the `--docs` ladder and the `--t-maxes` grid for
-/// selsweep), honoring `_`/hex via [`parse_u64`]. `flag` names the flag in error messages.
+/// Parse a comma-separated `usize` list (the `--docs` ladder for selsweep), honoring `_`/hex via
+/// [`parse_u64`]. `flag` names the flag in error messages.
 /// Sorted ascending and deduped, so a repeated or out-of-order list is normalized to one
 /// ascending sweep.
 fn parse_usize_list(flag: &str, s: &str) -> Result<Vec<usize>, String> {
@@ -1775,94 +1758,6 @@ fn parse_df_fracs(s: &str) -> Result<Vec<f64>, String> {
         return Err("--df-fracs is empty".into());
     }
     Ok(v)
-}
-
-/// Parse a comma-separated `f64` list (the `--steps` grid).
-fn parse_steps(s: &str) -> Result<Vec<f64>, String> {
-    let v: Vec<f64> = s
-        .split(',')
-        .map(|t| t.trim().parse::<f64>())
-        .collect::<Result<_, _>>()
-        .map_err(|_| format!("--steps: not a comma-separated float list: {s}"))?;
-    if v.is_empty() {
-        return Err("--steps is empty".into());
-    }
-    Ok(v)
-}
-
-fn cmd_dsweep(args: &[String]) -> Result<(), String> {
-    let flags = Flags::parse(args, &[])?;
-    flags.reject_unknown(&[
-        "corpus",
-        "docs",
-        "queries",
-        "edits",
-        "seed",
-        "min-shared",
-        "t-max",
-        "steps",
-    ])?;
-    let n = flags.usize("docs", 100_000)?;
-    if n == 0 {
-        return Err("--docs must be >= 1".into());
-    }
-    let q = flags.usize("queries", 1000)?;
-    let edits = flags.usize("edits", 2)?;
-    let seed = flags.u64("seed", DEFAULT_SEED)?;
-    let which = match flags.str("corpus", "msmarco-relevance").as_str() {
-        "msmarco-relevance" | "msmarco" => "msmarco".to_string(),
-        other => other.to_string(),
-    };
-    let steps = parse_steps(&flags.str("steps", "0.5,1.0,1.5,2.0,3.0"))?;
-    // `weight_step` is the swept variable, so it is NOT part of the held-constant tuning.
-    let fixed = Tuning {
-        min_shared: flags.opt_u32("min-shared")?,
-        t_max: flags.opt_u64("t-max")?.map(|v| v as usize),
-        weight_step: None,
-    };
-    let (corpus, queries) = labeled_corpus(&which, n, q, edits, seed)?;
-    if queries.is_empty() {
-        return Err("no queries generated".into());
-    }
-    let ndocs = corpus.docs.len();
-    let qtexts: Vec<&str> = queries.iter().map(|(t, _)| t.as_str()).collect();
-    let relevant: Vec<Vec<i64>> = queries.iter().map(|(_, r)| r.clone()).collect();
-    let trifle = Trifle::build(&corpus, fixed);
-
-    println!(
-        "# dsweep[{which}] — recall vs weight_step D — N={ndocs} queries={} depth={KMAX}",
-        qtexts.len()
-    );
-    println!("D       recall@1  @5      @10     @50     mrr@10  ndcg@10");
-    let mut best = (f64::NAN, f64::NEG_INFINITY); // (D, recall@10)
-    for &d in &steps {
-        let results: Vec<Vec<i64>> = qtexts
-            .iter()
-            .map(|qq| trifle.search_weight_step(qq, KMAX, d))
-            .collect();
-        let r10 = set_recall_at_k(&results, &relevant, 10);
-        println!(
-            "{d:<7.2} {:<9.4} {:<7.4} {:<7.4} {:<7.4} {:<7.4} {:.4}",
-            set_recall_at_k(&results, &relevant, 1),
-            set_recall_at_k(&results, &relevant, 5),
-            r10,
-            set_recall_at_k(&results, &relevant, 50),
-            mrr_at_k(&results, &relevant, 10),
-            ndcg_at_k(&results, &relevant, 10),
-        );
-        if r10 > best.1 {
-            best = (d, r10);
-        }
-    }
-    println!("# scored-queries={}", scored_queries(&relevant));
-    match trifle.weight_step_hint() {
-        Some(h) => println!(
-            "# WeightStepHint D≈{h:.2}; recall@10-best in grid D={:.2} ({:.4})",
-            best.0, best.1
-        ),
-        None => println!("# WeightStepHint: none"),
-    }
-    Ok(())
 }
 
 // ----- overlap (trifle-overlap engine microbench, synthetic bitmaps) ----------
@@ -2077,7 +1972,7 @@ fn cmd_ingest(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_edits_range, parse_steps};
+    use super::parse_edits_range;
 
     #[test]
     fn edits_range_single_value_and_inclusive_range() {
@@ -2089,12 +1984,5 @@ mod tests {
         // Non-integers are rejected.
         assert!(parse_edits_range("x").is_err());
         assert!(parse_edits_range("0,x").is_err());
-    }
-
-    #[test]
-    fn steps_parses_a_float_list() {
-        assert_eq!(parse_steps("0.5,1.0,2.0").unwrap(), vec![0.5, 1.0, 2.0]);
-        assert_eq!(parse_steps("1").unwrap(), vec![1.0]);
-        assert!(parse_steps("nope").is_err());
     }
 }

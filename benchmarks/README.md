@@ -15,10 +15,9 @@ There are seven benchmarks plus two utilities:
   scored.
 - **`relevance`** — recall + latency on MS MARCO real dev queries + qrels, vs BM25.
 - **`fuzzy`** — recall + latency on GeoNames entity names with injected edits (typo tolerance).
-- **`selsweep`** — the selection-cost frontier: recall@k vs Σdf (and vs p99 latency) for both
-  selection arms, `t_max` and `df_budget` — to pick the better recall-per-unit-work knob.
-- **`dsweep`** — recall/MRR/nDCG@{1,5,10,50} vs the IDF `weight_step` `D`, plus a check of the
-  corpus `WeightStepHint` against the recall-optimal `D`.
+- **`selsweep`** — the selection-cost frontier: recall@k vs Σdf (and vs p99 latency) as the
+  `df_budget` work cap is swept, plus a `derived` marker showing where trifle's derived default
+  budget `C` (df_budget unset, the Z=2 default) lands on that frontier — the "Z-knee".
 - **`overlap`** — the engine in isolation: `trifle-overlap` build/walk on synthetic CRoaring
   bitmaps (no SQLite). The build-cost-vs-cardinality flatness curve, the all-weight-1 fast path,
   and shallow top-k vs a full deep-pull walk.
@@ -91,10 +90,10 @@ size.
 
 ## Search tuning (trifle only)
 
-`--min-shared <m>` (match floor), `--t-max <T>` (rarest tokens kept by selection), and
-`--weight-step <D>` (df-doublings per IDF weight step) set trifle's strictness; each omitted
-flag leaves the engine default (`m=2`, `t_max=12`, `D=1.0`). Baselines have no analogue and
-ignore them.
+`--min-shared <m>` (match floor) sets trifle's strictness; omitted it leaves the engine default
+(`m=2`). Since v0.5 the count cap `t_max` and the IDF `weight_step` are gone — count is bounded by
+the query's finite gram set and work by the `df_budget` `Σdf` cap (derived from corpus stats when
+unset). Baselines have no analogue and ignore these.
 
 ## Running
 
@@ -119,7 +118,7 @@ cargo run --manifest-path benchmarks/Cargo.toml --release -- relevance --docs 10
 # 3. fuzzy: name+edit recall/MRR/nDCG (random 0-2 typos per query), vs FTS5 trigram + LIKE
 cargo run --manifest-path benchmarks/Cargo.toml --release -- fuzzy --corpus geonames-cities --queries 5000
 
-# 4. selsweep: the selection-cost frontier (both arms), CSV to stdout
+# 4. selsweep: the selection-cost frontier (df_budget sweep + derived-C marker), CSV to stdout
 cargo run --manifest-path benchmarks/Cargo.toml --release -- selsweep --corpus geonames-all --docs 125000 > frontier.csv
 
 # 5. the work-done curve: Σ(kept-posting cardinality)
@@ -165,24 +164,28 @@ repeated per-run header lines either way.)
 `--df-fracs a,b,c` overrides the df_budget grid (fractions of `N`, each becomes a `Σdf` cap =
 `frac·N`); the fractions scale per `N` across the ladder, so a refined grid around a knee works at
 every rung. E.g. once `knee` mode locates the elbow near `0.05·N`, densify there with
-`--df-fracs 0.02,0.03,0.04,0.05,0.06,0.08,0.1`. Symmetrically, `--t-maxes a,b,c` sets the t_max
-arm's token-count grid explicitly (overriding the generated `2,4,..,--max-tmax`), e.g.
-`--t-maxes 4,8,12,16`.
+`--df-fracs 0.02,0.03,0.04,0.05,0.06,0.08,0.1`.
+
+Alongside the swept grid, every `N` also emits one `derived` row: the run with `df_budget` unset,
+where trifle derives the work budget `C = (1/σ)·ln(N/k)·d̄/ln(N/d̄)` from corpus stats (the Z=2
+default). Its `knob` column is the observed `Σdf`-p50 of that run, so it marks exactly where the
+derived default lands on the recall-vs-`Σdf` frontier — the "Z-knee".
 
 `selsweep` CSV (and `--format json`) columns are
 `arm,knob,N,k,recall,sigma_df_p50,sigma_df_p99,lat_p50_us,lat_p99_us`, with one row per
-`(arm, knob, k)`. `arm` is `t_max` or `df_budget`; `knob` is the swept value (a `t_max` count,
-or a `Σdf` budget). The Σdf and latency columns are per-`(arm, knob)` aggregates captured under
-the work-done collector, constant across the four `k` rows; `recall` varies by `k`. Plot
-`recall@k` against `sigma_df_p50` (and against `lat_p99_us`) with both arms overlaid for the
-selection-cost frontier. The same ladder applies to `latency`/`profile` if you want the
-flat-latency-as-N-grows confirmation.
+`(arm, knob, k)`. `arm` is `df_budget` (a swept `Σdf` cap) or `derived` (the derived-default
+marker, one point per `N`); `knob` is the swept value — a `Σdf` budget for `df_budget`, or the
+observed `Σdf`-p50 for `derived`. The Σdf and latency columns are per-`(arm, knob)` aggregates
+captured under the work-done collector, constant across the four `k` rows; `recall` varies by `k`.
+Plot `recall@k` against `sigma_df_p50` (and against `lat_p99_us`) to read the selection-cost
+frontier, with the `derived` star marking the default's landing. The same ladder applies to
+`latency`/`profile` if you want the flat-latency-as-N-grows confirmation.
 
 `scripts/plot_selsweep.py` draws the frontier straight from that CSV (needs matplotlib). Three
 `--mode`s, all keyed off the `N` column so a ladder file plots in one shot:
 
-- **`facet`** (default) — one panel row per `N`, `recall@k` against Σdf and p99 latency, the
-  `t_max` and `df_budget` arms overlaid. The better knob is the curve up-and-left.
+- **`facet`** (default) — one panel row per `N`, `recall@k` against Σdf and p99 latency: the
+  swept `df_budget` frontier with the `derived`-default marker starred on it.
 - **`overlay`** — every `N` on shared axes (color = `N`, linestyle = arm); shows how the frontier
   shifts as the corpus grows.
 - **`knee`** — the scaling analysis: per `N`, the cheapest `df_budget` reaching `--knee-frac` (0.98)

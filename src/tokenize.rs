@@ -58,6 +58,42 @@ pub trait Tokenizer: Send + Sync {
     /// required.
     fn tokenize<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Self::Token> + 'a;
 
+    /// Query-side word tagging: like [`tokenize`](Tokenizer::tokenize), but each gram is paired
+    /// with its **word id** — the comonotone *stopping block* the pruner's confidence-bounded stop
+    /// groups co-failing grams into (derivation §5). Word ids increment at each word boundary;
+    /// grams within one word share an id, and (for a tokenizer that breaks its windows on those
+    /// boundaries) no gram straddles two words.
+    ///
+    /// The default assigns every gram to block `0` (one block) — always recall-safe, because
+    /// merging blocks only *raises* the stop's variance (§5), never lowers it. A tokenizer that
+    /// knows its word boundaries (e.g. [`DefaultTokenizer`], which breaks on whitespace) overrides
+    /// this to report them, tightening the bound. Used only on the **query** side; indexing uses
+    /// [`tokenize`](Tokenizer::tokenize) (the grams agree because both apply the same windowing).
+    fn tokenize_words<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = (Self::Token, u32)> + 'a {
+        self.tokenize(text).map(|t| (t, 0))
+    }
+
+    /// The **primary** gram order (codepoint window width) this tokenizer uses for a given
+    /// script-class byte, or `u8::MAX` for a **single-order** tokenizer that has no shorter
+    /// secondary order — the default.
+    ///
+    /// v0.4/M5 (derivation §8) scores each script run at its primary order plus, when a query
+    /// is starved, a **secondary** one order shorter (Latin trigram + bigram, CJK bigram +
+    /// unigram), reciprocal-rank-fused. The search path classifies a query gram `(script,
+    /// order)` into the primary rank-view (`order == primary_order(script)`) or the secondary
+    /// (`order == primary_order(script) − 1`). A single-order tokenizer returns `u8::MAX`, so
+    /// no gram is ever classified secondary and the secondary view never forms — it pays
+    /// nothing for the §8 machinery. [`DefaultTokenizer`] overrides this with its per-script
+    /// window policy; the fixed-width [`NgramTokenizer`] keeps the default (it emits exactly
+    /// one order and never a shorter fallback).
+    fn primary_order(&self, script: u8) -> u8 {
+        let _ = script;
+        u8::MAX
+    }
+
     /// A stable hash of this tokenizer's *behavior* (window policy, normalization,
     /// casefolding). It is stamped into the index and compared on open; a change forces a
     /// [`rebuild`](crate::Index::rebuild), because the postings are keyed by whatever this
@@ -640,6 +676,18 @@ impl<const N: usize> NgramTokenizerBuilder<N> {
 /// `Common`-class run. The default [`WindowPolicy`] uses bigrams for the dense CJK scripts
 /// (Han / Hiragana / Katakana / Hangul) and trigrams elsewhere.
 ///
+/// v0.4/M5 (derivation §8): each run is windowed at **two** orders — its primary order *and* a
+/// secondary one shorter (Latin trigram + bigram, CJK bigram + unigram) — so the tokenizer emits
+/// dual-order grams. The shorter order doubles as the structural fallback for a run too short to
+/// produce the primary (a 2-char Latin run yields its bigram; a 1-char CJK run its unigram).
+///
+/// Indexing both orders unconditionally grows posting volume **~2–2.5×** on small documents (the
+/// secondary must be indexed to be queryable), with the CJK unigram postings the densest; this is
+/// the §8-designed cost, kept bounded at query time by the per-script starved gate (the secondary
+/// view runs only when needed) and the usual rarity pruning. The flip side is a **new capability**:
+/// content shorter than the primary window (a 2-char Latin word, a 1-char CJK morpheme) is now
+/// indexable and queryable at all, where the trigram-only tokenizer dropped it.
+///
 /// Construct with [`new`](Self::new) for the defaults (NFC + Unicode lowercase) or
 /// [`builder`](Self::builder) to change normalization / casefolding.
 ///
@@ -647,9 +695,9 @@ impl<const N: usize> NgramTokenizerBuilder<N> {
 /// use trifle::tokenize::{DefaultTokenizer, Tokenizer};
 ///
 /// let tok = DefaultTokenizer::new();
-/// // "ab漢字" → Latin trigram run "ab" (too short, no gram) + Han bigram "漢字".
+/// // "ab漢字" → Latin run "ab" (a bigram, too short for a trigram) + Han run "漢字" (bigram + unigrams).
 /// let grams: Vec<String> = tok.tokenize("ab漢字").map(|g| g.to_string()).collect();
-/// assert_eq!(grams, ["漢字"]);
+/// assert_eq!(grams, ["ab", "漢", "漢字", "字"]);
 /// ```
 #[derive(Clone, Debug)]
 pub struct DefaultTokenizer {
@@ -713,7 +761,34 @@ impl Tokenizer for DefaultTokenizer {
             win_len: 0,
             class: None,
             n: 0,
+            word: 0,
+            pending: None,
         }
+    }
+
+    fn tokenize_words<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = (Self::Token, u32)> + 'a {
+        GramWords(GramTokens {
+            chars: self.norm.prepared(text),
+            sizes: self.policy.sizes,
+            win: ['\0'; 3],
+            win_len: 0,
+            class: None,
+            n: 0,
+            word: 0,
+            pending: None,
+        })
+    }
+
+    fn primary_order(&self, script: u8) -> u8 {
+        // The DefaultTokenizer's per-script primary gram order (CJK bigrams, else trigrams) —
+        // the SECONDARY order the v0.4/M5 rank-views fuse over is one shorter (derivation §8).
+        // The search path reads this to classify a query gram (script, order) into the primary
+        // or secondary rank-view without hard-coding the CJK list. (`NgramTokenizer` keeps the
+        // trait default `u8::MAX` — single-order, no rank-views.)
+        self.policy.sizes[script as usize]
     }
 
     fn fingerprint(&self) -> u64 {
@@ -724,7 +799,16 @@ impl Tokenizer for DefaultTokenizer {
         bytes.extend_from_slice(b"scr");
         bytes.extend_from_slice(&self.norm.fingerprint_bytes());
         bytes.extend_from_slice(&self.policy.sizes);
-        bytes.push(1); // encoding/layout version
+        // Layout version. Bumped 1 → 2 in v0.4/M4 (whitespace now breaks gram windows) and
+        // 2 → 3 in v0.4/M5: each script run is now windowed at BOTH its primary order and a
+        // secondary one-shorter order (Latin trigram + bigram, CJK bigram + unigram), so the
+        // tokenizer emits dual-order grams on both the index and query sides (derivation §8). A
+        // pre-M5 cache therefore drift-resets (drop + rebuild) on open — the expected "drop,
+        // never migrate" path, not a migration; the on-disk FORMAT is unchanged (a bigram and a
+        // trigram are already distinct `Term`s/postings), so only this tokenizer-behavior byte
+        // moves, not `SCHEMA_VERSION`. The change is in `GramTokens`, not a config byte, so it
+        // must be stamped here explicitly.
+        bytes.push(3);
         fnv1a_64(&bytes)
     }
 
@@ -739,6 +823,14 @@ impl Tokenizer for DefaultTokenizer {
         let mut class: Option<u8> = None;
         let mut n = 0usize;
         self.norm.for_each_normalized_char(text, |ch, cs, ce| {
+            if is_break(ch) {
+                // Mirror `GramTokens`: whitespace breaks the window (no gram straddles it) and
+                // resets the class, so span re-derivation tracks the same grams the tokenizer emits.
+                class = None;
+                n = 0;
+                win_len = 0;
+                return;
+            }
             let class_c = script_class_of(ch, class);
             if Some(class_c) != class {
                 class = Some(class_c);
@@ -761,17 +853,47 @@ impl Tokenizer for DefaultTokenizer {
                 win_start[n - 1] = cs;
                 win_end[n - 1] = ce;
             }
-            if win_len == n {
-                if let Some(g) = Gram::from_chars(&win_ch[..n]) {
+            // Mirror `GramTokens`: check BOTH the primary (full `n`-wide) window and the
+            // secondary (last `n − 1` code points) window, so a span can be located for either
+            // order's gram (derivation §8 dual-order).
+            let mut consider = |lo_idx: usize, hi_idx: usize| {
+                if let Some(g) = Gram::from_chars(&win_ch[lo_idx..=hi_idx]) {
                     if tokens.contains(&g.as_str()) {
-                        first.get_or_insert(win_start[0]);
-                        last = win_end[n - 1];
+                        first.get_or_insert(win_start[lo_idx]);
+                        last = last.max(win_end[hi_idx]);
                     }
                 }
+            };
+            if win_len == n {
+                consider(0, n - 1);
+            }
+            let ns = n.saturating_sub(1);
+            if ns >= 1 && win_len >= ns {
+                consider(win_len - ns, win_len - 1);
             }
         });
         first.map(|f| (f, last))
     }
+}
+
+/// A code point that **breaks** a gram window — and, on the query side, marks a word boundary (the
+/// §5 comonotone *stopping-block* boundary). v0.4/M4 breaks on Unicode whitespace only.
+///
+/// Whitespace-only is the recall-safe subset of the derivation's "whitespace + delimiter
+/// punctuation" (§5/§8). The asymmetry is decisive: *under*-splitting (merging two query words into
+/// one block) only **raises** the stop's variance, so it is conservative, whereas *over*-splitting
+/// a real word (the apostrophe in `don't`, the dots in `U.S.A`) under-counts the variance and fires
+/// the stop early — a recall loss. So inter-word delimiter-*punctuation* breaking is a deferred
+/// §5/§8 precision refinement; intra-word punctuation is word-internal regardless (§11). Digits and
+/// combining marks stay transparent (they inherit the current run), unchanged from v0.3.
+///
+/// Applied identically on the index side ([`tokenize`](Tokenizer::tokenize)) and the query side
+/// ([`tokenize_words`](Tokenizer::tokenize_words)) so the stored and queried grams agree (the
+/// single-tokenizer invariant). A break resets the window — so no gram spans it — and the dropped
+/// whitespace is not itself part of any gram.
+#[inline]
+fn is_break(c: char) -> bool {
+    c.is_whitespace()
 }
 
 /// The script class of `ch` for run segmentation: its strong script as `Script as u8`, or —
@@ -788,6 +910,11 @@ fn script_class_of(ch: char, current: Option<u8>) -> u8 {
 /// Lazy script-segmented window over a [`PreparedChars`] stream. Maintains a sliding window
 /// that resets at every change of script class and whose width is that class's policy; a
 /// leading `Common` run uses the `Common` width. Owns the source (no separate buffer).
+///
+/// v0.4/M5 (derivation §8): each run is windowed at BOTH its primary order `n` and a
+/// **secondary** one shorter (`n − 1`) — Latin trigram + bigram, CJK bigram + unigram — so one
+/// advance can yield two grams. The second (the secondary) is buffered in
+/// [`pending`](Self::pending) and emitted on the next call.
 struct GramTokens<'a> {
     chars: PreparedChars<'a>,
     /// The window policy, copied in (a `[u8; 256]` is `Copy`).
@@ -797,16 +924,51 @@ struct GramTokens<'a> {
     win_len: usize,
     /// The current run's script class, or `None` before the first code point.
     class: Option<u8>,
-    /// The current run's window width (`1..=3`), `0` before the first code point.
+    /// The current run's primary window width (`1..=3`), `0` before the first code point.
     n: usize,
+    /// The current word id (the §5 comonotone *stopping-block* id), incremented at each
+    /// [`is_break`] boundary. Surfaced only through [`next_tagged`](GramTokens::next_tagged) /
+    /// [`tokenize_words`](DefaultTokenizer::tokenize_words); the bare [`Iterator`] drops it. Starts
+    /// at `0`; leading/consecutive breaks may leave gaps, which is fine — only the *partition* of
+    /// grams into words matters to the stop.
+    word: u32,
+    /// The buffered **secondary**-order gram produced alongside a primary gram in one advance,
+    /// returned on the next call (with the word id it was produced under). Drained before any new
+    /// code point is read, so it always belongs to the position just processed and never straddles
+    /// a word/run boundary.
+    pending: Option<(Gram, u32)>,
 }
 
-impl Iterator for GramTokens<'_> {
-    type Item = Gram;
-
-    fn next(&mut self) -> Option<Gram> {
+impl GramTokens<'_> {
+    /// The next gram paired with its word id (the §5 stopping-block id). Whitespace (and any other
+    /// [`is_break`] code point) resets the window — so no gram straddles it — and bumps the word id.
+    /// A break also resets the script class to `None`, so the text after a break starts a fresh run
+    /// exactly like the start of the string (the leading-`Common` rule reapplies).
+    ///
+    /// Each run is windowed at its primary order `n` AND the secondary order `n − 1` (derivation
+    /// §8). A single advance can therefore produce two grams — the **primary** (the full `n`-wide
+    /// window) and the **secondary** (the last `n − 1` code points). The primary is returned first
+    /// and the secondary buffered in [`pending`](Self::pending) for the next call. Sliding the
+    /// secondary window across the whole run recovers every shorter gram (e.g. `"abcd"` →
+    /// `ab, bc, cd` for the bigrams and `abc, bcd` for the trigrams), the structural fallback a
+    /// too-short run (a 2-char Latin word, a 1-char CJK run) relies on.
+    fn next_tagged(&mut self) -> Option<(Gram, u32)> {
+        // Drain a buffered secondary gram before reading any new code point — it belongs to the
+        // position already processed, so it is emitted before any boundary reset.
+        if let Some(p) = self.pending.take() {
+            return Some(p);
+        }
         loop {
             let c = self.chars.next()?;
+            if is_break(c) {
+                // Word/window boundary: drop the break char, reset the window + class, advance the
+                // word id. `saturating_add` so a pathologically long query cannot wrap the counter.
+                self.class = None;
+                self.n = 0;
+                self.win_len = 0;
+                self.word = self.word.saturating_add(1);
+                continue;
+            }
             let class_c = script_class_of(c, self.class);
             if Some(class_c) != self.class {
                 // Run break: start a fresh window of the new class's width.
@@ -824,12 +986,46 @@ impl Iterator for GramTokens<'_> {
                 self.win.copy_within(1..self.n, 0);
                 self.win[self.n - 1] = c;
             }
-            if self.win_len == self.n {
-                if let Some(g) = Gram::from_chars(&self.win[..self.n]) {
-                    return Some(g);
+            // Primary gram: the full `n`-wide window once it has filled.
+            let primary = (self.win_len == self.n)
+                .then(|| Gram::from_chars(&self.win[..self.n]))
+                .flatten();
+            // Secondary gram: the last `n − 1` code points (the one-shorter order), once that many
+            // are present. `n == 1` (a unigram-primary run) has no shorter order, so no secondary.
+            let ns = self.n - 1;
+            let secondary = (ns >= 1 && self.win_len >= ns)
+                .then(|| Gram::from_chars(&self.win[self.win_len - ns..self.win_len]))
+                .flatten();
+            match (primary, secondary) {
+                (Some(p), sec) => {
+                    self.pending = sec.map(|s| (s, self.word));
+                    return Some((p, self.word));
                 }
+                (None, Some(s)) => return Some((s, self.word)),
+                (None, None) => continue,
             }
         }
+    }
+}
+
+impl Iterator for GramTokens<'_> {
+    type Item = Gram;
+
+    fn next(&mut self) -> Option<Gram> {
+        self.next_tagged().map(|(g, _)| g)
+    }
+}
+
+/// The query-side word-tagged adaptor over [`GramTokens`] — yields each gram with its §5
+/// stopping-block (word) id. Indexing uses the bare [`GramTokens`] iterator (the word id is dropped
+/// but the *windowing* — whitespace breaking — is identical, so stored grams agree with queried).
+struct GramWords<'a>(GramTokens<'a>);
+
+impl Iterator for GramWords<'_> {
+    type Item = (Gram, u32);
+
+    fn next(&mut self) -> Option<(Gram, u32)> {
+        self.0.next_tagged()
     }
 }
 
@@ -1069,28 +1265,209 @@ mod tests {
         assert!(g.contains(&"hel".to_string()));
         assert!(g.contains(&"llo".to_string()));
         assert!(g.contains(&"漢字".to_string()));
-        assert!(g.iter().all(|t| !t.contains('漢') || t == "漢字"));
+        // v0.4/M5 dual-order: the Han run also yields its unigrams (漢, 字) and the Latin run its
+        // bigrams. The invariant under test is that no gram STRADDLES the script seam — every gram
+        // is purely Latin or purely Han, never a mix.
+        assert!(g.iter().all(|t| {
+            let has_han = t.chars().any(|c| matches!(c, '漢' | '字'));
+            let has_latin = t.chars().any(|c| c.is_ascii_alphabetic());
+            !(has_han && has_latin)
+        }));
     }
 
     #[test]
     fn common_codepoints_inherit_the_run_script() {
         let tok = DefaultTokenizer::new();
-        // An interior digit is Common: it inherits the Latin run rather than splitting it.
-        assert_eq!(grams(&tok, "a1b"), ["a1b"]);
+        // An interior digit is Common: it inherits the Latin run rather than splitting it. v0.4/M5
+        // dual-order: the Latin run yields its trigram AND its bigrams (no run boundary at the digit).
+        assert_eq!(grams(&tok, "a1b"), ["a1", "a1b", "1b"]);
     }
 
     #[test]
     fn leading_common_run_is_its_own_class() {
         let tok = DefaultTokenizer::new();
-        // "12漢字": "12" is a leading Common (trigram) run — too short, no gram — then the
-        // Han bigram. No "2漢" gram straddles the Common→Han seam.
-        assert_eq!(grams(&tok, "12漢字"), ["漢字"]);
+        // "12漢字": "12" is a leading Common run — now a Common bigram "12" (v0.4/M5 dual-order) —
+        // then the Han run yields its bigram 漢字 AND its unigrams 漢, 字. No gram straddles the
+        // Common→Han seam (no "2漢").
+        assert_eq!(grams(&tok, "12漢字"), ["12", "漢", "漢字", "字"]);
     }
 
     #[test]
     fn uses_bigrams_for_cjk() {
         let tok = DefaultTokenizer::new();
-        assert_eq!(grams(&tok, "漢字漢"), ["漢字", "字漢"]);
+        // CJK primary order is the bigram; v0.4/M5 also emits the unigram secondary (derivation §8).
+        assert_eq!(grams(&tok, "漢字漢"), ["漢", "漢字", "字", "字漢", "漢"]);
+    }
+
+    // ----- v0.4/M4: whitespace breaks gram windows + word tagging -----------------
+
+    #[test]
+    fn whitespace_breaks_gram_windows_no_gram_straddles_a_word() {
+        let tok = DefaultTokenizer::new();
+        // "quick brown" used to be one run yielding cross-word grams ("k b", " br", …). Now the
+        // space breaks the window: per-word trigrams only, and no gram contains whitespace.
+        let g = grams(&tok, "quick brown");
+        // v0.4/M5 dual-order: per-word trigrams AND bigrams; still no gram contains whitespace.
+        assert_eq!(
+            g,
+            [
+                "qu", "qui", "ui", "uic", "ic", "ick", "ck", "br", "bro", "ro", "row", "ow", "own",
+                "wn"
+            ]
+        );
+        assert!(
+            g.iter().all(|t| !t.contains(' ')),
+            "no gram straddles the space: {g:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_and_leading_whitespace_just_break() {
+        let tok = DefaultTokenizer::new();
+        // Runs of whitespace, tabs/newlines, and leading space all break without manufacturing grams.
+        // v0.4/M5 dual-order: each word yields its trigram AND bigrams.
+        assert_eq!(
+            grams(&tok, "  abc\tdef\n"),
+            ["ab", "abc", "bc", "de", "def", "ef"]
+        );
+    }
+
+    #[test]
+    fn break_resets_class_like_string_start() {
+        let tok = DefaultTokenizer::new();
+        // After a break the next run starts fresh: "ab 123" → "ab" is now a Latin bigram (v0.4/M5),
+        // then "123" is a leading-Common run → the Common trigram "123" and its bigrams 12, 23 (the
+        // digit does not inherit a stale Latin run across the break).
+        assert_eq!(grams(&tok, "ab 123"), ["ab", "12", "123", "23"]);
+        // Within a word an interior digit still inherits the run (unchanged): "a1b" yields its
+        // trigram and bigrams; "cd" yields its bigram. No gram crosses the break.
+        assert_eq!(grams(&tok, "a1b cd"), ["a1", "a1b", "1b", "cd"]);
+    }
+
+    #[test]
+    fn tokenize_words_tags_one_id_per_query_word() {
+        let tok = DefaultTokenizer::new();
+        let tagged: Vec<(String, u32)> = tok
+            .tokenize_words("quick brown")
+            .map(|(g, w)| (g.to_string(), w))
+            .collect();
+        // Word 0 = "quick" grams; the space bumps to word 1 = "brown" grams. Grams within a word
+        // share an id; no gram crosses the boundary. v0.4/M5 dual-order: trigrams AND bigrams.
+        assert_eq!(
+            tagged,
+            [
+                ("qu".to_string(), 0),
+                ("qui".to_string(), 0),
+                ("ui".to_string(), 0),
+                ("uic".to_string(), 0),
+                ("ic".to_string(), 0),
+                ("ick".to_string(), 0),
+                ("ck".to_string(), 0),
+                ("br".to_string(), 1),
+                ("bro".to_string(), 1),
+                ("ro".to_string(), 1),
+                ("row".to_string(), 1),
+                ("ow".to_string(), 1),
+                ("own".to_string(), 1),
+                ("wn".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_words_default_is_one_block_for_plain_ngram() {
+        // The plain n-gram tokenizer keeps the trait default: every gram in block 0 (recall-safe),
+        // and it does NOT break on whitespace (its deliberate straddling is unchanged).
+        let tok = TrigramTokenizer::new();
+        let tagged: Vec<(String, u32)> = tok
+            .tokenize_words("a b")
+            .map(|(g, w)| (g.to_string(), w))
+            .collect();
+        assert_eq!(tagged, [("a b".to_string(), 0)]);
+    }
+
+    #[test]
+    fn index_equals_query_grams_under_adversarial_whitespace() {
+        // The single-tokenizer invariant: the index path (`tokenize`) and the query path
+        // (`tokenize_words`) MUST emit the same grams — only the word tags differ — across the full
+        // zoo of whitespace (NBSP, em-space, VT/FF/NEL, CR/LF, tabs, runs, leading/trailing), short
+        // words, mixed script, and intra-word punctuation. And no emitted gram may contain a break.
+        let tok = DefaultTokenizer::new();
+        let cases = [
+            "",
+            " ",
+            "   ",
+            "\t\n\r",
+            "\u{00A0}",                         // NBSP only
+            "a",                                // 1-char Latin
+            "ab",                               // 2-char Latin (no trigram)
+            "abc",                              // exactly one trigram
+            "  abc\tdef\n",                     // leading + tab + trailing
+            "quick\u{00A0}brown",               // NBSP between words
+            "a\u{2003}b\u{2003}ccc",            // em-space separated, short/long mix
+            "café 漢字 test",                   // mixed script with spaces + combining-capable
+            "漢字\t漢",                         // CJK split by tab
+            "a1b cd2",                          // interior digits + a 2-char word
+            "\u{000B}\u{000C}word\u{0085}next", // VT, FF, NEL
+            "don't stop",                       // apostrophe is NOT whitespace -> intra-word
+        ];
+        for text in cases {
+            let bare = grams(&tok, text);
+            let tagged: Vec<String> = tok
+                .tokenize_words(text)
+                .map(|(g, _)| g.to_string())
+                .collect();
+            assert_eq!(
+                bare, tagged,
+                "index vs query grams must agree (single-tokenizer invariant) for {text:?}"
+            );
+            assert!(
+                bare.iter().all(|g| !g.chars().any(|c| c.is_whitespace())),
+                "no gram may contain whitespace for {text:?}: {bare:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn word_ids_partition_grams_by_word_no_cross_word_gram() {
+        // Word ids are constant within a word and non-decreasing across words; three words yield
+        // three distinct ids and no gram straddles a boundary.
+        let tok = DefaultTokenizer::new();
+        let tagged: Vec<(String, u32)> = tok
+            .tokenize_words("quick brown foxes")
+            .map(|(g, w)| (g.to_string(), w))
+            .collect();
+        let mut last = 0u32;
+        let mut words = std::collections::BTreeSet::new();
+        for (g, w) in &tagged {
+            assert!(*w >= last, "word ids are non-decreasing: {tagged:?}");
+            last = *w;
+            words.insert(*w);
+            assert!(
+                !g.chars().any(|c| c.is_whitespace()),
+                "no cross-word gram: {g:?}"
+            );
+        }
+        assert_eq!(words.len(), 3, "three distinct words tagged: {tagged:?}");
+    }
+
+    #[test]
+    fn span_never_returns_a_cross_word_gram() {
+        // Span re-derivation applies the same break, so it locates per-word grams and never a
+        // space-straddling one.
+        let tok = DefaultTokenizer::new();
+        let span = tok.span("quick brown", &["uic"]).expect("span for uic");
+        assert_eq!(&"quick brown"[span.0..span.1], "uic");
+        assert_eq!(
+            tok.span("quick brown", &["k b"]),
+            None,
+            "a space-straddling gram is never located"
+        );
+        assert_eq!(
+            tok.span("quick brown", &["ck "]),
+            None,
+            "a trailing-space gram is never located"
+        );
     }
 
     // ----- span -------------------------------------------------------------------
@@ -1107,7 +1484,13 @@ mod tests {
     fn span_recovers_decomposed_input_under_nfc() {
         let tok = DefaultTokenizer::new();
         let stored = "Xcafe\u{301}Y"; // X c a f e ́ Y
-        let token: String = tok.tokenize(stored).map(|g| g.to_string()).nth(2).unwrap();
+        // The composed trigram "afé" is present in the dual-order stream (alongside bigrams); pick
+        // it by value rather than position (v0.4/M5 interleaves bigrams, so it is no longer nth(2)).
+        let token: String = tok
+            .tokenize(stored)
+            .map(|g| g.to_string())
+            .find(|g| g == "af\u{e9}")
+            .expect("the composed trigram afé is emitted"); // afé (composed)
         assert_eq!(token, "af\u{e9}"); // afé (composed)
         let span = tok
             .span(stored, &[token.as_str()])
@@ -1137,7 +1520,8 @@ mod tests {
         let tok = DefaultTokenizer::new();
         let stored = "\u{1100}\u{1161}\u{11A8}\u{1100}\u{1161}\u{11A8}"; // "각각"
         let tokens: Vec<String> = tok.tokenize(stored).map(|g| g.to_string()).collect();
-        assert_eq!(tokens, ["각각"], "{tokens:?}");
+        // v0.4/M5: the Hangul (CJK) run yields its bigram 각각 AND its unigrams 각, 각.
+        assert_eq!(tokens, ["각", "각각", "각"], "{tokens:?}");
         let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
         let (lo, hi) = tok.span(stored, &refs).expect("a span for the match");
         assert!(stored.is_char_boundary(lo) && stored.is_char_boundary(hi));

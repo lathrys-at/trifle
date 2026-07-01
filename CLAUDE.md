@@ -11,11 +11,18 @@ never touches the caller's data store, and any version/tokenizer/schema drift dr
 rather than migrating it.
 
 It is *lexical* fuzzy search, deliberately **not** semantic search and **not a relevance engine**.
-It ranks by **IDF-weighted, class-normalized trigram overlap** computed in a bit-sliced counter:
-rarer shared grams weigh more (a per-query, df-anchored 4-tier scheme, weights `{1,2,3,4}`, knob
-`D`), and rarity is normalized per script class so a CJK bigram and a Latin trigram compare fairly.
-There is no BM25/relevance tier; a caller wanting a domain reorder composes it over the candidate
-stream. The design assumes small segments throughout.
+It ranks by **logit-idf energy overlap**: a matched gram is worth the RSJ log-odds
+`E_g = ln((N − df_eff − κ)/(df_eff + κ))` — an `N`-anchored idf, surprisal its rare-gram limit —
+which the engine counts as `Δ`-quantized, bit-sliced energy planes; a `search.rs` float post-pass
+then adds a per-gram count credit `μ` and subtracts a saturating length null, and the top-`k` come
+off that corrected float score. Rarity is **class-normalized**, but only as the per-`(script,
+order)` *selection* key — the energy itself stays global — so a CJK bigram and a Latin trigram
+compare fairly when choosing which grams to score. Pruning is a distribution-free Cantelli
+confidence-bounded stop with a per-class floor, realizing an `O(C)` work budget. Grams are
+**dual-order** (a primary order plus a richness-gated secondary one shorter), their per-`(script,
+order)` rank-views fused by RRF. There is no BM25/relevance tier; a caller wanting a domain reorder
+composes it over the candidate stream. See `docs/derivation.md` for the full scoring derivation.
+The design assumes small segments throughout.
 
 Bitmaps are **CRoaring** (the `croaring` crate, SIMD) everywhere — both the storage posting layer
 and the overlap engine.
@@ -76,20 +83,27 @@ A search flows through these stages, each its own module:
 
 - **Tokenize** (`src/tokenize.rs`) — one `Tokenizer` runs on indexed text, postings, *and* queries,
   so "index agrees with query" holds by construction. `DefaultTokenizer` splits text into
-  maximal same-script runs and windows each (CJK bigrams, else trigrams); `NgramTokenizer<N>`
+  maximal same-script runs and windows each at **two** orders — a primary (CJK bigrams, else
+  trigrams) plus a one-shorter secondary (CJK unigrams / Latin bigrams); whitespace and delimiters
+  break gram windows and mark query words. `NgramTokenizer<N>`
   (`TrigramTokenizer`/`BigramTokenizer`) is the fixed-width tokenizer. Normalization (NFC default,
   NFD, accent-stripping, casefold) is the tokenizer's job.
 - **Select** (`src/select.rs`, with `src/welford.rs`) — keeps a **rarest-first** prefix of the
-  query's tokens, from the typo floor `F = m + d` up to `t_max`. Rarity is **class-normalized**: a
-  `z`-score within the token's script class (per-class mean/variance maintained in log space by
-  `welford.rs`), falling back to raw df for a sparse class — so multi-script queries rank fairly.
-  Derives only from *this query's* token document-frequencies, so `matches_batch([…,q,…])` ranks
-  `q` identically to `matches(q)` (**batch == serial**).
+  query's tokens: the typo floor `F = m + d` plus a per-`(script,order)` floor, then rarest-first
+  until the Cantelli stop or the work budget `C`. There is no `t_max` count cap — count is bounded
+  by the query's finite gram set and work by `C`, whose default is **derived from the corpus**
+  (`C = (1/σ)·ln(N/k)·d̄/ln(N/d̄)`, the Lagrangian dual of the stop; a caller `df_budget` overrides
+  it). Rarity is **class-normalized**: a `z`-score within the token's script class (per-class
+  mean/variance maintained in log space by `welford.rs`), falling back to raw df for a sparse class
+  — so multi-script queries rank fairly. Derives only from *this query's* token document-frequencies
+  (and the shared per-batch snapshot), so `matches_batch([…,q,…])` ranks `q` identically to
+  `matches(q)` (**batch == serial**).
 - **Candidate generation** (`crates/trifle-overlap`, the inner engine crate) — the selected tokens'
-  CRoaring postings are handed to a `Counter`, which counts IDF-weighted overlap in a **bit-sliced
-  counter** (counts held across bitmap "bit planes"; adding a weighted posting is a ripple-carry
-  add), `O(k·log k)` bitmap ops — the op count is cardinality-independent ("flatness"). A high→low
-  bucket walk streams scored candidate ids best-first.
+  CRoaring postings are handed to a `Counter`, which counts the `Δ`-quantized logit-idf **energy**
+  overlap in a **bit-sliced counter** (counts held across bitmap "bit planes"; adding a weighted
+  posting is a ripple-carry add), `O(k·log k)` bitmap ops — the op count is cardinality-independent
+  ("flatness"). A high→low bucket walk streams scored candidate ids best-first; the count credit
+  `μ` and the length null are applied afterward, in the `search.rs` float post-pass.
 - **Provenance + filter + hydrate** (`src/search.rs`) — `search.rs` drives the engine walk in
   chunks, batch-reads each chunk's `(key, label)` from `seg` (folding in the opt-in `SqlFilter`),
   dedups one candidate per key, and finally hydrates text + span for exactly the kept candidates in

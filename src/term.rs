@@ -57,6 +57,21 @@ impl Term {
         (self.0 >> 120) as u8
     }
 
+    /// The gram **order** `n` — its codepoint count (`1..=3`), the number of non-zero
+    /// codepoint slots. v0.4/M5 keys the selection class on `(class, order)`: a Latin
+    /// trigram (`n=3`) and a Latin bigram (`n=2`) share a script byte but live in
+    /// different document-frequency regimes (derivation §5/§8), and the
+    /// [`DefaultTokenizer`](crate::tokenize::DefaultTokenizer) now emits both orders. Sound
+    /// because `encode_term` rejects U+0000, so a present codepoint slot is never `0` and
+    /// a `0` slot always means "absent codepoint".
+    #[inline]
+    pub fn order(self) -> u8 {
+        let c0 = (self.0 >> 88) & 0xFFFF_FFFF;
+        let c1 = (self.0 >> 56) & 0xFFFF_FFFF;
+        let c2 = (self.0 >> 24) & 0xFFFF_FFFF;
+        (c0 != 0) as u8 + (c1 != 0) as u8 + (c2 != 0) as u8
+    }
+
     /// Reverse the encoding back to the gram string (lossless for fitting grams).
     #[cfg(test)]
     pub(crate) fn decode(self) -> String {
@@ -175,6 +190,21 @@ mod tests {
         assert_eq!(encode_term("123").unwrap().class(), Script::Common as u8);
         // A leading common codepoint is transparent: the strong script wins.
         assert_eq!(encode_term("1ab").unwrap().class(), Script::Latin as u8);
+    }
+
+    #[test]
+    fn order_is_the_codepoint_count() {
+        // v0.4/M5 (script, order) class key: order = number of present codepoints (1..=3).
+        assert_eq!(encode_term("abc").unwrap().order(), 3); // Latin trigram
+        assert_eq!(encode_term("ab").unwrap().order(), 2); // Latin bigram
+        assert_eq!(encode_term("日本").unwrap().order(), 2); // Han bigram
+        assert_eq!(encode_term("日").unwrap().order(), 1); // Han unigram
+        assert_eq!(encode_term("a").unwrap().order(), 1);
+        // A bigram and a trigram of the same script share a class byte but differ in order.
+        let tri = encode_term("abc").unwrap();
+        let bi = encode_term("ab").unwrap();
+        assert_eq!(tri.class(), bi.class());
+        assert_ne!(tri.order(), bi.order());
     }
 
     #[test]

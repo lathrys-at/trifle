@@ -17,7 +17,7 @@ use crate::store::Namespace;
 
 /// trifle's on-disk format version. Bump on any incompatible schema change; an index stamped
 /// with a different value is reset on open (the cache is rebuilt, never migrated).
-pub(crate) const SCHEMA_VERSION: u32 = 4;
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 
 pub(crate) const KEY_SCHEMA_VERSION: &str = "schema_version";
 pub(crate) const KEY_DATA_VERSION: &str = "data_version";
@@ -28,7 +28,8 @@ pub(crate) const KEY_NEXT_ID: &str = "next_id";
 /// use), maintained in the write transaction so a search reads it as an O(1) point lookup
 /// rather than an O(N) `count(*)`.
 pub(crate) const KEY_SEG_COUNT: &str = "seg_count";
-/// Rolling sum of per-segment gram lengths. `avgdl = seg_len_sum / seg_count`.
+/// Rolling sum of per-segment **distinct** gram counts (`L_d`, derivation §0/§6). `avgdl =
+/// seg_len_sum / seg_count` is then the mean distinct-gram count `L̄`.
 pub(crate) const KEY_SEG_LEN_SUM: &str = "seg_len_sum";
 /// The dictionary generation (id-assignment epoch): bumped on every reassignment of
 /// term-ids (rebuild + reset). The read path compares the snapshot's value to the
@@ -40,7 +41,7 @@ pub(crate) fn create_tables(conn: &Connection, ns: &Namespace, schema: &Schema) 
     let key_sql_type = schema.key_shape().sql_type();
     // The flattened model: `seg` is the only document table — one row per `(key, label)`
     // segment, `seg.id` is the roaring posting id, `seg.key` is the caller key (the one
-    // schema-typed column), `seg.txt` the stored text, `seg.len` its gram count.
+    // schema-typed column), `seg.txt` the stored text, `seg.len` its distinct gram count (`L_d`).
     // `fwd` holds every segment's term-id set (a roaring bitmap), so delete needs neither
     // the text nor the tokenizer. Postings are keyed by the interned term-id from `dict`;
     // the three-way write-frequency split — `term`/`delta` on every write, `post` only on
@@ -194,7 +195,8 @@ pub(crate) fn reset(conn: &Connection, ns: &Namespace, schema: &Schema) -> Resul
 }
 
 /// The `(seg_count, seg_len_sum)` rolling stats (absent → `0`). `seg_count` is the corpus
-/// size `N`; `avgdl = seg_len_sum / seg_count`.
+/// size `N`; `seg_len_sum` sums the per-segment **distinct** gram counts, so `avgdl =
+/// seg_len_sum / seg_count` is the mean distinct-gram count `L̄` (derivation §0/§6).
 pub(crate) fn read_seg_stats(conn: &Connection, ns: &Namespace) -> Result<(i64, i64)> {
     let count = meta_get(conn, ns, KEY_SEG_COUNT)?
         .and_then(|s| s.parse().ok())

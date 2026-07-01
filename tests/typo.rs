@@ -80,12 +80,19 @@ fn min_shared_controls_strictness_when_both_trigrams_are_present() {
 }
 
 #[test]
-fn wider_t_max_never_loses_a_narrow_hit() {
+fn wider_budget_never_loses_a_narrow_hit() {
+    // v0.4/M6 removed `t_max`; the selection-breadth knob is now the work budget `C` (`df_budget`).
+    // On this tiny fixture (N = 8, all grams df ≤ 8) a generous budget admits every gram (no skips),
+    // so its candidate set is a superset of a tight budget's — a wider budget never loses a hit.
     let h = Harness::new();
     load_fixture(&h);
     let q = "quick brown";
-    let narrow = h.search_opts(q, &SearchOpts::new().t_max(6), 10).unwrap();
-    let wide = h.search_opts(q, &SearchOpts::new().t_max(12), 10).unwrap();
+    let narrow = h
+        .search_opts(q, &SearchOpts::new().df_budget(6).min_shared(1), 10)
+        .unwrap();
+    let wide = h
+        .search_opts(q, &SearchOpts::new().df_budget(60).min_shared(1), 10)
+        .unwrap();
     assert!(
         !narrow.is_empty(),
         "narrow must hit something for this to be meaningful"
@@ -94,9 +101,28 @@ fn wider_t_max_never_loses_a_narrow_hit() {
     for d in ids(&narrow) {
         assert!(
             wide_ids.contains(&d),
-            "wider t_max dropped doc {d} that narrow found"
+            "wider budget dropped doc {d} that a narrower one found"
         );
     }
+}
+
+#[test]
+fn two_char_words_match_via_the_bigram_fallback() {
+    // v0.4/M5 (derivation §8): a doc whose every word is exactly 2 chars now indexes BIGRAMS (the
+    // secondary order — a 2-char Latin run is too short for a trigram), and a query of the same short
+    // words reaches the bigram (secondary) rank-view via the structural fallback, so it now MATCHES.
+    // v0.3/M4 (trigram-only) indexed nothing and returned empty here — this is a deliberate,
+    // user-visible recall improvement. Index and query still agree (both emit the same dual-order
+    // grams), so the state stays consistent.
+    let h = Harness::new();
+    h.put(1, "f", "ab cd ef");
+    assert!(
+        hit(&h.search("ab cd ef", 10).unwrap(), 1),
+        "all-short-word doc now matches via the bigram structural fallback (§8)"
+    );
+    // A normal doc in the same index is unaffected.
+    h.put(2, "f", "quick brown");
+    assert!(hit(&h.search("quick brown", 10).unwrap(), 2));
 }
 
 #[test]

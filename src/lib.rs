@@ -103,10 +103,31 @@ use tokenize::{DefaultTokenizer, Tokenizer};
 pub(crate) const DEFAULT_MIN_SHARED: u32 = 2;
 /// Per-typo token damage `d`; the typo floor is `F = m + d`.
 pub(crate) const TYPO_DAMAGE: u32 = 4;
-/// Default `t_max` — the number of rarest query tokens selection keeps.
-pub(crate) const DEFAULT_T_MAX: usize = 12;
 /// Default `D` — df-doublings per IDF weight step in the overlap counter.
 const DEFAULT_WEIGHT_STEP: f64 = 1.0;
+
+// v0.4 scoring-knob defaults (`docs/derivation.md`). `ν`, `κ`, `Δ` are consumed by the M1
+// logit-idf energy path (`search::prepare`); the rest are still scaffolding — declared on
+// [`SearchOpts`] but not yet read by the scoring path, so each carries an `#[expect(dead_code)]`
+// that the milestone wiring it in removes the moment it does (an unfulfilled expectation then
+// fails the lint gate, forcing the cleanup). The companion `Option` fields default to `None`; a
+// consumer resolves the effective value with `unwrap_or(DEFAULT_*)`.
+/// Default `ν` — corroboration depth; sets the contamination floor `df_min = N^((ν−1)/ν)` and
+/// the single-gram energy ceiling `E_max = (1/ν)·ln N` (derivation §4).
+pub(crate) const DEFAULT_NU: f64 = 2.0;
+/// Default `κ` — Jeffreys smoothing pseudocount in the logit-idf energy estimate (derivation §4).
+pub(crate) const DEFAULT_KAPPA: f64 = 0.5;
+/// Default `Δ` — energy quantization step, in nats, for the bit-sliced weights (derivation §7).
+pub(crate) const DEFAULT_DELTA: f64 = 0.5;
+/// Default `σ` — query-side reliability / topicality, driving the count credit `μ = max(0, logit σ)`
+/// (derivation §3/§9). An index-level corpus constant (lives on [`Config`], not [`SearchOpts`]).
+pub(crate) const DEFAULT_SIGMA: f64 = 0.9;
+/// Default `k` — the stop's target candidate-pool size; the stop aims for `ln(N/k)` nats
+/// (derivation §5). Wired into the M4 Cantelli stop (`search::prepare` → `select`).
+pub(crate) const DEFAULT_K_TARGET: u64 = 128;
+/// Default `c` — the Cantelli stopping margin (derivation §5). Wired into the M4 Cantelli stop
+/// (`search::prepare` → `select`).
+pub(crate) const DEFAULT_C_MARGIN: f64 = 2.0;
 /// Buckets in the per-query band-spread histogram (the [`Stats`] weight-step hint). 33 × 0.5 =
 /// 16.5 df-doublings of range (a df ratio up to ~92 000:1).
 const HINT_BUCKETS: usize = 33;
@@ -114,17 +135,47 @@ const HINT_BUCKETS: usize = 33;
 const HINT_BUCKET_WIDTH: f64 = 0.5;
 
 /// Index configuration.
-#[derive(Default)]
 pub struct Config {
     /// The caller's drift/epoch token. Bumping it on reopen invalidates the cache
     /// (drops it to empty), so the next [`rebuild`](Index::rebuild) repopulates.
     pub data_version: u64,
+    /// `σ` — query-side reliability / topicality, driving the count credit `μ = max(0, logit σ)`
+    /// (derivation §3/§9). An **index-level** corpus constant (the reliability is a corpus, not a
+    /// query, property — derivation §3.3), so it lives here rather than on [`SearchOpts`]. It is a
+    /// **runtime-only scoring** field: it is *not* stamped to disk and changing it does **not**
+    /// drift-reset the cache (scoring is a query-time concern). `Config::default()`/`new` set it to
+    /// `0.9`; it is sanitized to `(0,1)` on [`Index::open`] (`logit σ` is finite only there).
+    pub sigma: f64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            data_version: 0,
+            sigma: DEFAULT_SIGMA,
+        }
+    }
 }
 
 impl Config {
-    /// A configuration with the given drift token and otherwise default settings.
+    /// A configuration with the given drift token and otherwise default settings (`σ = 0.9`).
     pub fn new(data_version: u64) -> Self {
-        Config { data_version }
+        Config {
+            data_version,
+            sigma: DEFAULT_SIGMA,
+        }
+    }
+}
+
+/// Sanitize a caller `σ` to the open interval `(0,1)` the count credit `μ = max(0, logit σ)`
+/// needs: `logit σ = ln(σ/(1−σ))` is finite only there, and `σ = 1` would send it to `+∞`. A
+/// non-finite or out-of-range value falls back to the recall-safe default, mirroring the M1
+/// `ν`/`κ`/`Δ` sanitization in the search path. Applied once, at [`Index::open`].
+fn sanitized_sigma(sigma: f64) -> f64 {
+    if sigma.is_finite() && sigma > 0.0 && sigma < 1.0 {
+        sigma
+    } else {
+        DEFAULT_SIGMA
     }
 }
 
@@ -137,18 +188,41 @@ impl Config {
 pub struct SearchOpts<'a> {
     /// `m` — the match floor (shared rare tokens for a hit). `None` → `2`.
     pub min_shared: Option<u32>,
-    /// `t_max` — the number of rarest query tokens selection keeps, above the typo floor
-    /// `F = m + d`. `None` → `12`. The selection breadth (recall/cost) knob.
-    pub t_max: Option<usize>,
-    /// `B` — an optional cap on the cumulative document frequency (`Σdf`) of the selected
-    /// tokens, which is what candidate generation scans — so this bounds *work* directly
-    /// (`t_max` bounds count). Rarest-first tokens are kept while `Σdf` stays within budget; the
-    /// typo floor is always kept. `None` (the default) = no cap.
+    /// `C` — the work budget: a cap on the cumulative document frequency (`Σdf`) of the selected
+    /// tokens, which is what candidate generation scans — so this bounds *work* directly.
+    /// Rarest-first tokens are kept while `Σdf` stays within budget; the typo floor is always kept.
+    /// This is the derivation's work budget `C` (the cap on `Σdf` over the pruned set, derivation
+    /// §5/§7). `None` (the default) does **not** mean unbounded — it means **derive `C` from the
+    /// corpus** (`C = (1/σ)·ln(N/k)·d̄/ln(N/d̄)`, `d̄ = exp(mean_lndf + 2·std_lndf)`; the Lagrangian
+    /// dual of the §5 stop). A caller-supplied value overrides the derived one; the derivation's
+    /// recall-safe guards fall the derived budget back to unbounded on a degenerate corpus (tiny
+    /// `N`, non-finite stats). Bind an explicit huge value to force fully-unbounded selection.
     pub df_budget: Option<u64>,
-    /// `D` — df-doublings per IDF weight step in the overlap counter. `1.0` (the default) means
-    /// each weight level is one more halving of df relative to the query's commonest survivor.
-    /// `N`-invariant. [`Stats::weight_step_hint`] suggests a corpus-fitted value.
+    /// `D` — df-doublings per IDF weight step. `1.0` is the default. **As of v0.4/M1 this no longer
+    /// reaches the overlap counter** — the v0.3 4-tier df-rarity weighting it tuned was replaced by
+    /// the `N`-anchored logit-idf energy planes (knob `Δ`/[`delta`](SearchOpts::delta)). It now only
+    /// feeds the band-spread [`Stats::weight_step_hint`] telemetry, so setting it no longer affects
+    /// ranking.
     pub weight_step: f64,
+    /// `ν` — corroboration depth (derivation §4): sets the contamination floor
+    /// `df_min = N^((ν−1)/ν)` and the single-gram energy ceiling `E_max = (1/ν)·ln N`. `None` →
+    /// `2.0`. Consumed by the logit-idf energy weighting (derivation §2/§4).
+    pub nu: Option<f64>,
+    /// `κ` — the Jeffreys smoothing pseudocount in the logit-idf energy estimate (derivation §4).
+    /// `None` → `0.5`. Consumed by the logit-idf energy weighting (derivation §2/§4).
+    pub kappa: Option<f64>,
+    /// `Δ` — the energy quantization step, in nats, for the bit-sliced energy weights (derivation
+    /// §7). `None` → `0.5`. Consumed by the logit-idf energy weighting (derivation §7). Keep it
+    /// sane: work scales as `~1/Δ` (the engine's plane count, `max_score`, and reachability array
+    /// all grow with `E_max/Δ`), so a pathologically tiny `Δ` is a memory / `u32`-overflow hazard.
+    /// A non-finite, zero, or negative value falls back to the `0.5` default.
+    pub delta: Option<f64>,
+    /// `k` — the confidence-bounded stop's target candidate-pool size; the stop aims for `ln(N/k)`
+    /// nats (derivation §5). `None` → `128`. Consumed by the v0.4/M4 Cantelli stop.
+    pub k_target: Option<u64>,
+    /// `c` — the Cantelli stopping margin (a distribution-free bound, *not* a z-score; derivation
+    /// §5). `None` → `2.0`. Consumed by the v0.4/M4 Cantelli stop.
+    pub c_margin: Option<f64>,
     /// An opt-in raw-SQL [`SqlFilter`] over the caller's live data, folded into per-bucket
     /// provenance. `None` = unfiltered.
     pub filter: Option<SqlFilter<'a>>,
@@ -159,9 +233,13 @@ impl<'a> SearchOpts<'a> {
     pub fn new() -> Self {
         SearchOpts {
             min_shared: None,
-            t_max: None,
             df_budget: None,
             weight_step: DEFAULT_WEIGHT_STEP,
+            nu: None,
+            kappa: None,
+            delta: None,
+            k_target: None,
+            c_margin: None,
             filter: None,
         }
     }
@@ -172,13 +250,8 @@ impl<'a> SearchOpts<'a> {
         self
     }
 
-    /// Set `t_max` — the number of rarest query tokens selection keeps.
-    pub fn t_max(mut self, t_max: usize) -> Self {
-        self.t_max = Some(t_max);
-        self
-    }
-
-    /// Set `df_budget` `B` — cap the cumulative `Σdf` of the selected tokens (bounds scan work).
+    /// Set the work budget `C` — cap the cumulative `Σdf` of the selected tokens (bounds scan
+    /// work). Overrides the corpus-derived default (see [`df_budget`](SearchOpts::df_budget)).
     pub fn df_budget(mut self, budget: u64) -> Self {
         self.df_budget = Some(budget);
         self
@@ -187,6 +260,36 @@ impl<'a> SearchOpts<'a> {
     /// Set `D`, the df-doublings per IDF weight step.
     pub fn weight_step(mut self, d: f64) -> Self {
         self.weight_step = d;
+        self
+    }
+
+    /// Set `ν` — corroboration depth (derivation §4).
+    pub fn nu(mut self, nu: f64) -> Self {
+        self.nu = Some(nu);
+        self
+    }
+
+    /// Set `κ` — the Jeffreys smoothing pseudocount (derivation §4).
+    pub fn kappa(mut self, kappa: f64) -> Self {
+        self.kappa = Some(kappa);
+        self
+    }
+
+    /// Set `Δ` — the energy quantization step in nats (derivation §7).
+    pub fn delta(mut self, delta: f64) -> Self {
+        self.delta = Some(delta);
+        self
+    }
+
+    /// Set `k` — the stop's target candidate-pool size (derivation §5).
+    pub fn k_target(mut self, k: u64) -> Self {
+        self.k_target = Some(k);
+        self
+    }
+
+    /// Set `c` — the Cantelli stopping margin (derivation §5).
+    pub fn c_margin(mut self, c: f64) -> Self {
+        self.c_margin = Some(c);
         self
     }
 
@@ -273,6 +376,10 @@ pub struct Index<T: Tokenizer = DefaultTokenizer> {
     pub(crate) store: Sidecar,
     pub(crate) tokenizer: T,
     data_version: u64,
+    /// `σ` — the index-level query-side reliability (derivation §3.3), sanitized to `(0,1)` from
+    /// [`Config::sigma`] at open. Read by the scoring path (`search::prepare`) to form the count
+    /// credit `μ = max(0, logit σ)`. Runtime-only (never stamped; not a drift trigger).
+    pub(crate) sigma: f64,
     /// The declared data model (key shape, text fields).
     pub(crate) schema: Schema,
     /// The in-memory faulting term dictionary (gram → `u32` id) + per-class df statistics,
@@ -318,6 +425,9 @@ impl<T: Tokenizer> Index<T> {
             store,
             tokenizer,
             data_version: config.data_version,
+            // Sanitize σ once here (an index-level corpus constant); the scoring path then reads it
+            // without re-checking. Mirrors the M1 ν/κ/Δ sanitization (recall-safe fallback).
+            sigma: sanitized_sigma(config.sigma),
             schema,
             dict: Dictionary::empty(),
             poisoned: AtomicBool::new(false),
@@ -448,16 +558,16 @@ impl<T: Tokenizer> Index<T> {
     // ----- write internals (used by the `Writer` lease) -----------------------
 
     /// Tokenize `text` once, returning both its distinct resolved term-ids (each assigned via
-    /// `assign`) and its total gram count with repetition — the stored segment length `|d|`.
+    /// `assign`) and its **distinct** gram count — the stored segment length `L_d` (the
+    /// derivation §0/§6 presence-length the length null is computed against; distinct, *not*
+    /// with-repetition).
     fn distinct_term_ids(
         &self,
         text: &str,
         mut assign: impl FnMut(Term) -> Result<TermId>,
     ) -> Result<(Vec<TermId>, i64)> {
         let mut distinct: FxHashSet<T::Token> = FxHashSet::default();
-        let mut seg_len: i64 = 0;
         for tok in self.tokenizer.tokenize(text) {
-            seg_len += 1;
             distinct.insert(tok);
         }
         let mut ids: Vec<TermId> = Vec::with_capacity(distinct.len());
@@ -471,6 +581,9 @@ impl<T: Tokenizer> Index<T> {
             })?;
             ids.push(assign(term)?);
         }
+        // `L_d` is the number of *distinct* grams (derivation §0): one per deduplicated token,
+        // equal to `ids.len()`.
+        let seg_len = distinct.len() as i64;
         Ok((ids, seg_len))
     }
 
@@ -573,12 +686,21 @@ impl<T: Tokenizer> Index<T> {
         Ok(())
     }
 
-    /// The distinct tokens of `text`, deduplicated via the token type. Returns the tokens
-    /// themselves (the read path resolves and selects in term-space, stringifying only the
-    /// tokens that reach the result).
-    pub(crate) fn distinct_tokens(&self, text: &str) -> Vec<T::Token> {
-        let distinct: FxHashSet<T::Token> = self.tokenizer.tokenize(text).collect();
-        distinct.into_iter().collect()
+    /// The distinct **query** tokens of `text`, each tagged with its **word id** — the §5
+    /// comonotone stopping-block id the Cantelli stop groups co-failing grams into (derivation §5).
+    /// A gram occurring in more than one query word is kept once, with its **first-occurrence** word
+    /// id (a shared gram → one block; cross-word coupling is the §5 "accepted residual", and a
+    /// shared gram is usually a common one that is floored out of the stop anyway). Deduplicated via
+    /// the token type; the read path resolves and selects in term-space, stringifying only the
+    /// tokens that reach the result. Query-side only; indexing tokenizes with
+    /// [`Tokenizer::tokenize`] directly (no word tags needed — the grams agree because both sides
+    /// apply the same whitespace-breaking windowing).
+    pub(crate) fn distinct_tokens_tagged(&self, text: &str) -> Vec<(T::Token, u32)> {
+        let mut seen: FxHashMap<T::Token, u32> = FxHashMap::default();
+        for (tok, word) in self.tokenizer.tokenize_words(text) {
+            seen.entry(tok).or_insert(word);
+        }
+        seen.into_iter().collect()
     }
 
     /// Read the stored `fwd` term-id sets for a set of segment ids.
@@ -1140,6 +1262,42 @@ impl TokenChanges {
             })
             .collect();
         postings::apply_writes(conn, ns, &writes)
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::{Config, DEFAULT_SIGMA, sanitized_sigma};
+
+    #[test]
+    fn config_defaults_sigma_to_the_default() {
+        assert_eq!(Config::default().sigma, DEFAULT_SIGMA);
+        assert_eq!(Config::new(7).sigma, DEFAULT_SIGMA);
+        assert_eq!(Config::new(7).data_version, 7);
+    }
+
+    #[test]
+    fn sigma_sanitization_keeps_the_open_interval_and_falls_back_otherwise() {
+        // In-range values pass through.
+        assert_eq!(sanitized_sigma(0.9), 0.9);
+        assert_eq!(sanitized_sigma(0.5), 0.5);
+        assert_eq!(sanitized_sigma(0.001), 0.001);
+        // Boundary / out-of-range / non-finite all fall back (logit is non-finite there).
+        for bad in [
+            0.0,
+            1.0,
+            -0.1,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                sanitized_sigma(bad),
+                DEFAULT_SIGMA,
+                "σ={bad} must fall back"
+            );
+        }
     }
 }
 

@@ -26,6 +26,21 @@
 //!   the keys). The key array is cacheable across an as-you-type session.
 //! - **Co-located join (Sidecar + an optional `ATTACH`):** attach your tables to trifle's read
 //!   connections, then join directly — `"key IN (SELECT note_id FROM src.cards WHERE deck = ?)"`.
+//!
+//! **Field-scoping.** The provenance query exposes the segment's `label` (the text-field name), so
+//! restricting a search to one field is just a filter — the supported idiom, no per-field API:
+//!
+//! ```
+//! # use trifle::SqlFilter;
+//! # use trifle::rusqlite::ToSql;
+//! let field: &dyn ToSql = &"title";
+//! let filter = SqlFilter { fragment: "label = ?1", params: &[field] };
+//! # let _ = filter;
+//! ```
+//!
+//! This scopes candidates to segments of that field. (First-class field-scoped candidate generation
+//! — field-local idf, per-field channels — arrives with the field-aware index milestone, post-0.4;
+//! until then this filter is the field-scoping mechanism.)
 
 use rusqlite::ToSql;
 

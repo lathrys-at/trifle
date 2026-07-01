@@ -21,8 +21,17 @@ fn candidates_are_provenance_only_then_hydrated() {
         .collect::<Result<Vec<_>>>()
         .unwrap();
     assert!(!pool.is_empty(), "the query matches fixture docs");
-    // Candidates carry provenance + score, no text.
-    assert!(pool.iter().all(|c| c.score() >= c.overlap()));
+    // Candidates carry provenance + score components + the corrected ranking key, no text. Since
+    // v0.4 M3 dropped the engine's `≥ 1` weight clamp, `score()` (the bit-sliced energy `E_acc`)
+    // can fall below `overlap()` (a candidate matching only weight-0 commons has `score() == 0`),
+    // so the old `score() ≥ overlap()` no longer holds. The stream now orders by the finite
+    // corrected float, descending.
+    assert!(pool.iter().all(|c| c.corrected_score().is_finite()));
+    assert!(
+        pool.windows(2)
+            .all(|w| w[0].corrected_score() >= w[1].corrected_score()),
+        "the stream yields candidates in corrected-score descending order"
+    );
 
     // Hydrate only the top 2 (choose-then-hydrate).
     let keep: Vec<_> = pool.into_iter().take(2).collect();

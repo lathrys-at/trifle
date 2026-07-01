@@ -51,8 +51,11 @@ pub(crate) struct Dictionary {
 
 struct DictInner {
     map: FxHashMap<u128, TermId>,
-    /// id → script-class byte, for maintaining [`ClassStats`] by term-id on writes.
-    class_of: FxHashMap<TermId, u8>,
+    /// id → `(script-class byte, order)`, for maintaining [`ClassStats`] by term-id on writes.
+    /// v0.4/M5 keys the selection class on `(script, order)` (derivation §5/§8), and a delta
+    /// applied in [`apply_df_changes`](Dictionary::apply_df_changes) has only the id, so both
+    /// the class byte and the order are stashed here at intern/load time.
+    class_of: FxHashMap<TermId, (u8, u8)>,
     classes: ClassStats,
     /// The next id to assign (high-water mark), as `u64` so it can represent the
     /// exhausted sentinel `u32::MAX + 1` without wrapping.
@@ -89,7 +92,7 @@ impl Dictionary {
             term = ns.term(),
         );
         let mut map: FxHashMap<u128, TermId> = FxHashMap::default();
-        let mut class_of: FxHashMap<TermId, u8> = FxHashMap::default();
+        let mut class_of: FxHashMap<TermId, (u8, u8)> = FxHashMap::default();
         let mut classes = ClassStats::new();
         let mut max_id: u32 = 0;
         {
@@ -104,9 +107,10 @@ impl Dictionary {
                 let key = decode_key(&gram)?;
                 let df: i64 = r.get(2)?;
                 let class = (key >> 120) as u8;
+                let order = Term(key).order();
                 map.insert(key, id);
-                class_of.insert(id, class);
-                classes.add_sample(class, df);
+                class_of.insert(id, (class, order));
+                classes.add_sample(class, order, df);
                 max_id = max_id.max(id);
             }
         }
@@ -145,9 +149,9 @@ impl Dictionary {
     ) -> (FxHashMap<u128, TermId>, u64, ClassSnap) {
         let guard = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut out = FxHashMap::with_capacity_and_hasher(terms.len(), Default::default());
-        let mut classes_seen: Vec<u8> = Vec::new();
+        let mut classes_seen: Vec<(u8, u8)> = Vec::new();
         for t in terms {
-            classes_seen.push(t.class());
+            classes_seen.push((t.class(), t.order()));
             if let Some(&id) = guard.map.get(&t.0) {
                 out.insert(t.0, id);
             }
@@ -185,8 +189,8 @@ impl Dictionary {
         }
         let mut guard = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         for &(id, old_df, new_df) in changes {
-            if let Some(class) = guard.class_of.get(&id).copied() {
-                guard.classes.update(class, old_df, new_df);
+            if let Some((class, order)) = guard.class_of.get(&id).copied() {
+                guard.classes.update(class, order, old_df, new_df);
             }
         }
     }
@@ -281,7 +285,10 @@ impl InternStage<'_> {
             .unwrap_or_else(PoisonError::into_inner);
         for (key, id) in self.new {
             guard.map.entry(key).or_insert(id);
-            guard.class_of.entry(id).or_insert((key >> 120) as u8);
+            guard
+                .class_of
+                .entry(id)
+                .or_insert(((key >> 120) as u8, Term(key).order()));
             guard.next_id = guard.next_id.max(id as u64 + 1);
         }
     }

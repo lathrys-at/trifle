@@ -20,6 +20,18 @@
 //! for the overlap. Either way the retained state is owned (`Vec<Bitmap>`), so
 //! [`Counter`] is `'static` — no self-referential lifetime when embedded in a stream.
 //!
+//! # Weight 0 and the raw-overlap floor (v0.4)
+//!
+//! Explicit weights may be **0** (a common gram whose logit-idf energy quantizes to nothing). Such
+//! a gram contributes no energy to the bit-sliced planes, so a candidate matching *only* weight-0
+//! grams has weighted score 0 and is **not** surfaced by the walk — it is a *count-only* candidate
+//! recovered by the search layer (which carries the per-order / floored metadata the engine does
+//! not). Because weight 0 breaks the old `weighted ≥ raw` invariant (a candidate can have raw
+//! overlap ≥ floor yet weighted score < floor), the walk's **scan** lower bound is decoupled from
+//! the raw-overlap **gate**: when any weight is 0 the walk scans every positive bucket down to 1
+//! and checks `raw_overlap ≥ floor` per id; otherwise (`min weight ≥ 1`, so `weighted ≥ raw`) it
+//! keeps scanning only down to `floor`. The all-weight-1 fast path is unchanged.
+//!
 //! # Flatness
 //!
 //! Building the counter is `O(k·log k)` bitmap *operations* (the op count is cardinality-
@@ -102,6 +114,11 @@ pub struct Counter {
     postings: Vec<Bitmap>,
     /// The raw-overlap floor: a candidate must share at least this many postings.
     floor: u32,
+    /// The walk's bucket-scan lower bound, decoupled from [`floor`](Self::floor) for v0.4 weight-0
+    /// support: `1` when any weight is 0 (then `weighted < raw` is possible, so every positive
+    /// bucket down to 1 must be scanned and gated per-id on raw overlap), else `floor` (then
+    /// `weighted ≥ raw`, so buckets below `floor` hold only sub-floor candidates and are skipped).
+    scan_floor: u32,
     /// `Σ weights` — the maximum achievable weighted score.
     max_score: u32,
     /// `reachable[c]` = some subset of weights sums to exactly `c`; lets the walk skip
@@ -122,7 +139,11 @@ impl Counter {
     }
 
     /// Build from owned `bitmaps` with explicit per-posting `weights` (parallel to `bitmaps`).
-    /// Weights are clamped to `>= 1` (the floor + early-stop rely on *weighted ≥ raw*).
+    ///
+    /// Weights may be **0** (v0.4): a weight-0 gram adds no energy, so a candidate matching only
+    /// weight-0 grams is not surfaced by the walk (it is a count-only candidate for the search
+    /// layer to recover). The raw-overlap floor is still honored via the decoupled `scan_floor`
+    /// (see the module docs). The old `≥ 1` clamp is gone.
     ///
     /// # Panics
     /// Panics if `weights.len() != bitmaps.len()`.
@@ -134,12 +155,14 @@ impl Counter {
             max_score,
             reachable,
             floor,
+            scan_floor,
         } = {
             let refs: Vec<&Bitmap> = bitmaps.iter().collect();
             plan(&refs, weights, min_shared)
         };
         // Retain owned postings only for mixed-weight queries (raw overlap via `contains`); the
-        // all-weight-1 case takes overlap = score and keeps nothing.
+        // all-weight-1 case takes overlap = score and keeps nothing. A weight-0 gram makes the
+        // query mixed (not all-weight-1), so postings are retained and `raw_overlap` works.
         let postings = if all_weight_one {
             Vec::new()
         } else {
@@ -149,6 +172,7 @@ impl Counter {
             weighted,
             postings,
             floor,
+            scan_floor,
             max_score,
             reachable,
             all_weight_one,
@@ -181,6 +205,7 @@ impl Counter {
             max_score,
             reachable,
             floor,
+            scan_floor,
         } = {
             // SAFETY: each `blob` outlives its `view` (both live only within this block);
             // portable layout needs no alignment.
@@ -206,6 +231,7 @@ impl Counter {
             weighted,
             postings,
             floor,
+            scan_floor,
             max_score,
             reachable,
             all_weight_one,
@@ -246,7 +272,11 @@ impl Counter {
                 }
             }
             let mut refilled = false;
-            while w.next_c >= self.floor as i64 {
+            // Scan down to `scan_floor` (= 1 when a weight-0 gram is present, else `floor`). The
+            // per-id `overlap >= floor` gate above still enforces the raw-overlap floor; decoupling
+            // the scan bound lets a positive-energy candidate whose weighted score fell below
+            // `floor` (energy from a weight-1 gram, the rest weight-0) still be reached.
+            while w.next_c >= self.scan_floor as i64 {
                 let c = w.next_c as u32;
                 w.next_c -= 1;
                 if !self.reachable[c as usize] {
@@ -363,15 +393,17 @@ struct Plan {
     max_score: u32,
     reachable: Vec<bool>,
     floor: u32,
+    scan_floor: u32,
 }
 
 /// Build the weighted bit-sliced planes + walk metadata from the operands. Generic over
 /// `&Bitmap` / `&BitmapView`, so the build is zero-copy over views yet reusable for owned inputs.
-fn plan<O: Operand + Copy>(ops: &[O], mut weights: Vec<u32>, min_shared: u32) -> Plan {
-    for w in &mut weights {
-        *w = (*w).max(1); // weighted >= raw (floor + early-stop soundness)
-    }
-    let all_weight_one = weights.iter().all(|&w| w == 1);
+///
+/// v0.4: weights are used as given (no `≥ 1` clamp). A weight-0 gram adds no energy; the walk's
+/// `scan_floor` compensates so the raw-overlap floor stays sound (see the module docs).
+fn plan<O: Operand + Copy>(ops: &[O], weights: Vec<u32>, min_shared: u32) -> Plan {
+    let all_weight_one = !weights.is_empty() && weights.iter().all(|&w| w == 1);
+    let has_zero_weight = weights.contains(&0);
 
     let mut weighted: Vec<Bitmap> = Vec::new();
     for (op, &w) in ops.iter().zip(&weights) {
@@ -379,6 +411,9 @@ fn plan<O: Operand + Copy>(ops: &[O], mut weights: Vec<u32>, min_shared: u32) ->
     }
 
     let floor = (min_shared as usize).min(ops.len()).max(1) as u32;
+    // A weight-0 gram breaks `weighted ≥ raw`, so scan every positive bucket (down to 1) and gate
+    // per-id on raw overlap; otherwise buckets below `floor` hold only sub-floor candidates.
+    let scan_floor = if has_zero_weight { 1 } else { floor };
     let max_score: u32 = weights.iter().sum();
 
     // Subset-sum reachability over the weights (0/1 knapsack, descending to avoid reuse).
@@ -405,6 +440,7 @@ fn plan<O: Operand + Copy>(ops: &[O], mut weights: Vec<u32>, min_shared: u32) ->
         max_score,
         reachable,
         floor,
+        scan_floor,
     }
 }
 
@@ -541,12 +577,34 @@ mod tests {
     }
 
     #[test]
-    fn weight_clamp_keeps_zero_weighted_results() {
+    fn zero_weight_yields_nothing_from_the_bit_sliced_walk() {
+        // v0.4: the old `≥ 1` clamp is removed, so a weight-0 gram contributes no energy — the
+        // bit-sliced walk yields nothing for a candidate that matches only weight-0 grams
+        // (max_score 0, no positive bucket). Recovering such *count-only* candidates is the search
+        // layer's job (it carries the per-order / floored metadata the engine does not).
         let counter = Counter::build_weighted(&[Bitmap::of(&[9])], vec![0], 1);
+        assert_eq!(counter.max_score, 0);
+        assert!(all(&counter).is_empty());
+    }
+
+    #[test]
+    fn zero_weight_gram_does_not_hide_a_positive_energy_candidate() {
+        // A candidate matching one weight-1 gram + one weight-0 gram has weighted energy 1 but raw
+        // overlap 2. With min_shared = 2 the old `scan down to floor` would skip bucket 1 and lose
+        // it; the decoupled `scan_floor = 1` (weight-0 present) reaches it, and the per-id raw gate
+        // (overlap 2 ≥ 2) admits it. A candidate matching only the weight-1 gram (overlap 1 < 2) is
+        // correctly excluded.
+        let w1 = Bitmap::of(&[5, 6]); // weight 1: ids 5,6
+        let w0 = Bitmap::of(&[5]); // weight 0: id 5
+        let counter = Counter::build_weighted(&[w1, w0], vec![1, 0], 2);
         let got = all(&counter);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].score, 1); // clamped to 1
-        assert_eq!(got[0].overlap, 1);
+        assert_eq!(got.len(), 1, "only id 5 clears the raw-overlap floor of 2");
+        assert_eq!(got[0].id, 5);
+        assert_eq!(got[0].score, 1, "energy is the single weight-1 gram");
+        assert_eq!(
+            got[0].overlap, 2,
+            "raw overlap counts the weight-0 gram too"
+        );
     }
 
     #[test]
@@ -582,6 +640,30 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].score, 8);
         assert_eq!(got[0].overlap, 8);
+    }
+
+    #[test]
+    fn plane_count_is_cardinality_independent_flatness() {
+        // Flatness (the property M3's reshape must preserve): the bit-sliced op count is fixed by
+        // the WEIGHTS — plane count = bits(Σ wq), reachability spans 0..=max_score — never by
+        // posting cardinality. Two multi-bucket counters with identical weights but vastly
+        // different cardinalities must have identical plane count, max_score, and reachability, so
+        // the walk does the same number of bitmap ops per bucket regardless of posting size.
+        let weights = vec![3u32, 5u32]; // buckets {3, 5, 8} — multi-bucket, not single
+        let small = [Bitmap::of(&[1]), Bitmap::of(&[1, 2])];
+        let huge = [
+            (0..100_000u32).collect::<Bitmap>(),
+            (0..200_000u32).collect::<Bitmap>(),
+        ];
+        let c_small = Counter::build_weighted(&small, weights.clone(), 1);
+        let c_huge = Counter::build_weighted(&huge, weights.clone(), 1);
+        assert_eq!(
+            c_small.weighted.len(),
+            c_huge.weighted.len(),
+            "plane count is cardinality-independent"
+        );
+        assert_eq!(c_small.max_score, c_huge.max_score);
+        assert_eq!(c_small.reachable.len(), c_huge.reachable.len());
     }
 
     #[test]

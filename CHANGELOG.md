@@ -44,9 +44,11 @@ breaking change for callers that set them).
   property, §3.3). The 7 scoring knobs — `ν`, `κ`, `Δ`, `σ`, `k`, `c`, `C` — live on
   [`SearchOpts`]/[`Config`].
 - Deferred to post-0.4: the per-**field** doc-side `ε` channel (`ρ = σ(1 − ε)^n`), which lands with
-  the field-aware index milestone, and a few §5/§9 precision refinements (incl. selsweep-tuning the
-  derived budget's `Z` shape constant down toward the latency knee, a recall-preserving 0.4.1 win).
-  Field-scoped results already work today via a [`SqlFilter`] on `seg.label` (see its rustdoc).
+  the field-aware index milestone, and a few §5/§9 precision refinements. The **performance-only
+  0.4.1** follow-up (selsweep-tuning the derived budget's `Z` shape constant down toward the latency
+  knee — a recall-preserving win — plus bounded-top-`k` / walk micro-costs) is planned in
+  `docs/v0.4.1-plan.md`. Field-scoped results already work today via a [`SqlFilter`] on `seg.label`
+  (see its rustdoc).
 - On disk: `SCHEMA_VERSION` 4 → 5 (`seg.len` is now the distinct-gram count) and a bumped
   tokenizer fingerprint (windowing change), so an existing cache **drift-resets** (drop + rebuild,
   never migrate). The CRoaring storage byte-format is unchanged.

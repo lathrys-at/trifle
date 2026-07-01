@@ -89,11 +89,15 @@ A search flows through these stages, each its own module:
   (`TrigramTokenizer`/`BigramTokenizer`) is the fixed-width tokenizer. Normalization (NFC default,
   NFD, accent-stripping, casefold) is the tokenizer's job.
 - **Select** (`src/select.rs`, with `src/welford.rs`) — keeps a **rarest-first** prefix of the
-  query's tokens, from the typo floor `F = m + d` up to `t_max`. Rarity is **class-normalized**: a
-  `z`-score within the token's script class (per-class mean/variance maintained in log space by
-  `welford.rs`), falling back to raw df for a sparse class — so multi-script queries rank fairly.
-  Derives only from *this query's* token document-frequencies, so `matches_batch([…,q,…])` ranks
-  `q` identically to `matches(q)` (**batch == serial**).
+  query's tokens: the typo floor `F = m + d` plus a per-`(script,order)` floor, then rarest-first
+  until the Cantelli stop or the work budget `C`. There is no `t_max` count cap — count is bounded
+  by the query's finite gram set and work by `C`, whose default is **derived from the corpus**
+  (`C = (1/σ)·ln(N/k)·d̄/ln(N/d̄)`, the Lagrangian dual of the stop; a caller `df_budget` overrides
+  it). Rarity is **class-normalized**: a `z`-score within the token's script class (per-class
+  mean/variance maintained in log space by `welford.rs`), falling back to raw df for a sparse class
+  — so multi-script queries rank fairly. Derives only from *this query's* token document-frequencies
+  (and the shared per-batch snapshot), so `matches_batch([…,q,…])` ranks `q` identically to
+  `matches(q)` (**batch == serial**).
 - **Candidate generation** (`crates/trifle-overlap`, the inner engine crate) — the selected tokens'
   CRoaring postings are handed to a `Counter`, which counts the `Δ`-quantized logit-idf **energy**
   overlap in a **bit-sliced counter** (counts held across bitmap "bit planes"; adding a weighted

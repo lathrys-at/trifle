@@ -29,9 +29,6 @@ breaking change for callers that set them).
   gram set, work by `C`).
 - **`SearchOpts::epsilon` is removed** (it was reserved and unconsumed; the doc-side `ε` channel is
   a per-*field* property that returns with the field-aware index milestone, post-0.4).
-- The §9 concentration cap now keys off the **non-floored** grams only: a floored (junk-suspect)
-  gram at `E_max` no longer loosens the cap, so it cannot out-credit and bury a real discriminating
-  gram.
 - [`Candidate`] exposes its §10 score components — [`energy`], [`count`], [`length`] (all nats) and
   [`nat_score`] `= energy + count − length` — from the governing (best-ranked / retained) rank-view,
   never a cross-view sum. `nat_score` is a stable, cross-query-comparable magnitude for a downstream

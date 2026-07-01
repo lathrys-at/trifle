@@ -257,16 +257,11 @@ fn batch_equals_serial_under_the_count_credit() {
 fn dedup_keeps_the_max_float_segment_per_key() {
     // score_union dedups one candidate per KEY, keeping the MAX-float segment. Doc 1 has a
     // rare-gram segment (title "kqxvz", high float) and a common-gram segment (body "report",
-    // low float); it must surface via the higher-float title segment. "kqxvz" is seated in enough
-    // docs (df = 8 > df_min = √48 ≈ 6.9) to stay NON-floored: a real discriminating gram the §9 cap
-    // (v0.4/M6 keys off non-floored grams) protects, so the rare title out-floats the common body.
+    // low float); it must surface via the higher-float title segment.
     let h = Harness::new();
     let mut w = h.index.writer().unwrap();
     w.upsert(1, &[("title", "kqxvz"), ("body", "report")])
         .unwrap();
-    for i in 2..=8 {
-        w.upsert(i, &[("title", "kqxvz")]).unwrap(); // "kqxvz" df = 8 ⇒ non-floored (real energy)
-    }
     for i in 2..=40 {
         w.upsert(i, &[("body", "report")]).unwrap(); // make "report" common (df high)
     }
@@ -447,11 +442,7 @@ fn union_recovers_both_walk_and_count_only_candidates() {
     // rare-energy docs then rank above the commons-only count docs.
     let h = Harness::new();
     let mut docs: Vec<(i64, String)> = Vec::new();
-    // "kqxvz" is seated in 8 docs (df = 8 > df_min = √39 ≈ 6.2) so it stays NON-floored — a real
-    // rare discriminating gram the §9 cap (v0.4/M6, non-floored keying) protects, so its walk docs
-    // outrank the commons-only count docs. (A FLOORED rare gram would instead be excluded from the
-    // cap's E_top and could be out-credited by the commons — the accepted §4/§9 precision tradeoff.)
-    for i in 1..=8 {
+    for i in 1..=3 {
         docs.push((i, "kqxvz".to_string())); // rare gram ⇒ walk candidates
     }
     for i in 10..=40 {
@@ -463,14 +454,14 @@ fn union_recovers_both_walk_and_count_only_candidates() {
         .search_opts("kqxvz report", &SearchOpts::new().min_shared(1), 64)
         .unwrap());
     assert!(
-        (1..=8).any(|k| hits.contains(&k)),
+        (1..=3).any(|k| hits.contains(&k)),
         "a walk (rare-gram) candidate is recovered: {hits:?}"
     );
     assert!(
         (10..=40).any(|k| hits.contains(&k)),
         "a count-only (common-gram) candidate is recovered: {hits:?}"
     );
-    let worst_rare = (1..=8)
+    let worst_rare = (1..=3)
         .filter_map(|k| hits.iter().position(|&h| h == k))
         .max()
         .unwrap();

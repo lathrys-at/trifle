@@ -520,29 +520,25 @@ fn derived_budget(n_segments: u64, k_target: u64, r: f64, class_snap: &ClassSnap
 /// the commons collectively outweigh the dominant gram) is the baseline; §9's smoother shrink
 /// toward the cap is a deferred tuning refinement.
 ///
-/// **Floored grams are excluded from `E_top` and the commons (v0.4/M6, §9/§12).** The cap exists to
-/// protect the real discriminating gram from being out-credited by commons; a floored (junk-suspect)
-/// gram sits at `E_max` and, if it were eligible to be `E_top`, its high energy would *loosen* the
-/// cap and defeat that protection. So `concentration_cap` keys off the **non-floored** grams only
-/// (parallel `floored` mask), consistent with where credit is actually earned and with the M4 stop.
-/// (R1's numeric, now fixed: with a floored `E_top = 6.9` co-present with a real gram `4.0` and two
-/// commons `0.5`, the floored-excluded reading takes `E_top = 4.0` and caps at `(4.0 − 1.0)/1 = 3.0`,
-/// protecting the real gram, rather than the floored-included `5.9` that loosened it.)
-fn concentration_cap(energies: &[f64], floored: &[bool]) -> Option<f64> {
-    // Range over the NON-floored grams only: a floored E_max gram must not be a dominant E_top.
-    let non_floored = || {
-        energies
-            .iter()
-            .zip(floored)
-            .filter(|&(_, &f)| !f)
-            .map(|(&e, _)| e)
-    };
-    let e_top = non_floored().fold(f64::NEG_INFINITY, f64::max);
+/// **Floored grams are NOT excluded from `E_top` — the literal §12 reading (v0.4/M6, resolved).**
+/// The cap ranges over *all* of `P`. This is deliberate: on a large corpus `df_min = √N` is a low
+/// bar, so a *genuinely rare, real* discriminating gram is itself floored (sits at `E_max`) — the
+/// common and valuable "find the doc with this rare term" query. Keeping it in `E_top` lets it
+/// anchor the cap, tightening μ so a commons-only doc cannot out-credit the on-topic doc (the strong
+/// case). Excluding floored grams (considered and rejected in M6) would instead *disable* the cap
+/// for exactly those queries — no non-floored dominant remains, so μ goes uncapped and the commons
+/// win. The price paid here is the rare *adversarial* case — a query pairing a junk floored gram
+/// (which loosens the cap) with a real *non-floored* discriminator — but a rare gram the user typed
+/// is almost always the intended discriminator, so that case is uncommon; §9 also frames such a
+/// distortion as "one the reranker undoes." The floored *exclusion* still governs which grams earn
+/// count credit (`popcount_credit`) and the M4 stop — just not the cap's `E_top`.
+fn concentration_cap(energies: &[f64]) -> Option<f64> {
+    let e_top = energies.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if e_top <= 0.0 {
-        return None; // no dominant real rare gram (all-common / all-floored / empty) — μ survives (§7/§9)
+        return None; // no dominant rare gram (all-common / empty) — μ survives (§7/§9)
     }
     let half = 0.5 * e_top;
-    let commons: Vec<f64> = non_floored().filter(|&e| e < half).collect();
+    let commons: Vec<f64> = energies.iter().copied().filter(|&e| e < half).collect();
     if commons.len() < 2 {
         return None;
     }
@@ -1044,10 +1040,10 @@ fn build_view_plan<T: Tokenizer>(
          flatness bound violated"
     );
     // v0.4 M2 (§3/§4/§9): per-gram floored flag (query-side `df ≤ df_min`) + gram order
-    // (codepoint count), then the §9-capped per-order count credit. The cap ranges over P's
-    // **non-floored** energies (a floored `E_max` gram is excluded from `E_top`, §9/§12/M6 — see
-    // `concentration_cap`); `σ` is index-level and uniform across orders query-side, so every
-    // present non-floored order maps to the same capped `μ`. The per-order bucketing is kept
+    // (codepoint count), then the §9-capped per-order count credit. The cap ranges over ALL of P's
+    // energies (the literal §12 reading — a floored `E_max` rare gram anchors `E_top`, protecting
+    // it; see `concentration_cap`); `σ` is index-level and uniform across orders query-side, so
+    // every present non-floored order maps to the same capped `μ`. The per-order bucketing is kept
     // structural for a future doc-side `ρ = σ(1−ε)^n`. All of this is a pure function of THIS
     // view's grams + the shared (σ, N, ν, κ, Δ) snapshot ⇒ `batch == serial`.
     let present_floored: Vec<bool> = present_dfs
@@ -1058,7 +1054,7 @@ fn build_view_plan<T: Tokenizer>(
         .iter()
         .map(|t| t.chars().count() as u8)
         .collect();
-    let mu_capped = match concentration_cap(&energies, &present_floored) {
+    let mu_capped = match concentration_cap(&energies) {
         Some(cap) => mu.min(cap),
         None => mu,
     };
@@ -1936,8 +1932,8 @@ mod energy_tests {
 mod credit_tests {
     //! Numerical fixtures for the v0.4 count credit `μ` and the §9 concentration cap (derivation
     //! §3/§7/§9/§12): `μ = max(0, logit σ)`; the floor↔μ crossover near `df ≈ 9000`; the cap's
-    //! all-common pass-through, its concentrated cap, and its hard floor at 0; the floored-energy
-    //! `E_top` interpretation; and the per-order non-floored popcount credit.
+    //! all-common pass-through, its concentrated cap, and its hard floor at 0; the literal-§12
+    //! floored-included `E_top` reading; and the per-order non-floored popcount credit.
     use super::{concentration_cap, count_credit, e_floored, e_max, energy, popcount_credit};
     use crate::DEFAULT_SIGMA;
     use crate::hash::FxHashMap;
@@ -1950,10 +1946,9 @@ mod credit_tests {
         assert!((a - b).abs() < 1e-6, "expected ≈ {b}, got {a}");
     }
 
-    /// The §9 cap over an **all-non-floored** energy set (the common case), so the existing fixtures
-    /// stay concise; the floored-exclusion tests call `concentration_cap` with an explicit mask.
+    /// Thin alias for [`concentration_cap`] keeping the fixtures concise.
     fn cap(energies: &[f64]) -> Option<f64> {
-        concentration_cap(energies, &vec![false; energies.len()])
+        concentration_cap(energies)
     }
 
     #[test]
@@ -2025,20 +2020,6 @@ mod credit_tests {
     }
 
     #[test]
-    fn cap_excludes_floored_energy_from_e_top() {
-        // v0.4/M6 (§9/§12): a floored gram's E_max-level energy is NOT eligible to be the dominant
-        // E_top — it is excluded from the cap. With the 6.9 floored and only two 0.0 non-floored
-        // grams left, there is no positive dominant ⇒ not concentrated ⇒ uncapped (μ survives).
-        assert_eq!(
-            concentration_cap(&[6.9, 0.0, 0.0], &[true, false, false]),
-            None,
-            "a floored top is excluded, so no dominant real gram remains"
-        );
-        // The SAME energies, now all non-floored, DO concentrate: cap = (6.9 − 0)/(2−1) = 6.9.
-        approx(cap(&[6.9, 0.0, 0.0]).expect("all-real concentrates"), 6.9);
-    }
-
-    #[test]
     fn cap_boundary_e_equals_half_is_not_common() {
         // §9 uses a STRICT `E < ½·E_top`: a gram exactly at half is NOT a common, so two grams at
         // the boundary leave 0 commons ⇒ uncapped.
@@ -2064,20 +2045,18 @@ mod credit_tests {
     }
 
     #[test]
-    fn cap_floored_e_top_no_longer_loosens_the_cap_r1_regression() {
-        // R1 regression (§9/§12, v0.4/M6): a FLOORED gram at E_max (≈6.9) is co-present with a real
-        // mid-rare gram (4.0) above two commons (0.5, 0.5). Excluding the floored gram from E_top,
-        // the dominant is the REAL 4.0, its commons are the two 0.5s (4.0 ≥ ½·6.9 would have hidden
-        // them under the old reading), and the cap is the tighter (4.0 − 1.0)/(2 − 1) = 3.0 — which
-        // protects the real discriminating gram. The old floored-INCLUDED reading gave 5.9 (loose).
+    fn cap_floored_e_top_anchors_and_protects_the_rare_gram() {
+        // Literal §12 (§9/§12, v0.4/M6, resolved): a genuinely-rare, real discriminating gram is
+        // itself FLOORED (df ≤ √N, so it sits at E_max ≈ 6.9) — the common "find the doc with this
+        // rare term" query. Because floored grams are NOT excluded, that 6.9 anchors `E_top`: with
+        // two commons at 0.5, cap = (6.9 − 1.0)/(2 − 1) = 5.9, a healthy budget that still bounds μ
+        // so a commons-only doc cannot out-credit the on-topic doc. (Excluding the floored gram —
+        // considered and rejected — would drop `E_top` to 0.5, leave no dominant, and DISABLE the
+        // cap for exactly this query, letting the commons win.)
         approx(
-            concentration_cap(&[6.9, 4.0, 0.5, 0.5], &[true, false, false, false])
-                .expect("the real gram is the dominant once the floored top is excluded"),
-            3.0,
+            concentration_cap(&[6.9, 0.5, 0.5]).expect("the floored rare gram anchors E_top"),
+            5.9,
         );
-        // Cross-check: the same non-floored trio {4.0, 0.5, 0.5} alone yields the identical 3.0, so
-        // excluding the floored 6.9 truly reproduces the tight, protective cap.
-        approx(cap(&[4.0, 0.5, 0.5]).expect("concentrated"), 3.0);
     }
 
     #[test]

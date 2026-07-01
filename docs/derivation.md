@@ -253,7 +253,7 @@ This withholding is essential, not incidental. The contamination floor parks a j
 
 $$\mu \le \max\!\left(0,\ \frac{\max(0,E_{\text{top}}) - \sum_{g\in\text{common}} \max(0,E_g)}{\#\text{common} - 1}\right),$$
 
-restricted to the query-relative commons, so that a query spread across several comparable rare grams — which has no dominant member, hence no commons under the relative definition — remains uncapped. The dominant gram $E_{\text{top}}$ and its commons range over the **non-floored** grams only. A floored gram sits at the ceiling $E_{\max}$, above every real gram (§4), so admitting it as $E_{\text{top}}$ would let a junk-suspect gram *loosen* the cap — raising the ceiling the commons are measured against — and so defeat the cap's whole purpose of shielding the real discriminating gram from commons-count. Keying the cap to the non-floored grams matches where the credit is actually earned (non-floored only, above): when the only rare gram present is itself floored, there is no real dominant gram to protect, the set is not concentrated, and $\mu$ is left uncapped — the count-and-length regime of §7, a precision distortion the reranker undoes rather than a recall loss. The hard floor at zero, reached when several commons collectively outweigh the dominant gram, discards all count evidence in a single step; a smoother form that shrinks $\mu$ toward the cap is preferable in tuning. Because the threshold is relative to the query's own top energy, it self-calibrates per query with no corpus-specific cutoff; only the fraction ($\tfrac12$) and the hard-versus-smooth choice are universal shape constants. (Concentration is a property of query structure, not corruption level: a short clean query can be concentrated, and a heavily corrupted query can still be spread.)
+restricted to the query-relative commons, so that a query spread across several comparable rare grams — which has no dominant member, hence no commons under the relative definition — remains uncapped. The dominant gram $E_{\text{top}}$ and its commons range over **all** of the pruned grams, floored ones included (the literal reading of $P$). This is deliberate: because $df_{\min}=\sqrt N$ is a low bar, a genuinely rare, real discriminating gram is itself floored and sits at $E_{\max}$, so admitting floored grams as $E_{\text{top}}$ lets that rare gram anchor the cap and shield the on-topic document from commons-count — the common, valuable "find the document carrying this rare term" case. Excluding floored grams (considered and rejected) would instead leave no dominant gram for exactly those queries and *disable* the cap, letting a commons-only document out-credit the on-topic one. The price of including them — a query that pairs a junk floored gram (whose ceiling energy loosens the cap) with a real non-floored discriminator — is rare, since a rare gram the user actually typed is almost always the intended discriminator, and is in any case a precision distortion the reranker undoes rather than a recall loss. The hard floor at zero, reached when several commons collectively outweigh the dominant gram, discards all count evidence in a single step; a smoother form that shrinks $\mu$ toward the cap is preferable in tuning. Because the threshold is relative to the query's own top energy, it self-calibrates per query with no corpus-specific cutoff; only the fraction ($\tfrac12$) and the hard-versus-smooth choice are universal shape constants. (Concentration is a property of query structure, not corruption level: a short clean query can be concentrated, and a heavily corrupted query can still be spread.)
 
 ---
 
@@ -371,11 +371,11 @@ score_query(query, channel):
 
         # per-gram count credit mu_g = max(0, logit(g.r)); one value per ORDER present (query-side: uniform SIGMA)
         for g in P: g.mu = max(0, logit(g.r))
-        # concentrated(P): a dominant NON-FLOORED gram (top energy) AND >= 2 query-relative commons
-        # (E < E_top/2) -- both ranging over the NON-FLOORED grams only, so a floored E_max gram is
-        # excluded from E_top and cannot LOOSEN the cap (Section 9). An all-common query, or one whose
-        # only rare gram is floored, has no real dominant -> not concentrated -> mu survives (Section 7).
-        if concentrated(P): for g in P: g.mu = min(g.mu, concentration_cap(P))   # cap over non-floored grams
+        # concentrated(P): a dominant gram (top energy) AND >= 2 query-relative commons (E < E_top/2),
+        # both ranging over ALL of P (floored included, literal Section 12) -- a genuinely rare gram is
+        # itself floored (df <= sqrt N), so keeping it as E_top lets it anchor and TIGHTEN the cap that
+        # shields it. An all-common query has no dominant gram -> not concentrated -> mu survives (Sec 7).
+        if concentrated(P): for g in P: g.mu = min(g.mu, concentration_cap(P))
 
         # bit-sliced accumulation of the ENERGY part only (hot loop)
         assert DELTA < 2 * E_floored                                 # Section 7: keeps round(E_floored/DELTA) >= 1, so a floored gram's weight

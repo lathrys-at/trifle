@@ -151,7 +151,7 @@ pub(crate) fn create_shadows(conn: &Connection, ns: &Namespace, schema: &Schema)
 /// Swap the freshly-built shadow tables in for the live ones in one transaction:
 /// drop live, rename each shadow to its live name, recreate the `seg`/`dict` indexes.
 /// A reader sees complete-old or complete-new — never partial.
-pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace, _schema: &Schema) -> Result<()> {
+pub(crate) fn swap_shadows(conn: &Connection, ns: &Namespace) -> Result<()> {
     let sql = format!(
         "DROP INDEX IF EXISTS {seg}_by_key;
          DROP INDEX IF EXISTS {seg}_by_key_label;
@@ -291,15 +291,38 @@ pub(crate) fn write_stamps(
     Ok(())
 }
 
+/// Parse a REQUIRED-integrity meta counter: **absent** is fine (a fresh store — the caller
+/// supplies the default), but a **present-yet-unparseable** value is external corruption and
+/// fails closed as [`Error::Corrupt`](crate::Error::Corrupt) (v0.5). Silently defaulting was the
+/// pre-v0.5 behavior and contradicted the fail-closed philosophy: a defaulted `next_id` restarts
+/// id allocation (id **reuse** — postings would alias new segments), and a defaulted
+/// `dict_generation` could falsely match a reader's captured generation.
+fn parse_counter<T: std::str::FromStr>(key: &str, raw: Option<String>) -> Result<Option<T>> {
+    match raw {
+        None => Ok(None),
+        Some(s) => match s.parse() {
+            Ok(v) => Ok(Some(v)),
+            Err(_) => Err(crate::Error::corrupt(format!(
+                "meta counter {key:?} holds an unparseable value {s:?}; the store is corrupt \
+                 (rebuild it)"
+            ))),
+        },
+    }
+}
+
+/// The id high-water mark (`meta.next_id`). Absent → `1` (a fresh store); malformed-present →
+/// [`Error::Corrupt`](crate::Error::Corrupt).
+pub(crate) fn next_id(conn: &Connection, ns: &Namespace) -> Result<i64> {
+    Ok(parse_counter(KEY_NEXT_ID, meta_get(conn, ns, KEY_NEXT_ID)?)?.unwrap_or(1))
+}
+
 /// Allocate `count` fresh, never-reused segment ids, returning the first. Ids are
 /// monotonic (the high-water mark lives in `meta.next_id`): a freed id is never
 /// reassigned, so a stale id lingering in a posting until the next fold is harmless
 /// (it can never come to mean a different segment), and no REMOVE-before-ADD
 /// ordering discipline is needed.
 pub(crate) fn alloc_ids(conn: &Connection, ns: &Namespace, count: u64) -> Result<i64> {
-    let next: i64 = meta_get(conn, ns, KEY_NEXT_ID)?
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    let next: i64 = next_id(conn, ns)?;
     let after = next
         .checked_add(count as i64)
         // Ids are stored in u32 roaring postings, so the real ceiling is u32::MAX, not
@@ -319,11 +342,14 @@ pub(crate) fn set_next_id(conn: &Connection, ns: &Namespace, next_id: i64) -> Re
     meta_set(conn, ns, KEY_NEXT_ID, &next_id.to_string())
 }
 
-/// The current dictionary generation (term-id-assignment epoch). Absent → 0.
+/// The current dictionary generation (term-id-assignment epoch). Absent → 0 (a fresh store);
+/// malformed-present → [`Error::Corrupt`](crate::Error::Corrupt) (a silently-defaulted
+/// generation could falsely match a reader's captured one).
 pub(crate) fn dict_generation(conn: &Connection, ns: &Namespace) -> Result<u64> {
-    Ok(meta_get(conn, ns, KEY_DICT_GENERATION)?
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0))
+    Ok(
+        parse_counter(KEY_DICT_GENERATION, meta_get(conn, ns, KEY_DICT_GENERATION)?)?
+            .unwrap_or(0),
+    )
 }
 
 /// Bump the dictionary generation. Called whenever term-ids are reassigned — a
@@ -476,7 +502,7 @@ mod tests {
             [],
         )
         .unwrap();
-        swap_shadows(&c, &ns, &schema()).unwrap();
+        swap_shadows(&c, &ns).unwrap();
         // Live now reflects the shadow's content, and the index exists again.
         let (id, txt): (i64, String) = c
             .query_row(&format!("SELECT id, txt FROM {}", ns.seg()), [], |r| {
@@ -496,6 +522,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn malformed_present_counters_fail_closed_as_corrupt() {
+        // v0.5 (§1.4 of the post-v0.4 review): an absent counter is a fresh store (defaulted),
+        // but a present-yet-unparseable one is external corruption — silently defaulting
+        // `next_id` would REUSE ids and a defaulted `dict_generation` could falsely match.
+        let c = conn();
+        let ns = Namespace::bare();
+        create_tables(&c, &ns, &schema()).unwrap();
+        // Absent → defaults, no error.
+        assert_eq!(next_id(&c, &ns).unwrap(), 1);
+        assert_eq!(dict_generation(&c, &ns).unwrap(), 0);
+        // Malformed-present → Corrupt, from both the reader and the allocator.
+        meta_set(&c, &ns, KEY_NEXT_ID, "not-a-number").unwrap();
+        assert!(matches!(next_id(&c, &ns), Err(crate::Error::Corrupt(_))));
+        assert!(matches!(alloc_ids(&c, &ns, 1), Err(crate::Error::Corrupt(_))));
+        meta_set(&c, &ns, KEY_DICT_GENERATION, "-3").unwrap(); // u64: negative is malformed
+        assert!(matches!(
+            dict_generation(&c, &ns),
+            Err(crate::Error::Corrupt(_))
+        ));
     }
 
     #[test]

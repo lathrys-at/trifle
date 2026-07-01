@@ -174,3 +174,36 @@ fn three_char_query_matches_via_single_trigram() {
         .unwrap();
     assert!(hit(&hits, 1));
 }
+
+/// v0.5 (§1.3 of the post-v0.4 review): a label repeated within one `upsert` call resolves
+/// LAST-WINS — equivalent to sequential upserts — and leaves no posting residue. Pre-v0.5 the
+/// duplicate was only debug-asserted, and in release the superseded segment's posting entries
+/// leaked permanently (df inflated by one + a dead id per shared token until rebuild).
+#[test]
+fn duplicate_label_in_one_upsert_is_last_wins_with_no_df_residue() {
+    let h = Harness::new();
+    {
+        let mut w = h.index.writer().unwrap();
+        w.upsert(1, &[("f", "alpha bravo"), ("f", "charlie delta")])
+            .unwrap();
+        w.commit().unwrap();
+    }
+    assert!(
+        hit(&h.search("charlie delta", 10).unwrap(), 1),
+        "the LAST duplicate's text is the indexed one"
+    );
+    assert!(
+        h.search("alpha bravo", 10).unwrap().is_empty(),
+        "the superseded first duplicate is not indexed"
+    );
+    // No df residue: removing the key and folding leaves zero live terms.
+    {
+        let mut w = h.index.writer().unwrap();
+        w.remove(1).unwrap();
+        w.commit().unwrap();
+    }
+    h.index.compact().unwrap();
+    let stats = h.index.stats().unwrap();
+    assert_eq!(stats.terms, 0, "no phantom df survives the duplicate-label upsert");
+    assert_eq!(stats.segments, 0);
+}

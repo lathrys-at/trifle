@@ -56,7 +56,8 @@ impl Sidecar {
 
         let read_path = path.clone();
         let factory = Box::new(move || -> Result<Connection> {
-            configure_sqlite_perf();
+            // `configure_sqlite_perf` already ran at open (before the first connection); the
+            // factory only ever runs after it, so no per-connection call is needed here.
             let conn = Connection::open_with_flags(
                 &read_path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -74,7 +75,16 @@ impl Sidecar {
 
     /// Acquire the exclusive write connection. Blocks until the writer is free.
     pub(crate) fn write(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        Ok(self.store.write())
+        let guard = self.store.write();
+        // Defensive rollback (v0.5 — mirrors the read pool's check-in): a prior writer whose
+        // Drop-time ROLLBACK failed leaves the connection inside a stale transaction; beginning
+        // new work on top would either fail ("cannot start a transaction within a transaction")
+        // or, worse, nest into the stale txn. Roll it back here so every write entry point
+        // (writer lease, compact, rebuild, init) starts from autocommit.
+        if !guard.is_autocommit() {
+            guard.execute_batch("ROLLBACK")?;
+        }
+        Ok(guard)
     }
 
     /// Acquire a pooled read-only connection (returned to the pool on drop).

@@ -513,15 +513,20 @@ impl<T: Tokenizer> Index<T> {
         }
     }
 
-    /// A cheap consistency probe: the monotonic-id invariant `max(seg.id) < next_id`.
+    /// A cheap consistency probe: the monotonic-id invariant `max(seg.id) < next_id`. A
+    /// **malformed** (present-yet-unparseable) `next_id` also counts as desync — at open, the
+    /// correct response to a corrupt counter is the same drop-and-rebuild reset (mid-operation
+    /// it surfaces as [`Error::Corrupt`] instead; see `schema::next_id`).
     fn desync(&self, conn: &Connection, ns: &Namespace) -> Result<bool> {
         let max_id: Option<i64> =
             conn.query_row(&format!("SELECT max(id) FROM {}", ns.seg()), [], |r| {
                 r.get(0)
             })?;
-        let next: i64 = schema::meta_get(conn, ns, schema::KEY_NEXT_ID)?
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
+        let next: i64 = match schema::next_id(conn, ns) {
+            Ok(n) => n,
+            Err(Error::Corrupt(_)) => return Ok(true),
+            Err(e) => return Err(e),
+        };
         Ok(max_id.is_some_and(|m| m >= next))
     }
 
@@ -604,10 +609,12 @@ impl<T: Tokenizer> Index<T> {
             .optional()?)
     }
 
-    /// Write one segment `(key, label) = text`, interning its grams through `stage` and storing
-    /// the term-id set in `fwd` (so delete needs no text). If a segment with this `(key, label)`
-    /// already exists: with `replace` it is dropped first (its removals into `changes`); without
-    /// `replace`, this errors.
+    /// Write one segment `(key, label) = text` under a **preallocated** id, interning its grams
+    /// through `stage` and storing the term-id set in `fwd` (so delete needs no text). If a
+    /// segment with this `(key, label)` already exists: with `replace` it is dropped first (its
+    /// removals into `changes`); without `replace`, this errors. Rolling-stat deltas accumulate
+    /// into `stats` — the caller applies them in **one** `bump_seg_stats` per write call (v0.5),
+    /// not one per segment.
     #[allow(clippy::too_many_arguments)]
     fn write_segment(
         &self,
@@ -616,7 +623,9 @@ impl<T: Tokenizer> Index<T> {
         key: &Key,
         label: &str,
         text: &str,
+        id: i64,
         changes: &mut TokenChanges,
+        stats: &mut (i64, i64),
         stage: &mut dict::InternStage<'_>,
         replace: bool,
     ) -> Result<()> {
@@ -631,9 +640,8 @@ impl<T: Tokenizer> Index<T> {
                     "a segment with label {label:?} already exists for this key"
                 )));
             }
-            self.drop_segment(conn, ns, seg_id, changes)?;
+            self.drop_segment(conn, ns, seg_id, changes, stats)?;
         }
-        let id = schema::alloc_ids(conn, ns, 1)?;
         let (ids, seg_len) =
             self.distinct_term_ids(text, |term| stage.intern_term(term, conn, ns))?;
         conn.execute(
@@ -649,18 +657,21 @@ impl<T: Tokenizer> Index<T> {
             rusqlite::params![id, postings::serialize(&bm)],
         )?;
         changes.add(id as u32, &ids);
-        schema::bump_seg_stats(conn, ns, 1, seg_len)?;
+        stats.0 += 1;
+        stats.1 += seg_len;
         Ok(())
     }
 
-    /// Drop one segment by id: accumulate its term-id removals into `changes`, then delete its
-    /// `seg` and `fwd` rows and back out its length from the rolling stats.
+    /// Drop one segment by id: accumulate its term-id removals into `changes` and its rolling-
+    /// stat deltas into `stats` (the caller applies them in one `bump_seg_stats`), then delete
+    /// its `seg` and `fwd` rows.
     fn drop_segment(
         &self,
         conn: &Connection,
         ns: &Namespace,
         seg_id: i64,
         changes: &mut TokenChanges,
+        stats: &mut (i64, i64),
     ) -> Result<()> {
         let fwd = self.read_fwd(conn, ns, &[seg_id as u32])?;
         if let Some(ids) = fwd.get(&(seg_id as u32)) {
@@ -682,7 +693,8 @@ impl<T: Tokenizer> Index<T> {
             &format!("DELETE FROM {} WHERE id = ?1", ns.seg()),
             rusqlite::params![seg_id],
         )?;
-        schema::bump_seg_stats(conn, ns, -1, -seg_len)?;
+        stats.0 -= 1;
+        stats.1 -= seg_len;
         Ok(())
     }
 
@@ -869,7 +881,7 @@ impl<T: Tokenizer> Index<T> {
             inverted.iter().map(|(id, bm)| (*id, bm)),
         )?;
 
-        schema::swap_shadows(&tx, ns, &self.schema)?;
+        schema::swap_shadows(&tx, ns)?;
         schema::set_next_id(&tx, ns, next_seg)?;
         schema::set_seg_stats(&tx, ns, next_seg - 1, total_seg_len)?;
         schema::bump_dict_generation(&tx, ns)?;
@@ -958,15 +970,6 @@ impl<T: Tokenizer> Index<T> {
     }
 }
 
-/// Whether `segments` names any label more than once — a caller-contract violation (a document
-/// holds each label at most once). Used only by a `debug_assert`; `O(n²)` over a tiny slice.
-fn has_duplicate_label(segments: &[(&str, &str)]) -> bool {
-    segments
-        .iter()
-        .enumerate()
-        .any(|(i, (label, _))| segments[..i].iter().any(|(prev, _)| prev == label))
-}
-
 /// The exclusive write lease: holding it **is** holding the single-writer lock. One transaction
 /// is open for the lease; [`commit`](Writer::commit) decouples durability from the lease
 /// (commit-and-continue), and dropping without committing rolls the uncommitted tail back.
@@ -1037,8 +1040,9 @@ impl<'a, T: Tokenizer> Writer<'a, T> {
     /// Insert-or-replace the given `(label, text)` segments of the document keyed `key` (creating
     /// it if absent). Never errors on collision; a key's other (unnamed) segments are left intact.
     ///
-    /// The labels in `segments` must be distinct (a document holds each label at most once);
-    /// a duplicate label in one call is a contract violation asserted in debug builds.
+    /// A label repeated within one call resolves **last-wins** (v0.5) — equivalent to sequential
+    /// `upsert`s of the same labels (a document holds each label at most once, so the earlier
+    /// duplicate is simply superseded).
     pub fn upsert(&mut self, key: impl Into<Key>, segments: &[(&str, &str)]) -> Result<()> {
         let key = key.into();
         self.atomic(|w| w.write_doc(&key, segments, true))
@@ -1055,14 +1059,39 @@ impl<'a, T: Tokenizer> Writer<'a, T> {
         let conn: &Connection = &self.guard;
         let stage = self.stage.as_mut().expect("writer stage present");
         let mut changes = TokenChanges::default();
-        debug_assert!(
-            !has_duplicate_label(segments),
-            "upsert requires distinct labels within one call (a document holds each label once)"
-        );
-        for (label, text) in segments {
-            self.index
-                .write_segment(conn, ns, key, label, text, &mut changes, stage, replace)?;
+        // Duplicate labels resolve last-wins (v0.5). Pre-v0.5 this was only debug-asserted, and
+        // in release the superseded segment's posting entries leaked permanently (df drift + a
+        // dead id per posting until rebuild) — deduping up front makes the sequential-upsert
+        // equivalence hold exactly.
+        let mut deduped: Vec<(&str, &str)> = Vec::with_capacity(segments.len());
+        {
+            let mut seen: FxHashSet<&str> = FxHashSet::default();
+            for &(label, text) in segments.iter().rev() {
+                if seen.insert(label) {
+                    deduped.push((label, text));
+                }
+            }
+            deduped.reverse();
         }
+        // One id allocation and one rolling-stats bump per call (v0.5), not per segment — the
+        // meta table is touched twice regardless of how many segments the call carries.
+        let first_id = schema::alloc_ids(conn, ns, deduped.len() as u64)?;
+        let mut stats = (0i64, 0i64);
+        for (i, (label, text)) in deduped.iter().enumerate() {
+            self.index.write_segment(
+                conn,
+                ns,
+                key,
+                label,
+                text,
+                first_id + i as i64,
+                &mut changes,
+                &mut stats,
+                stage,
+                replace,
+            )?;
+        }
+        schema::bump_seg_stats(conn, ns, stats.0, stats.1)?;
         let df = changes.apply(conn, ns)?;
         self.pending_df.extend(df);
         Ok(())
@@ -1127,8 +1156,13 @@ impl<'a, T: Tokenizer> Writer<'a, T> {
             let ns = w.index.store.namespace();
             let conn: &Connection = &w.guard;
             let mut changes = TokenChanges::default();
+            let mut stats = (0i64, 0i64);
             if let Some(seg_id) = w.index.find_segment(conn, ns, &key, label)? {
-                w.index.drop_segment(conn, ns, seg_id, &mut changes)?;
+                w.index
+                    .drop_segment(conn, ns, seg_id, &mut changes, &mut stats)?;
+            }
+            if stats != (0, 0) {
+                schema::bump_seg_stats(conn, ns, stats.0, stats.1)?;
             }
             let df = changes.apply(conn, ns)?;
             w.pending_df.extend(df);

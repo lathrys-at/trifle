@@ -5,7 +5,11 @@ edition = "2024"
 rust-version = "1.85"
 description = "IDF-weighted bit-sliced overlap engine for trifle, on the CRoaring (SIMD) backend with zero-copy posting views."
 license = "MIT OR Apache-2.0"
-publish = false
+repository = "https://github.com/lathrys-at/trifle"
+keywords = ["bitmap", "roaring", "overlap", "search", "idf"]
+categories = ["data-structures", "algorithms"]
+# Published so `trifle` (which depends on it by `version`) can resolve it on crates.io. The public
+# surface is an implementation detail of `trifle`; versions bump in lockstep with the parent crate.
 
 [dependencies]
 # CRoaring (SIMD). Permissive `^2.6` to keep MSRV 1.85: croaring 2.6 has no MSRV floor, while

@@ -57,9 +57,11 @@ fn span_indexes_the_matched_region_of_the_text() {
 }
 
 #[test]
-fn one_match_per_doc_even_with_many_segments() {
+fn retrieval_granularity_is_per_segment_by_default_and_per_key_on_collapse() {
+    // v0.5: the SEGMENT is the retrieval unit — retrieval granularity is decoupled from the key
+    // (the lifecycle handle). Two segments under one key, both matching: the default returns
+    // both (each with its own label + score); Collapse::Key folds to the key's best segment.
     let h = Harness::new();
-    // Two segments under one key: both mention "quartz".
     h.upsert(
         7,
         &[
@@ -68,10 +70,31 @@ fn one_match_per_doc_even_with_many_segments() {
         ],
     );
     let hits = h.search("quartz crystal", 10).unwrap();
+    let doc7: Vec<&trifle::Match> = hits.iter().filter(|m| m.key.as_i64() == Some(7)).collect();
+    assert_eq!(
+        doc7.len(),
+        2,
+        "per-segment default returns each matching segment"
+    );
+    assert_eq!(
+        doc7[0].label, "front",
+        "results stay best-first: the full-phrase segment outranks the partial one"
+    );
+    assert!(
+        doc7[0].score >= doc7[1].score,
+        "per-segment results are ordered by score"
+    );
+
+    let opts = SearchOpts::new().collapse(trifle::Collapse::Key);
+    let hits = h.search_opts("quartz crystal", &opts, 10).unwrap();
     assert_eq!(
         hits.iter().filter(|m| m.key.as_i64() == Some(7)).count(),
         1,
-        "a doc appears at most once (deduped by key)"
+        "Collapse::Key folds to one result per key"
+    );
+    assert_eq!(
+        hits[0].label, "front",
+        "the fold keeps the key's best-scoring segment"
     );
 }
 

@@ -62,6 +62,13 @@ untouched.
 
 ### Breaking API changes
 
+- **Retrieval granularity is decoupled from the key (behavior change).** The segment is the
+  engine's native unit, and a search now returns **every matching segment** by default — a key
+  may appear once per matching segment, and `limit` counts segments. The pre-v0.5 one-per-key
+  behavior is the explicit `SearchOpts::collapse(Collapse::Key)` (one result per key — its
+  best segment; `limit` counts keys). The key remains the *lifecycle* handle (dedup / replace /
+  delete); what a search returns is a search-time choice, no longer a schema commitment (the
+  old "give each chunk its own key to get multiple passages back" workaround is unnecessary).
 - **`SearchOpts::weight_step`, `WeightStepHint`, and `Stats::weight_step_hint` are removed.**
   `weight_step` has been scoring-inert since v0.4/M1 (the 4-tier weighting it tuned is gone), so
   the hint suggested a value for a knob that did nothing. (Supersedes the v0.3 "keep the

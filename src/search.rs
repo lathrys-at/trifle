@@ -6,7 +6,8 @@
 //! ([`Counter`]); this module wires storage to it: it loads the selected tokens' croaring
 //! postings, hands them to the engine, then walks the engine's best-first scored ids,
 //! batch-hydrating provenance (and applying the opt-in [`SqlFilter`](crate::SqlFilter)) per chunk,
-//! deduping one candidate per key.
+//! folding results at the caller's retrieval granularity ([`Collapse`], v0.5: per **segment** by
+//! default, per-key best on [`Collapse::Key`]).
 //!
 //! Two front doors share this pipeline:
 //! - [`CandidateStream`] — the lazy, snapshot-pinned spine: a best-first cursor of
@@ -39,9 +40,26 @@ use crate::term::Term;
 use crate::tokenize::Tokenizer;
 use crate::welford::ClassSnap;
 use crate::{
-    DEFAULT_C_MARGIN, DEFAULT_DELTA, DEFAULT_K_TARGET, DEFAULT_KAPPA, DEFAULT_MIN_SHARED,
+    Collapse, DEFAULT_C_MARGIN, DEFAULT_DELTA, DEFAULT_K_TARGET, DEFAULT_KAPPA, DEFAULT_MIN_SHARED,
     DEFAULT_NU, Error, Index, IntoTerm, Result, SearchOpts, TYPO_DAMAGE, postings, schema,
 };
+
+/// The retrieval-granularity fold key (v0.5): what one result *is*. [`Collapse::None`] keys
+/// results by segment id (every matching segment is its own result); [`Collapse::Key`] folds to
+/// the per-key best segment (the entity-style collapse — `limit` then counts keys).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ResultKey {
+    Seg(u32),
+    Key(Key),
+}
+
+/// The fold key for one candidate under the search's [`Collapse`] granularity.
+fn result_key(collapse: Collapse, key: &Key, seg_id: u32) -> ResultKey {
+    match collapse {
+        Collapse::None => ResultKey::Seg(seg_id),
+        Collapse::Key => ResultKey::Key(key.clone()),
+    }
+}
 
 /// How many engine candidates to pull per provenance/filter round-trip.
 const CHUNK: usize = 64;
@@ -1252,16 +1270,19 @@ impl Provenance<'_> {
     }
 }
 
-/// Fold one candidate into the per-key best-float map, keeping the **max-`corrected_score`**
-/// segment per caller key (derivation §7's float top-k). `corrected` is precomputed (cheap, no
-/// allocation), so the [`Candidate`] — which clones `key`/`label` — is materialized **only on an
-/// insert or a strict win**, never for a loser (the engine-review (4) cost note). Returns whether
-/// the candidate was accepted (inserted or strictly won) — the eager path feeds accepted events
-/// to its [`TopK`] tracker. Deterministic only via the later sort tiebreak; this map itself is
-/// order-free.
+/// Fold one candidate into the per-result best-float map, keeping the **max-`corrected_score`**
+/// candidate per [`ResultKey`] (derivation §7's float top-k). Under the default per-segment
+/// granularity the fold is trivial (each segment is scored once per view); under
+/// [`Collapse::Key`] it keeps the best segment per caller key. `corrected` is precomputed
+/// (cheap, no allocation), so the [`Candidate`] — which clones `key`/`label` — is materialized
+/// **only on an insert or a strict win**, never for a loser (the engine-review (4) cost note).
+/// Returns whether the candidate was accepted (inserted or strictly won) — the eager path feeds
+/// accepted events to its [`TopK`] tracker. Deterministic only via the later sort tiebreak; this
+/// map itself is order-free.
 #[allow(clippy::too_many_arguments)]
 fn upsert_best(
-    best: &mut FxHashMap<Key, (Candidate, f64)>,
+    best: &mut FxHashMap<ResultKey, (Candidate, f64)>,
+    rk: &ResultKey,
     key: &Key,
     label: &str,
     seg_id: u32,
@@ -1283,7 +1304,7 @@ fn upsert_best(
         count,
         length,
     };
-    match best.get_mut(key) {
+    match best.get_mut(rk) {
         Some(slot) => {
             if corrected > slot.1 {
                 *slot = (build(), corrected);
@@ -1293,7 +1314,7 @@ fn upsert_best(
             }
         }
         None => {
-            best.insert(key.clone(), (build(), corrected));
+            best.insert(rk.clone(), (build(), corrected));
             true
         }
     }
@@ -1314,21 +1335,22 @@ impl Ord for TotalF64 {
     }
 }
 
-/// Incremental top-`k` tracker over per-key best floats — the eager early-stop's `kth_best`
+/// Incremental top-`k` tracker over per-result best floats — the eager early-stop's `kth_best`
 /// ceiling (derivation §7). v0.5: replaces the per-qualifying-chunk `O(n)` `kth_largest`
 /// recompute (worst `O(union²/CHUNK)` on a deep-`k` query) with amortized `O(log n)` per event
 /// and an amortized-`O(1)` [`kth_best`](Self::kth_best) read; no per-check allocation.
 ///
-/// Keys are interned to dense `u32` slots (one `Key` clone per distinct key). The scheme is a
+/// Result keys ([`ResultKey`] — a segment id, or a caller key under [`Collapse::Key`]) are
+/// interned to dense `u32` slots (one clone per distinct result). The scheme is a
 /// **lazy min-heap over the current top set**: `in_top` holds the top-`k` slots; the heap holds
 /// every `(value, slot)` event accepted for a top slot, and an entry is stale iff its slot left
 /// the top set or its slot's value moved past it — both detected (and popped) on peek. Soundness
-/// leans on the caller's invariant that a key's value only ever **increases** (the per-key best
-/// is max-folded), so a slot's older entries are always strictly below its current value.
+/// leans on the caller's invariant that a result's value only ever **increases** (the per-result
+/// best is max-folded), so a slot's older entries are always strictly below its current value.
 struct TopK {
     k: usize,
-    /// key → dense slot id.
-    slots: FxHashMap<Key, u32>,
+    /// result key → dense slot id.
+    slots: FxHashMap<ResultKey, u32>,
     /// Current value per slot (the staleness oracle).
     vals: Vec<f64>,
     /// The slots currently in the top-`k` set (`len == min(k, #keys)`).
@@ -1348,17 +1370,18 @@ impl TopK {
         }
     }
 
-    /// Fold one accepted per-key event (an insert, or a strictly-improved best) into the tracker.
-    fn observe(&mut self, key: &Key, v: f64) {
-        let slot = match self.slots.get(key) {
+    /// Fold one accepted per-result event (an insert, or a strictly-improved best) into the
+    /// tracker.
+    fn observe(&mut self, rk: &ResultKey, v: f64) {
+        let slot = match self.slots.get(rk) {
             Some(&s) => {
-                debug_assert!(v > self.vals[s as usize], "per-key bests only increase");
+                debug_assert!(v > self.vals[s as usize], "per-result bests only increase");
                 self.vals[s as usize] = v;
                 s
             }
             None => {
                 let s = self.vals.len() as u32;
-                self.slots.insert(key.clone(), s);
+                self.slots.insert(rk.clone(), s);
                 self.vals.push(v);
                 s
             }
@@ -1381,7 +1404,7 @@ impl TopK {
         // re-enters consideration only via a future, larger event).
     }
 
-    /// The current `k`-th largest per-key best, or `None` while fewer than `k` keys are tracked.
+    /// The current `k`-th largest per-result best, or `None` while fewer than `k` are tracked.
     fn kth_best(&mut self) -> Option<f64> {
         if self.in_top.len() < self.k {
             return None;
@@ -1454,12 +1477,13 @@ fn hydrate_matches<T: Tokenizer>(
 
 /// The §6/§7/§12 **float post-pass over the bounded candidate union** — the single scoring core
 /// behind both front doors (the G2 reshape). Walks the engine best-first by integer energy,
-/// recovers count-only candidates, subtracts the §6 length null, dedups one candidate per caller
-/// key keeping the max [`corrected_score`](Candidate::corrected_score), and returns them sorted
-/// best-first. `limit = Some(k)` is the **eager** path (over-sample early-stop, truncated to `k`);
-/// `limit = None` is the **lazy** path (the full sorted union). With the same plan, `Some(k)`
-/// yields exactly the `k`-prefix of `None` — so `collect_matches(k) == matches(k)` (derivation
-/// §7: top-k strictly *after* the floats).
+/// recovers count-only candidates, subtracts the §6 length null, folds candidates at the search's
+/// retrieval granularity (`collapse`: per **segment** by default; per-key best under
+/// [`Collapse::Key`], keeping the max [`corrected_score`](Candidate::corrected_score)), and
+/// returns them sorted best-first. `limit = Some(k)` is the **eager** path (over-sample
+/// early-stop, truncated to `k`); `limit = None` is the **lazy** path (the full sorted union).
+/// With the same plan, `Some(k)` yields exactly the `k`-prefix of `None` — so
+/// `collect_matches(k) == matches(k)` (derivation §7: top-k strictly *after* the floats).
 ///
 /// **The candidate set is invariant** (the M3 spine): it is `{seg : raw_overlap ≥ floor}`,
 /// unchanged from M2 — M3 only rescores and reshapes, never shrinks it, so recall is preserved by
@@ -1491,6 +1515,7 @@ fn score_union(
     prov: &Provenance<'_>,
     plan: &QueryPlan,
     limit: Option<usize>,
+    collapse: Collapse,
 ) -> Result<Vec<Candidate>> {
     if limit == Some(0) {
         return Ok(Vec::new());
@@ -1502,8 +1527,9 @@ fn score_union(
     let avgdl = plan.avgdl;
 
     let mut walk = counter.walk();
-    // Max-corrected candidate per caller key, accumulated over the union.
-    let mut best: FxHashMap<Key, (Candidate, f64)> = FxHashMap::default();
+    // Max-corrected candidate per result key (segment, or caller key under Collapse::Key),
+    // accumulated over the union.
+    let mut best: FxHashMap<ResultKey, (Candidate, f64)> = FxHashMap::default();
     // The eager path's incremental `kth_best` tracker (fed by accepted `upsert_best` events).
     let mut topk = limit.map(TopK::new);
     // Seg ids the walk yielded — completes only when the walk exhausts; gates the U_zero pass so a
@@ -1558,12 +1584,13 @@ fn score_union(
                     if corrected > max_float_seen {
                         max_float_seen = corrected;
                     }
+                    let rk = result_key(collapse, key, s.id);
                     if upsert_best(
-                        &mut best, key, label, s.id, s.score, overlap, corrected, energy, count,
-                        length,
+                        &mut best, &rk, key, label, s.id, s.score, overlap, corrected, energy,
+                        count, length,
                     ) {
                         if let Some(t) = topk.as_mut() {
-                            t.observe(key, corrected);
+                            t.observe(&rk, corrected);
                         }
                     }
                 }
@@ -1630,8 +1657,10 @@ fn score_union(
                     // E_acc = 0 (matched only weight-0 grams).
                     let (corrected, energy, count, length) =
                         plan.corrected_parts(0, credit, rel_len(Some(*len), avgdl));
+                    let rk = result_key(collapse, key, id);
                     upsert_best(
-                        &mut best, key, label, id, 0, overlap, corrected, energy, count, length,
+                        &mut best, &rk, key, label, id, 0, overlap, corrected, energy, count,
+                        length,
                     );
                 }
             }
@@ -1659,39 +1688,53 @@ fn score_planned(
     prov: &Provenance<'_>,
     planned: &PlannedQuery,
     limit: Option<usize>,
+    collapse: Collapse,
 ) -> Result<Vec<Candidate>> {
     match planned.views.as_slice() {
         [] => Ok(Vec::new()),
-        [single] => score_union(prov, single, limit),
+        [single] => score_union(prov, single, limit, collapse),
         views => {
             // Each view's full ranked union (rank = position, so the whole order is needed).
             let mut ranked_views = Vec::with_capacity(views.len());
             for v in views {
-                ranked_views.push(score_union(prov, v, None)?);
+                ranked_views.push(score_union(prov, v, None, collapse)?);
             }
-            Ok(rrf_fuse(&ranked_views, &planned.view_weights, limit))
+            Ok(rrf_fuse(
+                &ranked_views,
+                &planned.view_weights,
+                limit,
+                collapse,
+            ))
         }
     }
 }
 
 /// Reciprocal-rank-fuse the per-view ranked candidate lists (derivation §8). `RRF(seg) = Σ_v w_v /
 /// (k_RRF + rank_v)`, 1-based `rank_v` = the candidate's position in view `v`'s corrected-float
-/// order, with **`missing = "omit"`**: a key absent from a view contributes nothing from that view
-/// (it is *not* given a worst-rank penalty), so a seg surfaced by only one view keeps just that
-/// view's contribution. RRF reads RANKS, not summed energy, so a contiguous match that ranks well
-/// in both the trigram and bigram views is *not* additively over-credited by its sub-grams (the §8
-/// robustness pooling would break). Dedups one candidate per caller key (the best-ranked view's),
-/// reports the fused score as [`corrected_score`](Candidate::corrected_score), and sorts best-first
-/// with a deterministic tiebreak (fused desc → integer energy desc → seg id asc) ⇒ `batch == serial`.
-fn rrf_fuse(views: &[Vec<Candidate>], weights: &[f64], limit: Option<usize>) -> Vec<Candidate> {
-    // key -> (best-ranked candidate, fused RRF score, that best 1-based rank).
-    let mut acc: FxHashMap<Key, (Candidate, f64, usize)> = FxHashMap::default();
+/// order, with **`missing = "omit"`**: a result absent from a view contributes nothing from that
+/// view (it is *not* given a worst-rank penalty), so a seg surfaced by only one view keeps just
+/// that view's contribution. RRF reads RANKS, not summed energy, so a contiguous match that ranks
+/// well in both the trigram and bigram views is *not* additively over-credited by its sub-grams
+/// (the §8 robustness pooling would break). Folds one candidate per [`ResultKey`] (the best-ranked
+/// view's) at the search's granularity — per segment by default, per caller key under
+/// [`Collapse::Key`] — reports the fused score as
+/// [`corrected_score`](Candidate::corrected_score), and sorts best-first with a deterministic
+/// tiebreak (fused desc → integer energy desc → seg id asc) ⇒ `batch == serial`.
+fn rrf_fuse(
+    views: &[Vec<Candidate>],
+    weights: &[f64],
+    limit: Option<usize>,
+    collapse: Collapse,
+) -> Vec<Candidate> {
+    // result key -> (best-ranked candidate, fused RRF score, that best 1-based rank).
+    let mut acc: FxHashMap<ResultKey, (Candidate, f64, usize)> = FxHashMap::default();
     for (vi, view) in views.iter().enumerate() {
         let w = weights.get(vi).copied().unwrap_or(1.0);
         for (i, c) in view.iter().enumerate() {
             let rank = i + 1; // 1-based
             let contrib = w / (K_RRF + rank as f64);
-            match acc.get_mut(c.key()) {
+            let rk = result_key(collapse, c.key(), c.seg_id);
+            match acc.get_mut(&rk) {
                 Some(slot) => {
                     slot.1 += contrib;
                     if rank < slot.2 {
@@ -1700,7 +1743,7 @@ fn rrf_fuse(views: &[Vec<Candidate>], weights: &[f64], limit: Option<usize>) -> 
                     }
                 }
                 None => {
-                    acc.insert(c.key().clone(), (c.clone(), contrib, rank));
+                    acc.insert(rk, (c.clone(), contrib, rank));
                 }
             }
         }
@@ -1754,7 +1797,7 @@ pub(crate) fn matches_batch<T: Tokenizer>(
 
     let mut out = Vec::with_capacity(queries.len());
     for planned in &plans {
-        let kept = score_planned(&prov, planned, Some(limit))?;
+        let kept = score_planned(&prov, planned, Some(limit), opts.collapse)?;
         out.push(hydrate_matches(
             &tx,
             ns,
@@ -1794,6 +1837,7 @@ pub(crate) fn candidates<'a, T: Tokenizer>(
         conn,
         planned,
         filter: opts.filter,
+        collapse: opts.collapse,
         ready: VecDeque::new(),
         started: false,
         errored: false,
@@ -1823,6 +1867,7 @@ pub struct CandidateStream<'a, T: Tokenizer> {
     conn: ReadConn<'a>,
     planned: PlannedQuery,
     filter: Option<SqlFilter<'a>>,
+    collapse: Collapse,
     /// The cached full sorted (and, for a starved query, RRF-fused) union, computed on the first
     /// [`next`](Iterator::next) and drained front-to-back thereafter.
     ready: VecDeque<Candidate>,
@@ -1903,7 +1948,8 @@ impl<T: Tokenizer> CandidateStream<'_, T> {
 
 impl<T: Tokenizer> Iterator for CandidateStream<'_, T> {
     type Item = Result<Candidate>;
-    /// Corrected-float order, deduped-per-key, filtered. The first call scores and sorts the whole
+    /// Corrected-float order, folded at the stream's [`Collapse`] granularity, filtered. The
+    /// first call scores and sorts the whole
     /// bounded union (caching it); each call then pops the next best. Fuses on the first `Err`.
     fn next(&mut self) -> Option<Result<Candidate>> {
         if self.errored {
@@ -1921,7 +1967,7 @@ impl<T: Tokenizer> Iterator for CandidateStream<'_, T> {
                     key_shape: self.index.schema.key_shape(),
                     filter: self.filter.as_ref(),
                 };
-                score_planned(&prov, &self.planned, None)
+                score_planned(&prov, &self.planned, None, self.collapse)
             };
             match scored {
                 Ok(v) => self.ready = VecDeque::from(v),
@@ -2480,12 +2526,16 @@ mod null_tests {
 #[cfg(test)]
 mod topk_tests {
     //! The v0.5 incremental top-`k` tracker behind the eager early-stop's `kth_best` ceiling:
-    //! oracle agreement under inserts and per-key increases (the two event kinds `upsert_best`
+    //! oracle agreement under inserts and per-result increases (the two event kinds `upsert_best`
     //! emits), promotion/demotion through the top set, and the not-yet-full `None`.
-    use super::TopK;
-    use crate::model::Key;
+    use super::{ResultKey, TopK};
 
-    /// The `k`-th largest of the current per-key values, by sort (the oracle).
+    /// A segment-granularity result key for the fixtures.
+    fn rk(key: i64) -> ResultKey {
+        ResultKey::Seg(key as u32)
+    }
+
+    /// The `k`-th largest of the current per-result values, by sort (the oracle).
     fn oracle(vals: &[(i64, f64)], k: usize) -> Option<f64> {
         if vals.len() < k {
             return None;
@@ -2501,13 +2551,13 @@ mod topk_tests {
         let mut state: Vec<(i64, f64)> = Vec::new();
         assert_eq!(t.kth_best(), None, "empty");
         for (key, v) in [(1, 5.0), (2, 3.0)] {
-            t.observe(&Key::Integer(key), v);
+            t.observe(&rk(key), v);
             state.push((key, v));
             assert_eq!(t.kth_best(), None, "fewer than k keys");
         }
         // Fill to k, then stream a mix of new keys (some below the kth, some promoting).
         for (key, v) in [(3, 4.0), (4, 1.0), (5, 6.0), (6, 3.5), (7, 4.5)] {
-            t.observe(&Key::Integer(key), v);
+            t.observe(&rk(key), v);
             state.push((key, v));
             assert_eq!(t.kth_best(), oracle(&state, 3), "after inserting {key}={v}");
         }
@@ -2518,19 +2568,19 @@ mod topk_tests {
         let mut t = TopK::new(2);
         let mut state: Vec<(i64, f64)> = vec![(1, 5.0), (2, 4.0), (3, 1.0)];
         for &(k, v) in &state {
-            t.observe(&Key::Integer(k), v);
+            t.observe(&rk(k), v);
         }
         assert_eq!(t.kth_best(), oracle(&state, 2)); // {5, 4} → 4
         // A top member improves: kth unchanged (it was the max's peer), stale entry ignored.
-        t.observe(&Key::Integer(2), 4.5);
+        t.observe(&rk(2), 4.5);
         state[1].1 = 4.5;
         assert_eq!(t.kth_best(), oracle(&state, 2)); // {5, 4.5} → 4.5
         // A non-top key improves past the kth: promoted, demoting the previous kth.
-        t.observe(&Key::Integer(3), 4.8);
+        t.observe(&rk(3), 4.8);
         state[2].1 = 4.8;
         assert_eq!(t.kth_best(), oracle(&state, 2)); // {5, 4.8} → 4.8
         // The demoted key re-improves and re-promotes (stale entries from both phases ignored).
-        t.observe(&Key::Integer(2), 6.0);
+        t.observe(&rk(2), 6.0);
         state[1].1 = 6.0;
         assert_eq!(t.kth_best(), oracle(&state, 2)); // {6, 5} → 5
     }
@@ -2538,13 +2588,13 @@ mod topk_tests {
     #[test]
     fn k_of_one_tracks_the_max() {
         let mut t = TopK::new(1);
-        t.observe(&Key::Integer(1), 2.0);
+        t.observe(&rk(1), 2.0);
         assert_eq!(t.kth_best(), Some(2.0));
-        t.observe(&Key::Integer(2), 1.0); // below — ignored
+        t.observe(&rk(2), 1.0); // below — ignored
         assert_eq!(t.kth_best(), Some(2.0));
-        t.observe(&Key::Integer(2), 9.0); // promotes
+        t.observe(&rk(2), 9.0); // promotes
         assert_eq!(t.kth_best(), Some(9.0));
-        t.observe(&Key::Integer(1), 11.0); // the demoted key re-promotes
+        t.observe(&rk(1), 11.0); // the demoted key re-promotes
         assert_eq!(t.kth_best(), Some(11.0));
     }
 
@@ -2564,11 +2614,11 @@ mod topk_tests {
                 match state.iter_mut().find(|(k2, _)| *k2 == key) {
                     Some(slot) => {
                         slot.1 += bump; // strictly increases (the upsert_best contract)
-                        t.observe(&Key::Integer(key), slot.1);
+                        t.observe(&rk(key), slot.1);
                     }
                     None => {
                         state.push((key, bump));
-                        t.observe(&Key::Integer(key), bump);
+                        t.observe(&rk(key), bump);
                     }
                 }
                 assert_eq!(t.kth_best(), oracle(&state, k), "step {i}, k={k}");
@@ -2584,6 +2634,7 @@ mod fusion_tests {
     //! not summed energy" property (a contiguous match is not additively tripled by its sub-grams),
     //! the deterministic tiebreak, and the ΔH → view-weight map.
     use super::{Candidate, K_RRF, rrf_fuse, view_weights_from_dh};
+    use crate::Collapse;
     use crate::hash::FxHashSet;
     use crate::model::Key;
     use crate::term::encode_term;
@@ -2612,7 +2663,7 @@ mod fusion_tests {
         let view_a = vec![cand(1, 1, 9.0), cand(3, 3, 5.0)];
         let view_b = vec![cand(1, 1, 8.0), cand(2, 2, 4.0)];
         let weights = vec![0.6, 0.4];
-        let fused = rrf_fuse(&[view_a, view_b], &weights, None);
+        let fused = rrf_fuse(&[view_a, view_b], &weights, None, Collapse::None);
 
         let score = |k: i64| {
             fused
@@ -2658,7 +2709,7 @@ mod fusion_tests {
         b1.length = 9.9;
         let view_a = vec![a1, cand(9, 9, 0.0)]; // key 1 at rank 1 (retained)
         let view_b = vec![cand(2, 2, 0.0), b1]; // key 1 at rank 2
-        let fused = rrf_fuse(&[view_a, view_b], &[0.5, 0.5], None);
+        let fused = rrf_fuse(&[view_a, view_b], &[0.5, 0.5], None, Collapse::None);
         let one = fused.iter().find(|c| c.key().as_i64() == Some(1)).unwrap();
         assert_eq!(
             one.energy(),
@@ -2687,7 +2738,7 @@ mod fusion_tests {
     fn rrf_truncates_to_limit_after_fusing() {
         let view_a = vec![cand(1, 1, 9.0), cand(2, 2, 5.0), cand(3, 3, 1.0)];
         let view_b = vec![cand(2, 2, 9.0), cand(1, 1, 5.0)];
-        let fused = rrf_fuse(&[view_a, view_b], &[0.5, 0.5], Some(2));
+        let fused = rrf_fuse(&[view_a, view_b], &[0.5, 0.5], Some(2), Collapse::None);
         assert_eq!(fused.len(), 2, "top-k applied after fusion");
         // Keys 1 and 2 are in both views; key 3 only in view_a low → truncated out.
         assert!(fused.iter().all(|c| c.key().as_i64() != Some(3)));
@@ -2699,8 +2750,13 @@ mod fusion_tests {
         // (fused desc → integer energy desc → seg id asc) breaks it by seg id, deterministically.
         let view_a = vec![cand(10, 10, 1.0)];
         let view_b = vec![cand(20, 20, 1.0)];
-        let a = rrf_fuse(&[view_a.clone(), view_b.clone()], &[0.5, 0.5], None);
-        let b = rrf_fuse(&[view_a, view_b], &[0.5, 0.5], None);
+        let a = rrf_fuse(
+            &[view_a.clone(), view_b.clone()],
+            &[0.5, 0.5],
+            None,
+            Collapse::None,
+        );
+        let b = rrf_fuse(&[view_a, view_b], &[0.5, 0.5], None, Collapse::None);
         assert_eq!(
             a.iter()
                 .map(|c| c.key().as_i64().unwrap())
@@ -2736,6 +2792,38 @@ mod fusion_tests {
             "richer primary inventory ⇒ more primary weight: {w:?}"
         );
         assert!((w[0] + w[1] - 1.0).abs() < 1e-12, "weights sum to 1");
+    }
+
+    #[test]
+    fn fuse_granularity_folds_per_segment_or_per_key() {
+        // Two SEGMENTS of one KEY, each ranked in one view. Per-segment (the v0.5 default):
+        // both survive as distinct results. Per-key (Collapse::Key): they fold to one result —
+        // the better-ranked segment — with the fused score accumulated across both.
+        let seg_a = cand(1, 10, 9.0); // key 1, segment 10
+        let seg_b = cand(1, 11, 5.0); // key 1, segment 11
+        let view_a = vec![seg_a.clone()];
+        let view_b = vec![seg_b.clone()];
+        let per_seg = rrf_fuse(
+            &[view_a.clone(), view_b.clone()],
+            &[0.5, 0.5],
+            None,
+            Collapse::None,
+        );
+        assert_eq!(
+            per_seg.len(),
+            2,
+            "per-segment keeps both segments of the key"
+        );
+        let per_key = rrf_fuse(&[view_a, view_b], &[0.5, 0.5], None, Collapse::Key);
+        assert_eq!(
+            per_key.len(),
+            1,
+            "Collapse::Key folds to one result per key"
+        );
+        assert_eq!(
+            per_key[0].seg_id, 10,
+            "the fold retains the best-ranked segment"
+        );
     }
 
     #[test]

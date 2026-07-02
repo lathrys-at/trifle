@@ -244,11 +244,31 @@ impl Tuning {
     }
 }
 
+/// The retrieval granularity: what one result *is* — and therefore what `limit` counts (v0.5).
+///
+/// The **segment** is the engine's native unit (the derivation scores segments and knows nothing
+/// of any grouping above them); a key-level result is a *collapse* of segment results. The
+/// default returns every matching segment, so retrieval granularity is decoupled from the key —
+/// which is the *lifecycle* handle (dedup / replace / delete), not a statement about what a
+/// search should return. Collapse to [`Key`](Collapse::Key) for entity-style result lists.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Collapse {
+    /// Every matching segment is its own result: a key appears once per matching segment (each
+    /// [`Match`] carries its `label` and `score`), and `limit` counts segments. The default.
+    #[default]
+    None,
+    /// One result per key — its best-scoring segment — and `limit` counts keys. The pre-v0.5
+    /// behavior; the right choice when segments are provenance facets of one entity (title /
+    /// body / ocr) and a result list should not repeat the entity.
+    Key,
+}
+
 /// Per-search options. Construct with [`SearchOpts::new`] and the builder setters.
 ///
-/// The front line is the three knobs a caller actually reaches for day to day — `min_shared`
-/// (strictness), `df_budget` (work), `filter` (scope). The derivation-level scoring knobs live
-/// behind [`tuning`](SearchOpts::tuning) (v0.5).
+/// The front line is the knobs a caller actually reaches for day to day — `min_shared`
+/// (strictness), `df_budget` (work), `filter` (scope), `collapse` (result granularity). The
+/// derivation-level scoring knobs live behind [`tuning`](SearchOpts::tuning) (v0.5).
 ///
 /// `limit` is **not** here — it is a terminal-op argument ([`Reader::matches`]), because the
 /// [`candidates`](Reader::candidates) stream is lazy/unbounded (the caller pulls depth via
@@ -257,6 +277,9 @@ impl Tuning {
 pub struct SearchOpts<'a> {
     /// `m` — the match floor (shared rare tokens for a hit). `None` → `2`.
     pub min_shared: Option<u32>,
+    /// The retrieval granularity — see [`Collapse`]. Default: one result per matching
+    /// **segment**; set [`Collapse::Key`] for one result per key (its best segment).
+    pub collapse: Collapse,
     /// `C` — the work budget: a cap on the cumulative document frequency (`Σdf`) of the selected
     /// tokens, which is what candidate generation scans — so this bounds *work* directly.
     /// Rarest-first tokens are kept while `Σdf` stays within budget; the typo floor is always kept.
@@ -276,10 +299,11 @@ pub struct SearchOpts<'a> {
 }
 
 impl<'a> SearchOpts<'a> {
-    /// Default options (derived budget, default tuning, no filter).
+    /// Default options (derived budget, default tuning, per-segment results, no filter).
     pub fn new() -> Self {
         SearchOpts {
             min_shared: None,
+            collapse: Collapse::default(),
             df_budget: None,
             tuning: Tuning::default(),
             filter: None,
@@ -289,6 +313,12 @@ impl<'a> SearchOpts<'a> {
     /// Set the match floor `m`.
     pub fn min_shared(mut self, m: u32) -> Self {
         self.min_shared = Some(m);
+        self
+    }
+
+    /// Set the retrieval granularity (see [`Collapse`]).
+    pub fn collapse(mut self, collapse: Collapse) -> Self {
+        self.collapse = collapse;
         self
     }
 

@@ -59,14 +59,18 @@ fn main() -> trifle::Result<()> {
 A `Schema` declares the shape of your data; trifle generates its tables from it. A document
 has a **key** and one or more named **segments**:
 
-- **key** — the unit of retrieval, of a declared shape (`Integer`, `Text`, or `Blob`). A
-  search returns at most one match per key — its best-matching segment — and `limit` counts
-  keys. A `Match` carries the `key`, the matched segment's `label`, its `text`, a byte `span`
-  (when locatable), and its `score` with the components it decomposes into.
+- **key** — the lifecycle handle, of a declared shape (`Integer`, `Text`, or `Blob`): the unit
+  of dedup, replace, and delete. A `Match` carries the `key`, the matched segment's `label`,
+  its `text`, a byte `span` (when locatable), and its `score` with the components it
+  decomposes into.
 - **segment** — a `(label, text)` pair under a key. `label` is a free-form name returned on
   a match so you know which segment matched; a document holds each label at most once. Every
-  indexed text field is **stored** and returned on a match. The segment is the ranking unit;
-  fuse across a key's segments above trifle (aggregate across your keys).
+  indexed text field is **stored** and returned on a match. The segment is the ranking **and
+  retrieval** unit: by default a search returns every matching segment (a key may appear once
+  per matching segment, each self-describing via its `label` and `score`), and `limit` counts
+  segments. For entity-style result lists, `SearchOpts::collapse(Collapse::Key)` folds to one
+  result per key — its best-scoring segment — with `limit` counting keys. Retrieval
+  granularity is a search-time option, deliberately decoupled from the key's lifecycle role.
 - `Schema::flat()` is the simplest shape: an integer key and one default text field that
   accepts any label. `Schema::chunked()` / the builder declare named text fields.
 
@@ -76,9 +80,8 @@ This covers two common patterns:
   sub-location: `"ocr"`, `"title"`, a filename). A search returns the document and its
   best-matching segment.
 - **Chunking a large document** — keep the document as the key and put each passage under its
-  own label; a match returns the best chunk, with its text and (when locatable) a byte span.
-  To retrieve several passages from one document at once, give each chunk its own key
-  (results are deduplicated per key).
+  own label. A search returns every matching passage (each with its text and, when locatable,
+  a byte span); collapse to `Collapse::Key` when you want just the document's best passage.
 
 ## Features
 
@@ -161,6 +164,8 @@ dials worth knowing on day one:
 - `SearchOpts::min_shared` — strictness: how many shared rare grams a hit requires (default 2).
 - `SearchOpts::df_budget` — the work budget: how many posting rows a query may scan. The
   default is derived from your corpus per query; override it to pin a latency ceiling.
+- `SearchOpts::collapse` — result granularity: every matching segment (default), or one
+  result per key (`Collapse::Key`).
 
 Everything else (`Config::sigma` and the `Tuning` group: `nu`, `kappa`, `delta`, `k_target`,
 `c_margin`) changes the scoring model itself, and should move only on the strength of a

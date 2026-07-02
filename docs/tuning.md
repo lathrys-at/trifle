@@ -16,7 +16,7 @@ knobs fall into three tiers:
 
 | Tier | Knobs | Posture |
 |---|---|---|
-| Day-one dials | `SearchOpts::min_shared`, `SearchOpts::df_budget` | Reach for these freely; they encode product decisions (strictness, latency ceiling) |
+| Day-one dials | `SearchOpts::min_shared`, `SearchOpts::df_budget`, `SearchOpts::collapse` | Reach for these freely; they encode product decisions (strictness, latency ceiling, result granularity) |
 | Model constants | `Config::sigma`; `Tuning::{nu, kappa, delta, k_target, c_margin}` | Change only with a measured evaluation; each moves the scoring model itself |
 | Index identity | tokenizer choice + normalization, `Config::data_version`, `Schema` | Not tuning — changing any of these **drift-resets the cache** (drop + rebuild, by design) |
 
@@ -75,6 +75,20 @@ works at the default.
 planted source still surface under typos? — raising `m` eats typo tolerance directly, since a
 typo destroys up to `n` grams per edit) and a precision spot-check of the top-`k` on your worst
 noisy queries. There is no corpus-derived "right" value; there is a right value *for your UI*.
+
+### `SearchOpts::collapse` — result granularity (default: per segment)
+
+**What it is.** What one result *is*: every matching segment (default; a key may appear once per
+matching segment, `limit` counts segments) or the per-key best segment (`Collapse::Key`; `limit`
+counts keys). Purely a product-semantics choice — scoring is identical either way, and the
+collapse is applied before top-`k` truncation, so it cannot be replicated by post-filtering a
+truncated segment list.
+
+**When to change it.** Use `Collapse::Key` whenever segments are provenance facets of one entity
+(title / body / ocr of a note) and your result list should not repeat the entity. Keep the
+default when segments are independently meaningful (passages of a chunked document, log lines).
+
+**Evaluation.** None needed — this is a UI decision, not a quality trade.
 
 ### `SearchOpts::df_budget` — the work budget (`C`, default: derived per query)
 

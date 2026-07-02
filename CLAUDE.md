@@ -110,7 +110,8 @@ A search flows through these stages, each its own module:
   `μ` and the length null are applied afterward, in the `search.rs` float post-pass.
 - **Provenance + filter + hydrate** (`src/search.rs`) — `search.rs` drives the engine walk in
   chunks, batch-reads each chunk's `(key, label)` from `seg` (folding in the opt-in `SqlFilter`),
-  dedups one candidate per key, and finally hydrates text + span for exactly the kept candidates in
+  folds results at the search's `Collapse` granularity (per segment by default; per-key best on
+  `Collapse::Key`), and finally hydrates text + span for exactly the kept candidates in
   one `WHERE id IN rarray(?1)` read.
 
 `src/search.rs` exposes both front doors: `Reader::matches`/`matches_batch` (the eager safe default,

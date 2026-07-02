@@ -254,10 +254,11 @@ fn batch_equals_serial_under_the_count_credit() {
 }
 
 #[test]
-fn dedup_keeps_the_max_float_segment_per_key() {
-    // score_union dedups one candidate per KEY, keeping the MAX-float segment. Doc 1 has a
-    // rare-gram segment (title "kqxvz", high float) and a common-gram segment (body "report",
-    // low float); it must surface via the higher-float title segment.
+fn collapse_key_keeps_the_max_float_segment_per_key() {
+    // Under Collapse::Key, score_union folds one candidate per KEY, keeping the MAX-float
+    // segment. Doc 1 has a rare-gram segment (title "kqxvz", high float) and a common-gram
+    // segment (body "report", low float); it must surface once, via the higher-float title
+    // segment. The per-segment default returns both, best-first.
     let h = Harness::new();
     let mut w = h.index.writer().unwrap();
     w.upsert(1, &[("title", "kqxvz"), ("body", "report")])
@@ -267,16 +268,26 @@ fn dedup_keeps_the_max_float_segment_per_key() {
     }
     w.commit().unwrap();
 
+    let opts = SearchOpts::new()
+        .min_shared(1)
+        .collapse(trifle::Collapse::Key);
+    let hits = h.search_opts("kqxvz report", &opts, 50).unwrap();
+    let doc1: Vec<_> = hits.iter().filter(|m| m.key.as_i64() == Some(1)).collect();
+    assert_eq!(doc1.len(), 1, "Collapse::Key: one result per key");
+    assert_eq!(
+        doc1[0].label, "title",
+        "the fold kept the higher-float (rare-gram) segment, not the common one"
+    );
+
+    // The per-segment default surfaces both of doc 1's segments, rare-gram one first.
     let hits = h
         .search_opts("kqxvz report", &SearchOpts::new().min_shared(1), 50)
         .unwrap();
-    let m1 = hits
-        .iter()
-        .find(|m| m.key.as_i64() == Some(1))
-        .expect("doc 1 retrieved");
+    let doc1: Vec<_> = hits.iter().filter(|m| m.key.as_i64() == Some(1)).collect();
+    assert_eq!(doc1.len(), 2, "per-segment default keeps both segments");
     assert_eq!(
-        m1.label, "title",
-        "per-key dedup kept the higher-float (rare-gram) segment, not the common one"
+        doc1[0].label, "title",
+        "best-first within the key's segments"
     );
 }
 
